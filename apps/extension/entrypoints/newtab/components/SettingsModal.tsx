@@ -63,6 +63,7 @@ export function SettingsModal({
   onChangeInterval,
   onClose,
   onSave,
+  canRebuild = true,
 }: {
   initialPrompt: string;
   blockedSites: string[];
@@ -74,7 +75,10 @@ export function SettingsModal({
   onChangeInterval: (next: number) => void;
   onClose: () => void;
   onSave: (prompt: string, blockedSites: string[]) => void;
+  /** False without an API key: saving can't start a build, so the button just says "Save". */
+  canRebuild?: boolean;
 }) {
+  const saveLabel = canRebuild ? "Save & rebuild" : "Save";
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
   const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
@@ -120,7 +124,7 @@ export function SettingsModal({
     if (value === "") {
       setArchiveCheck({
         state: "ok",
-        message: "The archive is off. Click Save & rebuild to use browsing history only.",
+        message: `The archive is off. Click ${saveLabel} to use browsing history only.`,
       });
       return;
     }
@@ -264,7 +268,7 @@ export function SettingsModal({
             </label>
             <p id="archive-help" className="set-hint">
               Where your saved articles live. Leave empty to build from browsing history only.
-              Saved when a test succeeds or you click Save &amp; rebuild.
+              Saved when a test succeeds or you click {saveLabel}.
             </p>
             <input
               id="set-archive"
@@ -304,7 +308,7 @@ export function SettingsModal({
             Cancel
           </button>
           <button type="button" className="solid-btn" onClick={() => void save()}>
-            Save &amp; rebuild
+            {saveLabel}
           </button>
         </footer>
       </div>

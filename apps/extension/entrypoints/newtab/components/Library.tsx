@@ -11,6 +11,11 @@ function isTyping(target: EventTarget | null): boolean {
   return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
 }
 
+/** Move real focus to a row so Enter, Tab and screen readers follow the keyboard cursor. */
+function focusRow(id: string) {
+  document.getElementById(`row-${id}`)?.focus({ preventScroll: true });
+}
+
 function matches(article: ArchiveArticleMeta, tokens: string[]): boolean {
   if (tokens.length === 0) return true;
   const haystack = `${article.title} ${article.author ?? ""} ${article.site}`.toLowerCase();
@@ -105,9 +110,14 @@ export function Library({
         const at = visible.findIndex((a) => a.id === cursorId);
         const next = e.key === "j" ? Math.min(visible.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
         onCursor(visible[next].id);
+        focusRow(visible[next].id);
       } else if (e.key === "Enter" && cursorId) {
+        // A focused row, or nothing in particular, opens the cursor row. Chips, links
+        // and the top bar keep their own Enter.
         const t = e.target as HTMLElement;
-        if (t.tagName === "BUTTON" || t.tagName === "A") return;
+        const onRow = !!t.closest?.(".row");
+        const idle = t === document.body || t.tagName === "MAIN" || t.classList?.contains("lib");
+        if (!onRow && !idle) return;
         e.preventDefault();
         onOpen(cursorId, visible);
       }
@@ -152,7 +162,10 @@ export function Library({
             } else if (e.key === "Enter" || e.key === "ArrowDown") {
               e.preventDefault();
               e.currentTarget.blur();
-              if (visible.length) onCursor(visible[0].id);
+              if (visible.length) {
+                onCursor(visible[0].id);
+                focusRow(visible[0].id);
+              }
             }
           }}
         />
@@ -185,7 +198,12 @@ export function Library({
             );
           })}
           {(hiddenSources > 0 || allSources) && ready.sources.length > COLLAPSED_SOURCES && (
-            <button type="button" className="chip more" onClick={() => setAllSources((v) => !v)}>
+            <button
+              type="button"
+              className="chip more"
+              aria-expanded={allSources}
+              onClick={() => setAllSources((v) => !v)}
+            >
               {allSources ? "Fewer" : `${hiddenSources} more`}
             </button>
           )}

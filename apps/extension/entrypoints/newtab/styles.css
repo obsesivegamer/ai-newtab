@@ -257,7 +257,7 @@ body {
   --text: #ece6da;
   --prose: #d8d1c3;
   --muted: #a49d90;
-  --faint: #756f64;
+  --faint: #8c8578;
   --accent: #d6a65a;
   --accent-wash: rgba(214, 166, 90, 0.11);
   --accent-line: rgba(214, 166, 90, 0.45);
@@ -271,7 +271,7 @@ body {
   --text: #25211b;
   --prose: #2e2a23;
   --muted: #6c6558;
-  --faint: #978f80;
+  --faint: #716a5d;
   --accent: #96590f;
   --accent-wash: rgba(150, 89, 15, 0.08);
   --accent-line: rgba(150, 89, 15, 0.4);
@@ -359,6 +359,10 @@ body {
   border-radius: 50%;
   background: var(--accent);
   animation: hb-pulse 1.4s ease-in-out infinite;
+}
+.tab-dot.error {
+  background: var(--danger);
+  animation: none;
 }
 
 .icon-btn,
@@ -613,8 +617,13 @@ kbd {
 .row.cursor {
   background: var(--hover);
 }
-.row.cursor {
+.row.cursor,
+.row:focus-visible {
   box-shadow: inset 2px 0 0 var(--accent);
+}
+.row:focus-visible {
+  outline: none;
+  background: var(--hover);
 }
 .row-main {
   display: block;
@@ -739,6 +748,10 @@ kbd {
 .main {
   min-height: calc(100vh - var(--bar-h));
 }
+.today-pane[hidden],
+.view-library[hidden] {
+  display: none;
+}
 .today-pane {
   height: calc(100vh - var(--bar-h));
   overflow: auto;
@@ -853,6 +866,17 @@ kbd {
 }
 .banner-row > span {
   flex: 1;
+}
+.banner-slim {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  font-size: 13px;
+}
+.banner-slim .banner-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .banner .ghost-btn.small {
   border-color: var(--border);

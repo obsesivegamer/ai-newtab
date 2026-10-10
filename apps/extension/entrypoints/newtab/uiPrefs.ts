@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * View preferences for the new tab (theme, reader text size). They live under
@@ -66,20 +66,51 @@ export function useTheme() {
 export const TEXT_SIZES = [16, 18, 20, 22, 24, 27] as const;
 const DEFAULT_SIZE_INDEX = 2;
 
+function validSizeIndex(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < TEXT_SIZES.length;
+}
+
+function readSizeMirror(): number | null {
+  try {
+    const raw = localStorage.getItem(KEYS.textSize);
+    const parsed = raw === null ? NaN : Number(raw);
+    return validSizeIndex(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSizeMirror(index: number) {
+  try {
+    localStorage.setItem(KEYS.textSize, String(index));
+  } catch {
+    /* ignore */
+  }
+}
+
 export function useTextSize() {
-  const [index, setIndex] = useState(DEFAULT_SIZE_INDEX);
+  // Read synchronously from the localStorage mirror so the Reader opens at the right size.
+  const [index, setIndex] = useState(() => readSizeMirror() ?? DEFAULT_SIZE_INDEX);
+  const touched = useRef(false);
 
   useEffect(() => {
     void browser.storage.local.get(KEYS.textSize).then((r) => {
       const stored = r[KEYS.textSize];
-      if (typeof stored === "number" && stored >= 0 && stored < TEXT_SIZES.length) setIndex(stored);
+      // A click that landed before this read finished wins.
+      if (touched.current || !validSizeIndex(stored)) return;
+      setIndex(stored);
+      writeSizeMirror(stored);
     });
   }, []);
 
   const step = useCallback((delta: number) => {
+    touched.current = true;
     setIndex((current) => {
       const next = Math.min(TEXT_SIZES.length - 1, Math.max(0, current + delta));
-      if (next !== current) void browser.storage.local.set({ [KEYS.textSize]: next });
+      if (next !== current) {
+        writeSizeMirror(next);
+        void browser.storage.local.set({ [KEYS.textSize]: next });
+      }
       return next;
     });
   }, []);

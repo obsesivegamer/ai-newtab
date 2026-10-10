@@ -9,11 +9,14 @@ export function ViewTabs({
   view,
   onChange,
   todayBusy,
+  todayError,
 }: {
   view: View;
   onChange: (view: View) => void;
   /** A homepage build is running in the background. */
   todayBusy: boolean;
+  /** The last build failed and the user hasn't dismissed it. */
+  todayError: boolean;
 }) {
   return (
     <nav className="tabs" aria-label="View">
@@ -26,7 +29,12 @@ export function ViewTabs({
           onClick={() => onChange(tab.id)}
         >
           {tab.label}
-          {tab.id === "today" && todayBusy && <span className="tab-dot" title="Building" />}
+          {tab.id === "today" && todayError && (
+            <span className="tab-dot error" title="The last build failed" role="img" aria-label="The last build failed" />
+          )}
+          {tab.id === "today" && !todayError && todayBusy && (
+            <span className="tab-dot" title="Building" role="img" aria-label="Building" />
+          )}
         </button>
       ))}
     </nav>

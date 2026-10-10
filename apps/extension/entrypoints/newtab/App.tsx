@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DEFAULT_MODEL,
   DEFAULT_BLOCKED_SITES,
@@ -45,6 +45,8 @@ export default function App() {
 
   const { theme, toggle: toggleTheme } = useTheme();
   const [view, setView] = useState<View>("library");
+  /** The Today pane mounts on first visit and then stays, so Sandpack isn't rebuilt on every switch. */
+  const [todayMounted, setTodayMounted] = useState(false);
   /** null until settings load; "" means the archive is switched off. */
   const [archiveUrl, setArchiveUrl] = useState<string | null>(null);
   const [reader, setReader] = useState<{ id: string; list: ArchiveArticleMeta[] } | null>(null);
@@ -54,6 +56,7 @@ export default function App() {
 
   useEffect(() => {
     document.title = view === "today" ? "Today" : "Library";
+    if (view === "today") setTodayMounted(true);
   }, [view]);
 
   const { state, build, cancel } = useHomepageBuild((code) => setRenderedCode(toRenderable(code)));
@@ -100,8 +103,15 @@ export default function App() {
       const data = e.data as { type?: unknown; id?: unknown } | null;
       if (!data || typeof data !== "object" || data.type !== OPEN_ARTICLE) return;
       if (typeof data.id !== "string" || !ARTICLE_ID.test(data.id)) return;
-      setReader({ id: data.id, list: [] });
-      setCursorId(data.id);
+      // Only the homepage's own Sandpack frame may ask; the model's code runs in there.
+      const frames = document.querySelectorAll<HTMLIFrameElement>(".today-frame iframe");
+      const fromHomepage = Array.from(frames).some(
+        (frame) => frame.contentWindow !== null && frame.contentWindow === e.source,
+      );
+      if (!fromHomepage) return;
+      const id = data.id;
+      setReader((current) => (current?.id === id ? current : { id, list: [] }));
+      setCursorId(id);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -116,6 +126,19 @@ export default function App() {
     setCursorId(id);
   }, []);
   const closeReader = useCallback(() => setReader(null), []);
+
+  // Put keyboard focus back on the row the reader was opened from.
+  const readerOpen = reader !== null;
+  const wasReaderOpen = useRef(false);
+  useEffect(() => {
+    if (readerOpen) {
+      wasReaderOpen.current = true;
+      return;
+    }
+    if (!wasReaderOpen.current) return;
+    wasReaderOpen.current = false;
+    if (cursorId) document.getElementById(`row-${cursorId}`)?.focus({ preventScroll: true });
+  }, [readerOpen]);
 
   const saveKey = useCallback(async (key: string) => {
     await saveSetting("apiKey", key);
@@ -225,52 +248,81 @@ export default function App() {
   };
 
   const showRebuild = view === "today" && !loading && !!apiKey && !!renderedCode;
-  const readerOpen = reader !== null;
+  const showTodayError = !!showError;
 
   return (
     <div className="shell">
-      <header className="topbar">
-        <ViewTabs view={view} onChange={setView} todayBusy={todayBuilding} />
-        <span className="bar-spacer" />
-        {showRebuild &&
-          (state.running ? (
-            // A build is running in the background (from here, another tab, or the
-            // scheduled rebuild). Let the user watch it without losing this page.
-            <button
-              className="ghost-btn small building"
-              onClick={() => setViewProgress(true)}
-              title="View build progress"
-            >
-              <span className="pulse-dot" />
-              Building… {Math.min(state.stepIndex + 1, BUILD_STEPS.length)}/{BUILD_STEPS.length}
-            </button>
-          ) : (
-            <button className="ghost-btn small" onClick={() => build()} title="Rebuild now">
-              Rebuild
-            </button>
-          ))}
-        <button className="ghost-btn small" onClick={() => setShowSettings(true)} title="Settings">
-          Settings
-        </button>
-        <ThemeToggle theme={theme} onToggle={toggleTheme} />
-      </header>
-
-      <main className="main" aria-hidden={readerOpen || undefined} inert={readerOpen || undefined}>
-        {view === "library" ? (
-          <Library
-            state={archive.state}
-            archiveUrl={archiveUrl}
-            onReload={archive.reload}
-            onOpen={openArticle}
-            cursorId={cursorId}
-            onCursor={setCursorId}
-            keysActive={!readerOpen && !showSettings}
-            onOpenSettings={() => setShowSettings(true)}
+      <div className="shell-content" aria-hidden={readerOpen || undefined} inert={readerOpen || undefined}>
+        <header className="topbar">
+          <ViewTabs
+            view={view}
+            onChange={setView}
+            todayBusy={todayBuilding}
+            todayError={showTodayError}
           />
-        ) : (
-          <div className="today-pane">{renderToday()}</div>
+          <span className="bar-spacer" />
+          {showRebuild &&
+            (state.running ? (
+              // A build is running in the background (from here, another tab, or the
+              // scheduled rebuild). Let the user watch it without losing this page.
+              <button
+                className="ghost-btn small building"
+                onClick={() => setViewProgress(true)}
+                title="View build progress"
+              >
+                <span className="pulse-dot" />
+                Building… {Math.min(state.stepIndex + 1, BUILD_STEPS.length)}/{BUILD_STEPS.length}
+              </button>
+            ) : (
+              <button className="ghost-btn small" onClick={() => build()} title="Rebuild now">
+                Rebuild
+              </button>
+            ))}
+          <button className="ghost-btn small" onClick={() => setShowSettings(true)} title="Settings">
+            Settings
+          </button>
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+        </header>
+
+        {showTodayError && view !== "today" && (
+          <div className="banner error banner-row banner-slim" role="alert">
+            <span className="banner-text">
+              <b>Today&apos;s build failed.</b> {state.error}
+            </span>
+            <button className="ghost-btn small" onClick={() => setView("today")}>
+              View
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => setDismissedError(state.error)}
+              title="Dismiss"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
         )}
-      </main>
+
+        <main className="main">
+          <div className="view-library" hidden={view !== "library"}>
+            <Library
+              state={archive.state}
+              archiveUrl={archiveUrl}
+              onReload={archive.reload}
+              onOpen={openArticle}
+              cursorId={cursorId}
+              onCursor={setCursorId}
+              keysActive={view === "library" && !readerOpen && !showSettings}
+              onOpenSettings={() => setShowSettings(true)}
+            />
+          </div>
+          {todayMounted && (
+            <div className="today-pane" hidden={view !== "today"}>
+              {renderToday()}
+            </div>
+          )}
+        </main>
+      </div>
 
       {reader && (
         <Reader
@@ -297,6 +349,7 @@ export default function App() {
           onChangeInterval={changeInterval}
           onClose={() => setShowSettings(false)}
           onSave={savePrompt}
+          canRebuild={!!apiKey}
         />
       )}
     </div>

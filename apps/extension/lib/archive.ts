@@ -63,18 +63,27 @@ function toMeta(base: string, s: ApiSnapshot): ArchiveArticleMeta {
   };
 }
 
-async function getJson<T>(url: string, timeoutMs: number): Promise<T> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const response = await fetch(url, { signal: signal ? AbortSignal.any([timeout, signal]) : timeout });
   if (!response.ok) throw new Error(`archive responded ${response.status} for ${url}`);
   return (await response.json()) as T;
 }
+
+/** The bridge the new-tab page uses: `getArticles` can be cancelled by the caller. */
+export type CancellableArchiveBridge = Omit<ArchiveBridge, "getArticles"> & {
+  getArticles(args: {
+    ids: string[];
+    signal?: AbortSignal;
+  }): ReturnType<ArchiveBridge["getArticles"]>;
+};
 
 /**
  * The user's Amber archive over its local JSON API. Used by the service worker
  * (the build) and by the new-tab page (the library and reader), so both see the
  * same shape.
  */
-export function createArchiveBridge(archiveUrl: string): ArchiveBridge {
+export function createArchiveBridge(archiveUrl: string): CancellableArchiveBridge {
   const normalized = normalizeArchiveUrl(archiveUrl);
   // Rejected from the methods, not here, so callers that build the bridge inside an
   // effect get a rejected promise they already handle rather than a throw.
@@ -96,7 +105,7 @@ export function createArchiveBridge(archiveUrl: string): ArchiveBridge {
       };
     },
 
-    async getArticles({ ids }) {
+    async getArticles({ ids, signal }) {
       const base = need();
       const articles: ArchiveArticle[] = [];
       const failed: Array<{ id: string; reason: string }> = [];
@@ -106,6 +115,7 @@ export function createArchiveBridge(archiveUrl: string): ArchiveBridge {
             const body = await getJson<ApiText>(
               `${base}/api/snapshots/${encodeURIComponent(id)}/text`,
               TEXT_TIMEOUT_MS,
+              signal,
             );
             articles.push({ ...toMeta(base, body), text: body.text });
           } catch (err) {

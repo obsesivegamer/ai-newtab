@@ -11,6 +11,22 @@ type Load =
   | { status: "ready"; article: ArchiveArticle }
   | { status: "error"; message: string };
 
+const UNREACHABLE = "Couldn't reach Amber. Is it running? Start it with ./run.sh";
+
+type FetchResult = { article: ArchiveArticle } | { error: string };
+
+interface InFlight {
+  promise: Promise<FetchResult>;
+  controller: AbortController;
+  watchers: number;
+}
+
+function failureMessage(reason: string): string {
+  if (/responded 404/.test(reason)) return "Amber has no readable text for this article.";
+  if (/responded \d+/.test(reason)) return "Amber answered with an error.";
+  return UNREACHABLE;
+}
+
 function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -38,7 +54,6 @@ export function Reader({
 }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
-  const cache = useRef(new Map<string, ArchiveArticle>());
   const scrollRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const { size, canShrink, canGrow, shrink, grow } = useTextSize();
@@ -47,6 +62,59 @@ export function Reader({
   const previous = position > 0 ? list[position - 1] : null;
   const next = position >= 0 && position < list.length - 1 ? list[position + 1] : null;
   const meta = position >= 0 ? list[position] : null;
+
+  // One request per article id, shared by the main load and the prefetch. It is aborted
+  // once nothing is watching it any more (the reader moved on), and cached on success.
+  const cache = useRef(new Map<string, ArchiveArticle>());
+  const inflight = useRef(new Map<string, InFlight>());
+
+  const watch = useCallback(
+    (articleId: string, url: string) => {
+      let entry = inflight.current.get(articleId);
+      if (!entry) {
+        const controller = new AbortController();
+        const created: InFlight = {
+          controller,
+          watchers: 0,
+          promise: createArchiveBridge(url)
+            .getArticles({ ids: [articleId], signal: controller.signal })
+            .then(({ articles, failed }): FetchResult => {
+              const article = articles[0];
+              if (article) {
+                cache.current.set(articleId, article);
+                return { article };
+              }
+              return { error: failureMessage(failed[0]?.reason ?? "") };
+            })
+            .catch((): FetchResult => ({ error: UNREACHABLE }))
+            .finally(() => {
+              if (inflight.current.get(articleId) === created) inflight.current.delete(articleId);
+            }),
+        };
+        inflight.current.set(articleId, created);
+        entry = created;
+      }
+      const shared = entry;
+      shared.watchers++;
+      let released = false;
+      return {
+        promise: shared.promise,
+        release() {
+          if (released) return;
+          released = true;
+          shared.watchers--;
+          // Deferred a microtask so an effect that re-watches in the same commit keeps it alive.
+          queueMicrotask(() => {
+            if (shared.watchers <= 0) {
+              shared.controller.abort();
+              if (inflight.current.get(articleId) === shared) inflight.current.delete(articleId);
+            }
+          });
+        },
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     if (archiveUrl === null) return;
@@ -61,33 +129,16 @@ export function Reader({
     }
     let cancelled = false;
     setLoad({ status: "loading" });
-    createArchiveBridge(archiveUrl)
-      .getArticles({ ids: [id] })
-      .then(({ articles, failed }) => {
-        if (cancelled) return;
-        const article = articles[0];
-        if (!article) {
-          const reason = failed[0]?.reason ?? "";
-          setLoad({
-            status: "error",
-            message: /responded 404/.test(reason)
-              ? "Amber has no readable text for this article."
-              : /responded \d+/.test(reason)
-                ? "Amber answered with an error."
-                : "Couldn't reach Amber. Is it running? Start it with ./run.sh",
-          });
-          return;
-        }
-        cache.current.set(id, article);
-        setLoad({ status: "ready", article });
-      })
-      .catch(() => {
-        if (!cancelled) setLoad({ status: "error", message: "Couldn't reach Amber. Is it running? Start it with ./run.sh" });
-      });
+    const watcher = watch(id, archiveUrl);
+    void watcher.promise.then((result) => {
+      if (cancelled) return;
+      setLoad("article" in result ? { status: "ready", article: result.article } : { status: "error", message: result.error });
+    });
     return () => {
       cancelled = true;
+      watcher.release();
     };
-  }, [id, archiveUrl, attempt]);
+  }, [id, archiveUrl, attempt, watch]);
 
   // Each article starts at the top, and the pane takes keyboard focus so space and arrows scroll it.
   useEffect(() => {
@@ -99,17 +150,9 @@ export function Reader({
   // Quietly warm the next article so j feels instant.
   useEffect(() => {
     if (!next || !archiveUrl || cache.current.has(next.id) || load.status !== "ready") return;
-    let cancelled = false;
-    void createArchiveBridge(archiveUrl)
-      .getArticles({ ids: [next.id] })
-      .then(({ articles }) => {
-        if (!cancelled && articles[0]) cache.current.set(next.id, articles[0]);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [next, archiveUrl, load.status]);
+    const watcher = watch(next.id, archiveUrl);
+    return () => watcher.release();
+  }, [next, archiveUrl, load.status, watch]);
 
   useEffect(() => {
     if (!keysActive) return;
