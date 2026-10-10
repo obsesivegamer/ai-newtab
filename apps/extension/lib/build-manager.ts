@@ -13,6 +13,14 @@ import {
 } from "./protocol";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
+function archiveHost(url: string): string[] {
+  try {
+    return url.trim() ? [new URL(url).hostname] : [];
+  } catch {
+    return [];
+  }
+}
+
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
 
 /**
@@ -176,7 +184,12 @@ export class BuildManager {
         archive: archiveUrl.trim() ? createArchiveBridge(archiveUrl) : undefined,
         store: extensionStore,
         userSystemPrompt: systemPrompt,
-        blockedSites: async () => (await loadSettings()).blockedSites,
+        // The archive's own host is never a page the agent may scrape: its index
+        // lists every saved article, including ones from blocked sites.
+        blockedSites: async () => {
+          const { blockedSites, archiveUrl: current } = await loadSettings();
+          return [...blockedSites, ...archiveHost(current)];
+        },
         model,
         resumeSessionId,
         signal: this.controller.signal,
