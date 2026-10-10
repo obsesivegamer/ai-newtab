@@ -13,6 +13,12 @@ const TRACKING_PARAMS = new Set([
   "ito", "taid", "mbid", "rss", "ex_cid", "campaign",
 ]);
 
+/** True for the query parameters that only say where a click came from. */
+export function isTrackingParam(key: string): boolean {
+  const k = key.toLowerCase();
+  return TRACKING_PARAMS.has(k) || TRACKING_PREFIX.test(k);
+}
+
 /**
  * A key two spellings of the same article share: no scheme, `www.`, fragment,
  * trailing slash or tracking parameters, and the remaining query in sorted order.
@@ -21,10 +27,7 @@ export function canonicalLink(link: string): string {
   try {
     const u = new URL(link);
     const params = [...u.searchParams.entries()]
-      .filter(([k]) => {
-        const key = k.toLowerCase();
-        return !TRACKING_PARAMS.has(key) && !TRACKING_PREFIX.test(key);
-      })
+      .filter(([k]) => !isTrackingParam(k))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     const query = params.length ? `?${params.map(([k, v]) => `${k}=${v}`).join("&")}` : "";
     const path = u.pathname.replace(/\/+$/, "");

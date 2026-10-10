@@ -67,7 +67,9 @@ export function entryFromFeed(item: FeedItem, archived?: ArchiveArticleMeta): Re
     wordCount: archived?.wordCount,
     paywalled: archived?.paywalled,
     permalink: archived?.permalink,
-    autoFetch: true,
+    // Only the story a person clicked may be saved; the rest of the list is reached with
+    // j/k/arrows and just looks itself up. The opener decides: see `App.openLatest`.
+    autoFetch: false,
   };
 }
 

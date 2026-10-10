@@ -85,31 +85,55 @@ tab's Sandpack frame. Anything else is ignored. The prompt in
 **`homepage:open-url` contract.** For a story from `getFeeds` that is not in the
 archive there is no snapshot id, so the model-written page sends
 `window.parent.postMessage({ type: "homepage:open-url", url: item.link }, "*")`
-(the item's `link`, verbatim). The new-tab page accepts it under the same sender
-rule as above (`source` is the `contentWindow` of an iframe inside `.today-frame`)
-and only when `type` is exactly `"homepage:open-url"` and `url` is a string that
-parses as an `http:` or `https:` URL. It then opens the Reader on that URL: the
-Reader shows the feed's title and summary at once, and fetches the full text by
-saving the URL to Amber (on that click only) and reading the snapshot. Anything
-that fails the checks is ignored. Stories the user already saved keep using
-`homepage:open-article`: the `getFeeds` handler itself matches each item to the
-archive (by canonical link) and attaches `archiveId` and `permalink`, and the
-prompt tells the model to use the open-article message for items that have them
-and open-url for the rest.
+(the item's `link`, verbatim). Both `homepage:open-article` and `homepage:open-url`
+pass one gate in `App.tsx`: the message is a plain object with exactly that `type`;
+its `source` is the `contentWindow` of an iframe inside `.today-frame`; the Today
+tab is showing and no Reader is open (a hidden or covered frame cannot have been
+clicked, and a page may not replace what you are reading); at most 3 requests per
+second are looked at and an immediate repeat is dropped. Then, for open-url, `url`
+must be a string of at most 2048 characters that parses as `http:` or `https:` with
+no credentials and passes `isAllowedUrl` against the blocked-sites list (so
+loopback, private hosts and Amber's own address are refused). The parsed `href` is
+used from then on, with `%27` turned back into `'` (the model's links arrive with
+the apostrophe percent-encoded). The page opens the in-page Reader on it and does
+nothing else: it never navigates, opens a window, or saves. The Reader shows the
+host as a title and a "Fetch full article" button; pressing that button (a user
+gesture in the extension's own UI) is what saves the URL to Amber. Before that it
+may only *look the address up* (`GET /api/lookup`), so a story already in Amber
+reads at once. Stories the user already saved keep using `homepage:open-article`:
+the `getFeeds` handler itself matches each item to the archive (by canonical link)
+and attaches `archiveId` and `permalink`, and the prompt tells the model to use the
+open-article message for items that have them and open-url for the rest.
 
-**Latest and the Reader.** The new-tab page's default view, Latest, is deterministic (no
-model, no API key): the page itself fetches the user's sources' feeds
-(`createFeedBridge`, `lib/feeds.ts`), merges them newest first, and marks stories whose
-link matches an archived article's `originalUrl` as "In Amber". Opening a story in the
-Reader reads it from the archive when it is there; otherwise the Reader shows the
-feed's headline and summary at once and `lib/archive-save.ts` does lookup, then (only
-because the person opened it) `POST /api/save`, poll `/api/jobs/{id}` about every 2 s
-for up to about 90 s, then `/api/snapshots/{id}/text`. A found snapshot that is not
-`usable` is treated as not archived, and failures come back typed (`amber-down`,
-`no-api`, `busy`, `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`). A
-`homepage:open-url` message never triggers a save: the Reader waits for the person to
-press "Fetch full article". Rapid repeats are dropped, and the message is only
-honoured while the Today tab is showing and no Reader is open.
+**Latest and the Reader.** The new-tab page's default view, Latest, is deterministic
+(no model, no API key). The page itself fetches the user's sources' feeds, one source
+at a time, and shows each source's stories as it settles; one slow feed (each has a
+15 s limit) never holds the others back. The last fetch is stored in
+`chrome.storage.local` (`latestFeed`) and shared by every new tab: a tab shows it at
+once and refetches only when it is older than 5 minutes, the set of sources changed,
+or you pressed refresh. Stories whose link host is on the blocked-sites list are
+dropped on the page. Stories whose link matches an archived article's `originalUrl`
+(`articleKey`: canonical link, `%27` as `'`) are marked "In Amber".
+
+Saving rules, in one place: nothing is ever saved to Amber except as the direct result
+of a person's gesture on a story.
+
+- A click or Enter on a Latest row opens its Reader with permission to save
+  (`ReaderEntry.autoFetch`). The Reader reads from the archive when the story is
+  there; otherwise it shows the headline and summary and `lib/archive-save.ts` does
+  lookup, then `POST /api/save`, then polls `/api/jobs/{id}` about every 2 s for up
+  to about 90 s, then `/api/snapshots/{id}/text`.
+- Anything reached afterwards with j/k, the arrows or the next card, and anything
+  opened by the model-built page, only looks itself up and otherwise shows "Fetch
+  full article"; pressing it is the gesture. A forced recapture ("Try capturing
+  again" on a paywall stub) belongs to the article it was pressed on.
+- A found snapshot that is not `usable` is treated as not archived. Failures come
+  back typed: `amber-down`, `no-api` (an Amber without the save API), `busy`,
+  `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`.
+
+Settings: saving the Sources list or the archive address never starts a build. The
+footer offers "Save & rebuild" only when the instructions or the blocked-sites list
+changed; otherwise it is just "Save".
 
 ## Layout
 
@@ -121,7 +145,10 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   schemas.ts              custom tool input schemas (getFeeds, getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
-  link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the extension's feed parser
+  link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the feed parser
+  feeds.ts                parseFeed, fetchSourceFeeds, mergeSourceFetches, createFeedBridge, probeFeed: fetch + AbortSignal only,
+                          hardened against hostile feeds (body cap, per-element caps, linear-time scanning, private-address checks)
+  feed-catalog.ts         the table of publications we know feeds for, seeding, and the pure source-list edits
   types.ts                BrowserBridge, ArchiveBridge, FeedBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
@@ -129,11 +156,17 @@ apps/extension/           MV3 extension (WXT + React)
     background.ts         service worker: hosts BuildManager, alarm heartbeat
     scraper.content.ts    injected into scraped tabs: scroll, return HTML
     newtab/               the new-tab UI (thin client onto the worker)
+      components/Latest.tsx   the live stream: chips, search, per-source retry, "In Amber" marker
+      useLatest.ts            progressive fetch, the shared stored fetch, blocked-site filter, archive index
+      components/Reader.tsx   reads an archived story or a story from outside the archive
+      readerEntry.ts          what the Reader opens: an archive id or an external story
   lib/
     build-manager.ts      single-flight build host, broadcast, keepalive, reattach
     browser-bridge.ts     BrowserBridge over chrome.history / chrome.tabs
     archive.ts            ArchiveBridge over fetch to Amber's JSON API; shared by the worker and the new-tab page
-    archive-save.ts       lookup / save / poll / read against Amber's save API: the Reader's "fetch the full article"
+    archive-save.ts       lookup / save / poll / read against Amber's save API (GET and POST): the Reader's "fetch the full article"
+    feeds.ts              re-exports agent-core's feed code for the extension
+    sources.ts            the stored catalog of sources (chrome.storage), seeding from the archive and history
     history.ts            getHistory: group and rank chrome.history by domain
     scraper.ts            getPageHtml: load URLs in a background window, sanitize HTML
     protocol.ts           page ↔ worker messages and the five UI build steps
@@ -141,8 +174,9 @@ apps/extension/           MV3 extension (WXT + React)
     storage.ts            chrome.storage keys, settings (incl. archiveUrl), saved homepage
     transpile.ts          TSX → JS for the preview
 
-harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (and an
-                          Amber ArchiveBridge reading AMBER_URL), test the extension
+harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (an Amber
+                          ArchiveBridge reading AMBER_URL, a FeedBridge reading FEEDS or the known
+                          table), test the extension
 ```
 
 ## Live feeds (`getFeeds`)
@@ -248,7 +282,7 @@ existing ones: `getArchive` reports `history`, `getArchiveArticles` reports
 | Command | Proves |
 |---|---|
 | `pnpm test` | The history digest is capped, ranked, drops `urls[]`, reports `totalSitesSeen` |
-| `pnpm agent:run` | Full build against the real API: tools, mounting, sandbox grep/read, deliverable, cleanup. Uses Amber at `AMBER_URL` when it is reachable |
+| `pnpm agent:run` | Full build against the real API: tools, mounting, sandbox grep/read, deliverable, cleanup. Uses Amber at `AMBER_URL` when it is reachable, and live feeds from `FEEDS` (comma-separated feed addresses) or the known publications table |
 | `pnpm agent:verify` | The deliverable transforms, evaluates and server-renders |
 | `pnpm agent:resume-test` | A build killed with a tool call pending can be reattached and finished |
 | `pnpm agent:retention <sessionId>` | The session and every uploaded page body are actually deleted |

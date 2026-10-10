@@ -401,11 +401,20 @@ async function main() {
     if (p.entry?.level === "error") consoleErrors.push({ phase, text: p.entry.text });
   });
 
+  // Requests the page makes to anything but Amber and itself (feeds, mostly), while `collect` is set.
+  let collect: string[] | null = null;
+  page.on("Network.requestWillBeSent", (p) => {
+    const url: string = p.request?.url ?? "";
+    if (!collect || url.startsWith("chrome-extension://") || url.startsWith("data:") || url.startsWith(AMBER)) return;
+    collect.push(url);
+  });
+
   // ---- UI drivers: real mouse and key events ------------------------------
   const KEYS: Record<string, { code: string; vk: number }> = {
     Enter: { code: "Enter", vk: 13 },
     Escape: { code: "Escape", vk: 27 },
     "/": { code: "Slash", vk: 191 },
+    j: { code: "KeyJ", vk: 74 },
   };
   async function key(k: string) {
     const d = KEYS[k];
@@ -510,15 +519,17 @@ async function main() {
     }
   })();
   const FIXTURE_NOT_SAVED = "https://example.com/verify-newtab-fixture-not-archived";
+  const FIXTURE_FUTURE_TITLE = "Fixture story dated two days ahead";
   const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   const fixtureXml = () => {
     const at = new Date().toUTCString();
     const items = [
       archivedFixture && { title: archivedFixture.title, link: archivedFixture.link, d: "From the fixture feed: already in the archive." },
       { title: "Fixture story that is not in the archive yet", link: FIXTURE_NOT_SAVED, d: "From the fixture feed: Amber has never seen this address." },
-    ].filter(Boolean) as Array<{ title: string; link: string; d: string }>;
+      { title: FIXTURE_FUTURE_TITLE, link: "https://example.com/verify-newtab-future", d: "Dated two days ahead: a feed bug.", at: new Date(Date.now() + 2 * 86_400_000).toUTCString() },
+    ].filter(Boolean) as Array<{ title: string; link: string; d: string; at?: string }>;
     return `<?xml version="1.0"?><rss version="2.0"><channel><title>Verify fixture</title>${items
-      .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${at}</pubDate><description>${esc(i.d)}</description></item>`)
+      .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${i.at ?? at}</pubDate><description>${esc(i.d)}</description></item>`)
       .join("")}</channel></rss>`;
   };
   fixtureServer = Bun.serve({
@@ -539,6 +550,13 @@ async function main() {
       "latest rows or notice",
       ms,
     );
+  /** Every source has answered (or timed out) and the fetch was stored: "Updated …" and the refresh button is live. */
+  const latestSettled = (ms = 60_000) =>
+    waitFor(
+      `/^Updated /.test(document.querySelector(".view-latest .lib-head .meta")?.textContent || "") && !document.querySelector(".view-latest .latest-refresh")?.disabled`,
+      "Latest to settle",
+      ms,
+    );
   /** Open Latest's first row matching `where` (a JS predicate over the row element) and return its id. */
   const rowId = (where: string) =>
     page.evaluate<string | null>(`(() => {
@@ -556,6 +574,8 @@ async function main() {
     const before = snapshotCount();
     await waitFor(`document.querySelector(".view-latest")`, "latest pane");
     await latestReady();
+    await latestSettled();
+    await sleep(400);
     const seeded = await page.evaluate<any>(`(() => ({
       rows: document.querySelectorAll(".view-latest .row").length,
       chips: [...document.querySelectorAll(".view-latest .chips .chip")].map((c) => c.textContent.trim()),
@@ -621,6 +641,90 @@ async function main() {
     await sleep(200);
     await key("Escape");
 
+    // A story dated days in the future is a feed bug: no row for a day that hasn't happened.
+    {
+      const future = await page.evaluate<any>(`(() => {
+        const row = [...document.querySelectorAll(".view-latest .row")].find((r) => r.querySelector(".row-title").textContent === ${JSON.stringify(FIXTURE_FUTURE_TITLE)});
+        if (!row) return null;
+        const group = row.closest(".day-group")?.querySelector(".day span")?.textContent || "";
+        return { group, time: row.querySelector(".row-time")?.textContent || "" };
+      })()`);
+      check(
+        "A future-dated story is filed under Date unknown, with no time",
+        !!future && future.group === "Date unknown" && future.time === "",
+        future ? `group "${future.group}", time "${future.time}"` : "row not found",
+      );
+      const labels = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .day span:first-child")].map((e) => e.textContent)`);
+      check("Every day group in Latest is unique", new Set(labels).size === labels.length, labels.join(" | "));
+    }
+
+    // A new tab shows the stored fetch and does not refetch the feeds; refresh does.
+    {
+      phase = `${theme}:latest-cache`;
+      await latestSettled();
+      await sleep(500);
+      const stored = await page.evaluate<any>(`chrome.storage.local.get("latestFeed").then((r) => r.latestFeed || null)`);
+      const clean = !!stored && stored.results.every((r: any) => !r.error);
+      collect = [];
+      await load();
+      const shown = await waitFor(`document.querySelectorAll(".view-latest .row").length > 0`, "stored stream", 5000);
+      await sleep(2500);
+      check(
+        "A new tab shows the stored fetch without refetching feeds",
+        shown && collect.length === 0,
+        `${collect.length} request(s)${collect.length ? `, e.g. ${collect[0].slice(0, 60)}` : ""}`,
+        !clean,
+      );
+      collect = [];
+      await click(".view-latest .latest-refresh");
+      await sleep(3000);
+      check("Refresh does refetch the feeds", collect.length > 0, `${collect.length} request(s)`);
+      collect = null;
+      await waitFor(`!document.querySelector(".view-latest .latest-refresh")?.disabled`, "refresh to settle", 40_000);
+    }
+
+    // The blocked-sites list applies to Latest by the host of each story's link.
+    {
+      phase = `${theme}:latest-blocked`;
+      await setStorage({ blockedSites: ["example.com"] });
+      await load();
+      await latestReady();
+      await waitFor(`document.querySelector(".view-latest .row")`, "rows");
+      await sleep(600);
+      const titles = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .row-title")].map((e) => e.textContent)`);
+      const sawFixtureArchived = archivedFixture ? titles.includes(archivedFixture.title) : true;
+      check(
+        "Stories on a blocked site are not shown in Latest",
+        titles.length > 0 && !titles.some((t) => /not in the archive yet|dated two days ahead/.test(t)) && sawFixtureArchived,
+        `${titles.length} rows, example.com stories absent`,
+      );
+      await page.evaluate(`chrome.storage.local.remove("blockedSites")`);
+      await load();
+      await latestReady();
+    }
+
+    // Progressive: stories appear as sources settle, not when the slowest one does (first pass only).
+    if (theme === "dark") {
+      phase = `${theme}:latest-progressive`;
+      await page.evaluate(`chrome.storage.local.remove("latestFeed")`);
+      await load();
+      const t0 = Date.now();
+      let firstRow = -1;
+      let settled = -1;
+      while (Date.now() - t0 < 60_000 && settled < 0) {
+        const s = await page.evaluate<any>(`({ rows: document.querySelectorAll(".view-latest .row").length, busy: !!document.querySelector(".view-latest .latest-refresh")?.disabled })`);
+        if (firstRow < 0 && s.rows > 0) firstRow = Date.now() - t0;
+        if (firstRow >= 0 && !s.busy) settled = Date.now() - t0;
+        await sleep(60);
+      }
+      check(
+        "Latest shows stories before the slowest feed has answered",
+        firstRow >= 0 && settled >= 0 && firstRow < settled,
+        `first row at ${firstRow} ms, all settled at ${settled} ms`,
+        true,
+      );
+    }
+
     // An archived story opens straight in the Reader, from the archive, without a save.
     if (archivedFixture) {
       phase = `${theme}:latest-archived-reader`;
@@ -633,6 +737,22 @@ async function main() {
         const pos = await text(".reader-bar .bar-pos");
         check('The Reader names where it came from and walks the Latest list', /Latest/.test(back) && /\d+ of \d+/.test(pos), `${back.trim()} · ${pos.trim()}`);
         check("Opening an archived story saved nothing new", snapshotCount() === snaps);
+        // Walking the list is not a request to save: neighbours only look themselves up.
+        for (let n = 0; n < 10; n++) {
+          await key("j");
+          await sleep(150);
+        }
+        await waitFor(`document.querySelector(".reader-fetch.idle") || document.querySelectorAll(".reader-body p").length > 0 || document.querySelector(".reader-notice")`, "a neighbour to settle", 15_000);
+        const walked = await page.evaluate<any>(`({
+          position: document.querySelector(".reader-bar .bar-pos")?.textContent || "",
+          idle: !!document.querySelector(".reader-fetch.idle .solid-btn"),
+          fetching: !!document.querySelector(".reader-fetch:not(.idle)"),
+        })`);
+        check(
+          "Pressing j ten times saves nothing and starts no fetch",
+          snapshotCount() === snaps && !walked.fetching,
+          `${walked.position.trim()}, ${walked.idle ? 'shows "Fetch full article"' : "already readable"}, snapshots ${snaps} -> ${snapshotCount()}`,
+        );
         await key("Escape");
         await waitFor(`!document.querySelector(".reader")`, "reader to close");
         const focus = await page.evaluate<boolean>(`!!document.activeElement?.closest?.(".view-latest .row")`);
@@ -951,7 +1071,7 @@ export default function App() {
   return <button style={{ position: "fixed", inset: 0, width: "100%", fontSize: 28 }} onClick={() => {
     send("javascript:alert(1)");
     send(${JSON.stringify(AMBER + "/")});
-    send(${JSON.stringify(FIXTURE_NOT_SAVED)});
+    send(${JSON.stringify(FIXTURE_NOT_SAVED + "-it%27s")});
   }}>open</button>;
 }`;
     await setStorage({
@@ -995,9 +1115,81 @@ export default function App() {
         check("The host stands in for the title, and nothing was fetched on its own", state.title === "example.com" && !state.fetching, `title "${state.title}"`);
         check('The Reader waits for "Fetch full article"', state.button);
         check("A javascript: or loopback address never opened anything", state.title === "example.com", state.title);
+        const original = await page.evaluate<string>(`document.querySelector(".reader-links a")?.getAttribute("href") || ""`);
+        check("An encoded apostrophe (%27) reaches the Reader as an apostrophe", original.endsWith("it's"), original);
         check("The new tab was not navigated away", state.href.startsWith("chrome-extension://"), state.href);
         check("Nothing was saved to Amber by the message", snapshotCount() === snaps, `${snaps} -> ${snapshotCount()}`);
         await shot("13-today-open-url-reader");
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      }
+
+      // Settings: a rebuild is only offered when what the model reads changed, and Save never starts one.
+      phase = "settings-rebuild";
+      const footer = () =>
+        page.evaluate<string[]>(`[...document.querySelectorAll(".modal-foot button")].map((b) => b.textContent.trim())`);
+      await click(".topbar button", "Settings");
+      await waitFor(`document.querySelector(".modal")`, "settings modal");
+      await waitFor(`document.querySelector("#set-archive") && !document.querySelector("#set-archive").disabled`, "archive field");
+      const unchanged = await footer();
+      check("Settings offers only Save when nothing the model reads changed", unchanged.join("|") === "Cancel|Save", unchanged.join(" | "));
+      await click("#set-prompt");
+      await page.send("Input.insertText", { text: "Lead with the economy. " });
+      await sleep(200);
+      const edited = await footer();
+      check(
+        'Editing the instructions offers "Save" and "Save & rebuild"',
+        edited.join("|") === "Cancel|Save|Save & rebuild",
+        edited.join(" | "),
+      );
+      await shot("15-settings-save-and-rebuild");
+      await click(".modal-foot button", "Save");
+      await waitFor(`!document.querySelector(".modal")`, "settings to close");
+      await sleep(1500);
+      const building = await page.evaluate<boolean>(
+        `/Building/.test(document.querySelector(".topbar")?.textContent || "") || !!document.querySelector(".build")`,
+      );
+      check("Plain Save did not start a build", !building);
+      await click(".topbar button", "Settings");
+      await waitFor(`document.querySelector(".modal")`, "settings modal");
+      await click("#set-prompt");
+      await key("Escape");
+      await waitFor(`!document.querySelector(".modal")`, "settings to close");
+      await page.evaluate(`chrome.storage.local.remove("systemPrompt")`);
+
+      // open-article obeys the same gate: visible Today tab, no Reader open, from the frame only.
+      if (archivedFixture) {
+        phase = "open-article";
+        const articleCode = `import React from "react";
+export default function App() {
+  return <button style={{ position: "fixed", inset: 0, width: "100%", fontSize: 28 }} onClick={() => {
+    window.parent.postMessage({ type: "homepage:open-article", id: ${JSON.stringify(archivedFixture.id)} }, "*");
+  }}>open</button>;
+}`;
+        await setStorage({ homepageData: { code: articleCode, timestamp: new Date().toISOString() } });
+        await load();
+        await click(".tab", "Today");
+        const up = await waitFor(`document.querySelector(".today-frame iframe")`, "Today iframe", 20_000);
+        if (up) {
+          await sleep(8000);
+          const where = await page.evaluate<{ x: number; y: number } | null>(`(() => {
+            const r = document.querySelector(".today-frame iframe")?.getBoundingClientRect();
+            return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+          })()`);
+          if (where) {
+            for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+              await page.send("Input.dispatchMouseEvent", {
+                type,
+                x: where.x,
+                y: where.y,
+                button: type === "mouseMoved" ? "none" : "left",
+                clickCount: type === "mouseMoved" ? 0 : 1,
+              });
+            }
+          }
+          const read = await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "archived story from the homepage", 15_000);
+          check("homepage:open-article from the visible Today frame opens the archived story", read);
+        }
       }
     }
     await page.evaluate(`chrome.storage.local.remove(["apiKey", "homepageData", "autoRebuild"])`);

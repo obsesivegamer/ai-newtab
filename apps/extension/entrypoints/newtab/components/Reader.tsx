@@ -129,7 +129,10 @@ export function Reader({
   keysActive: boolean;
 }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
-  const [run, setRun] = useState({ n: 0, force: false });
+  /** Retries and forced recaptures belong to the article they were asked on, never the next one. */
+  const [run, setRun] = useState({ key: "", n: 0, force: false });
+  const runN = run.key === entry.key ? run.n : 0;
+  const runForce = run.key === entry.key && run.force;
   /** The key of the address-only entry the person pressed "Fetch full article" on. */
   const [requestedKey, setRequestedKey] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -243,7 +246,7 @@ export function Reader({
     setLoad(mayFetch ? { status: "fetching", stage: "checking" } : { status: "loading" });
     void fetchFullArticle(
       archiveUrl,
-      { url: entry.url, force: run.force, saveIfMissing: mayFetch },
+      { url: entry.url, force: runForce, saveIfMissing: mayFetch },
       { signal: controller.signal, onStatus: (stage) => setLoad({ status: "fetching", stage }) },
     ).then((result) => {
       if (controller.signal.aborted) return;
@@ -260,7 +263,7 @@ export function Reader({
     });
     return () => controller.abort();
     // `entry` is a new object whenever the list rebuilds; its key and address are what identify the work.
-  }, [entry.key, entry.archiveId, entry.url, archiveUrl, run, mayFetch, watch]);
+  }, [entry.key, entry.archiveId, entry.url, archiveUrl, runN, runForce, mayFetch, watch]);
 
   // Each article starts at the top, and the pane takes keyboard focus so space and arrows scroll it.
   useEffect(() => {
@@ -322,7 +325,7 @@ export function Reader({
   const waiting = load.status === "fetching" || load.status === "loading";
   const elapsed = useElapsed(load.status === "fetching");
 
-  const retry = (force = false) => setRun((r) => ({ n: r.n + 1, force }));
+  const retry = (force = false) => setRun({ key: entry.key, n: runN + 1, force });
 
   return (
     <div className="reader" role="dialog" aria-modal="true" aria-label={title || "Article"}>

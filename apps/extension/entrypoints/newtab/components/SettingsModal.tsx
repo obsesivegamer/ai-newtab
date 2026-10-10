@@ -82,13 +82,18 @@ export function SettingsModal({
   intervalHours: number;
   onChangeInterval: (next: number) => void;
   onClose: () => void;
-  onSave: (prompt: string, blockedSites: string[]) => void;
-  /** False without an API key: saving can't start a build, so the button just says "Save". */
+  onSave: (prompt: string, blockedSites: string[], rebuild: boolean) => void;
+  /** False without an API key: there is nothing to rebuild with, so only "Save" is offered. */
   canRebuild?: boolean;
 }) {
-  const saveLabel = canRebuild ? "Save & rebuild" : "Save";
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
+  // A rebuild is paid for, so it is only offered when what the model reads actually changed:
+  // the standing instructions or the blocked list. Sources and the archive address don't need one.
+  const rebuildMeaningful =
+    canRebuild &&
+    (draft !== initialPrompt ||
+      normalizeBlockList(blockedDraft.split("\n")).join("\n") !== normalizeBlockList(blockedSites).join("\n"));
   const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
   const [archiveLoaded, setArchiveLoaded] = useState(false);
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
@@ -158,7 +163,7 @@ export function SettingsModal({
     if (value === "") {
       setArchiveCheck({
         state: "ok",
-        message: `The archive is off. Click ${saveLabel} to use browsing history only.`,
+        message: `The archive is off. Click Save to use browsing history only.`,
       });
       return;
     }
@@ -173,7 +178,7 @@ export function SettingsModal({
     setArchiveCheck(result);
   };
 
-  const save = async () => {
+  const save = async (rebuild: boolean) => {
     const value = archiveValue();
     if (value === null) {
       archiveRequest.current++;
@@ -184,7 +189,7 @@ export function SettingsModal({
     // Written before the rebuild starts, so the build reads the new address.
     if (archiveLoaded) await saveSetting("archiveUrl", value);
     if (sources && sourcesDirty) await saveSources(sources);
-    onSave(draft, normalizeBlockList(blockedDraft.split("\n")));
+    onSave(draft, normalizeBlockList(blockedDraft.split("\n")), rebuild && rebuildMeaningful);
   };
 
   const statusClass =
@@ -213,7 +218,7 @@ export function SettingsModal({
       setFeedInput("");
       setSourceCheck({
         state: "ok",
-        message: `Added. ${found.itemCount} article${found.itemCount === 1 ? "" : "s"} in that feed. Click ${saveLabel} to keep it.`,
+        message: `Added. ${found.itemCount} article${found.itemCount === 1 ? "" : "s"} in that feed. Click Save to keep it.`,
       });
     } catch (err) {
       if (request !== sourcesRequest.current) return;
@@ -247,7 +252,7 @@ export function SettingsModal({
     } else {
       setSourceCheck({
         state: "ok",
-        message: `Added ${added.length}: ${added.map((a) => a.name).join(", ")}. Click ${saveLabel} to keep ${added.length === 1 ? "it" : "them"}.${skipped}`,
+        message: `Added ${added.length}: ${added.map((a) => a.name).join(", ")}. Click Save to keep ${added.length === 1 ? "it" : "them"}.${skipped}`,
       });
     }
   };
@@ -365,7 +370,7 @@ export function SettingsModal({
             </label>
             <p id="archive-help" className="set-hint">
               Where your saved articles live. Leave empty to build from browsing history only.
-              Saved when a test succeeds or you click {saveLabel}.
+              Saved when a test succeeds or you click Save.
             </p>
             <input
               id="set-archive"
@@ -403,7 +408,7 @@ export function SettingsModal({
             <h3 className="set-title">Sources</h3>
             <p id="sources-help" className="set-hint">
               The publications the Latest view and Today pull current articles from, read from their
-              public feeds. Changes are saved when you click {saveLabel}.
+              public feeds. Changes are saved when you click Save.
             </p>
             {sources === null ? (
               <p className="src-empty" role="status">
@@ -502,9 +507,25 @@ export function SettingsModal({
           <button type="button" className="ghost-btn" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="solid-btn" onClick={() => void save()}>
-            {saveLabel}
-          </button>
+          {rebuildMeaningful ? (
+            <>
+              <button type="button" className="ghost-btn" onClick={() => void save(false)}>
+                Save
+              </button>
+              <button
+                type="button"
+                className="solid-btn"
+                onClick={() => void save(true)}
+                title="Saves, then builds today's homepage again (uses your API key)"
+              >
+                Save &amp; rebuild
+              </button>
+            </>
+          ) : (
+            <button type="button" className="solid-btn" onClick={() => void save(false)}>
+              Save
+            </button>
+          )}
         </footer>
       </div>
     </div>

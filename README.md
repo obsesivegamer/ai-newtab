@@ -27,6 +27,23 @@ readable, paywall-free copy of each article on your Mac.
 - **A Library and a reader that need no model.** The new tab can list the archive
   directly and show the full article text from Amber in a reader pane, with no
   API key and no credits.
+- **Latest: what is new, from the sites you read.** The default tab lists the
+  newest stories from your sources, merged newest first, with source filters and
+  search. It needs no API key and no model. **Every new tab fetches your sources'
+  public RSS/Atom feeds directly from your browser** (no cookies, nothing goes
+  through a server of ours), at most once every five minutes: the last fetch is
+  kept and shared by new tabs, and the refresh button fetches again. Stories from
+  a site on your blocked list are not shown.
+- **Sources.** **Settings → Sources** lists the publications Latest and Today read.
+  It is seeded from the sites in your archive (and your browsing history) for
+  publications we know feeds for; you can switch sources off and add any feed
+  address (or a page that links to one).
+- **Full text on demand.** Open a story that is not in your archive and the reader
+  asks Amber to save it, waits for the capture, and shows the full text. This
+  needs a version of Amber with the save API (`/api/lookup`, `/api/save`:
+  [Amber PR #17](https://github.com/obsesivegamer/amber-archive/pull/17)). Nothing is
+  saved unless you open that story with a click or Enter, or press **Fetch full
+  article** yourself; moving through the list with j/k only looks.
 - **Amber has to be running.** The extension talks to Amber's local JSON API at
   `http://127.0.0.1:8080` (change it in **Settings → Article archive (Amber)**;
   leave it empty to turn the archive off). If Amber is stopped, the Library says
@@ -103,7 +120,7 @@ over the agent's own defaults. This box sets both the content and the look:
 | *"Green-on-black terminal, monospace, like a 1980s BBS."* | Exactly that |
 | *"Skip sports and politics. Always show the weather and my next three calendar events."* | Your rules, every day |
 
-Click **Save & rebuild** to apply them right away.
+Click **Save & rebuild** to apply them right away. (The button appears when the instructions or the blocked-sites list changed; saving sources or the archive address never starts a build.)
 
 **Sites the agent never reads.** Enter one host per line; subdomains are included,
 and `*.example.com` is supported. The editable defaults include common webmail,
@@ -111,6 +128,8 @@ sign-in and document hosts. **Save & rebuild** saves the list and applies it to
 history summaries and URLs requested through `getPageHtml`. A page that redirects
 onto a blocked host is dropped before its content is uploaded. Local-network
 addresses (localhost, private IPs, `.local` and `.internal` hosts) are always blocked.
+
+**Sources.** The publications Latest and Today read. Switch a source off, add a feed address (it is checked first: it must be a feed, or a page that links to one), or re-seed from your archive. Changes are saved with **Save**.
 
 **Article archive (Amber).** The address of your Amber server, default
 `http://127.0.0.1:8080`. **Test connection** reads Amber's article list and tells
@@ -155,6 +174,8 @@ failed build until the next interval, so it never loops.
 
 ## How it works
 
+0. **`getFeeds`**: what is new from your sources: headlines and blurbs from their
+   public feeds, matched to the archive by link.
 1. **`getArchive`**: the agent gets the list of your recent Amber articles
    (titles, publication, date, word count, permalink) and per-publication counts.
 2. **`getArchiveArticles`**: it picks a handful (up to 12 per call, 24 per build),
@@ -192,8 +213,9 @@ pnpm test                # unit tests (no API calls; needs Bun)
 pnpm extension:test      # loads the built extension into headless Chrome (no API calls)
 
 cp .env.example .env     # add ANTHROPIC_API_KEY, then:
-pnpm agent:run           # a full build against the real API, with fixture history and your Amber archive
-                         # (AMBER_URL overrides the address; AMBER_URL= runs without the archive)
+pnpm agent:run           # a full build against the real API, with fixture history, your Amber archive and live feeds
+                         # (AMBER_URL overrides the address; AMBER_URL= runs without the archive;
+                         #  FEEDS=https://a/rss,https://b/rss picks the feeds; FEEDS= turns them off)
 pnpm agent:verify        # check the output actually renders
 ```
 

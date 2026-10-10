@@ -1,16 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
-import {
-  archiveHostOf,
-  isBlocked,
-  normalizeArchiveUrl,
-  runHomepageBuild,
-  type FeedSource,
-  type RunPhase,
-} from "@homepage/agent-core";
+import { archiveHostOf, normalizeArchiveUrl, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
 import { createArchiveBridge } from "./archive";
 import { createFeedBridge } from "./feeds";
-import { DEFAULT_FEEDS, loadSources } from "./sources";
+import { isSourceBlocked, loadSources } from "./sources";
 import { browserBridge } from "./browser-bridge";
 import {
   INITIAL_BUILD_STATE,
@@ -23,17 +16,6 @@ import {
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
-
-/** True when a source's name, its known hosts, or any of its feed addresses is on the blocked list. */
-function isSourceBlocked(source: FeedSource, blocked: string[]): boolean {
-  const known = DEFAULT_FEEDS.find((k) => k.id === source.id);
-  const name = source.name.trim();
-  return (
-    (!/\s/.test(name) && isBlocked(name, blocked)) ||
-    (known?.hosts ?? []).some((host) => isBlocked(host, blocked)) ||
-    source.feedUrls.some((url) => isBlocked(url, blocked))
-  );
-}
 
 /**
  * While a turn is active, ping a cheap chrome API on this interval to reset the

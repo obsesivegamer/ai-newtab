@@ -37,6 +37,7 @@ export function Latest({
   active,
   reloadToken,
   saved,
+  blockedSites,
   cursorId,
   onCursor,
   onOpen,
@@ -48,13 +49,20 @@ export function Latest({
   reloadToken: number;
   /** Stories saved from the Reader this session, by link key, so they say "In Amber" at once. */
   saved: Map<string, ArchiveArticleMeta>;
+  /** Stories whose link is on one of these sites are not shown. */
+  blockedSites: string[];
   cursorId: string | null;
   onCursor: (id: string | null) => void;
   /** Open the reader on `entry`; `list` is the order prev/next should walk. */
   onOpen: (entry: ReaderEntry, list: ReaderEntry[]) => void;
   onOpenSettings: () => void;
 }) {
-  const { state, archived, enabledCount, refresh, retrySource } = useLatest({ archiveUrl, active, reloadToken });
+  const { state, items, statuses, archived, enabledCount, refresh, retrySource } = useLatest({
+    archiveUrl,
+    active,
+    reloadToken,
+    blockedSites,
+  });
   const now = useNow(30_000);
   const [query, setQuery] = useState("");
   const [source, setSource] = useState<string | null>(null);
@@ -63,7 +71,7 @@ export function Latest({
 
   const tokens = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
 
-  const searched = useMemo(() => state.items.filter((i) => matches(i, tokens)), [state.items, tokens]);
+  const searched = useMemo(() => items.filter((i) => matches(i, tokens)), [items, tokens]);
   const visible = useMemo(
     () => (source ? searched.filter((i) => i.source === source) : searched),
     [searched, source],
@@ -145,9 +153,11 @@ export function Latest({
 
   const loading = state.phase === "loading";
   const offline = typeof navigator !== "undefined" && navigator.onLine === false;
-  const everyFailed = !loading && enabledCount > 0 && state.statuses.length > 0 && state.statuses.every((s) => s.error && s.count === 0);
-  const problems = state.statuses.filter((s) => s.error);
-  const hasStream = state.items.length > 0;
+  const settled = state.pending.length === 0;
+  const everyFailed =
+    !loading && settled && enabledCount > 0 && statuses.length > 0 && statuses.every((s) => s.error && s.count === 0);
+  const problems = statuses.filter((s) => s.error && !state.pending.includes(s.name));
+  const hasStream = items.length > 0;
   const noSources = !loading && enabledCount === 0;
 
   const updated = state.refreshing
@@ -169,7 +179,7 @@ export function Latest({
           <button
             type="button"
             className={`icon-btn latest-refresh${state.refreshing ? " spinning" : ""}`}
-            onClick={() => void refresh()}
+            onClick={() => void refresh({ force: true })}
             disabled={state.refreshing || noSources}
             title="Refresh"
             aria-label="Refresh"
@@ -225,6 +235,7 @@ export function Latest({
           </button>
           {chips.map((name) => {
             const n = counts.get(name) ?? 0;
+            const waiting = state.pending.includes(name) && n === 0;
             return (
               <button
                 key={name}
@@ -233,7 +244,7 @@ export function Latest({
                 aria-pressed={source === name}
                 onClick={() => setSource(source === name ? null : name)}
               >
-                {name} <span className="chip-n">{n}</span>
+                {name} <span className="chip-n">{waiting ? "…" : n}</span>
               </button>
             );
           })}
@@ -256,7 +267,7 @@ export function Latest({
             <li key={p.name} className="latest-problem" title={p.error}>
               <span className="latest-problem-dot" aria-hidden="true" />
               <span className="latest-problem-text">
-                <b>{p.name}</b> {p.count === 0 ? "couldn’t load" : "only partly loaded"}
+                <b>{p.name}</b> {p.count === 0 ? "couldn’t load" : "didn’t fully load"}
               </span>
               <button type="button" className="ghost-btn small" onClick={() => void retrySource(p.name)}>
                 Retry
@@ -290,15 +301,15 @@ export function Latest({
               ? "Latest needs a connection. Your saved articles are still in the Library."
               : "None of your sources answered. Check your connection, then try again."
           }
-          action={{ label: "Retry", onClick: () => void refresh() }}
+          action={{ label: "Retry", onClick: () => void refresh({ force: true }) }}
         />
       )}
 
-      {!loading && enabledCount > 0 && !hasStream && !everyFailed && (
+      {!loading && settled && enabledCount > 0 && !hasStream && !everyFailed && (
         <Notice
           title={`Nothing new in the last ${Math.round(LATEST_HOURS / 24)} days.`}
           body="Your sources haven’t published anything in that time."
-          action={{ label: "Check again", onClick: () => void refresh() }}
+          action={{ label: "Check again", onClick: () => void refresh({ force: true }) }}
         />
       )}
 

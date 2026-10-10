@@ -36,8 +36,8 @@ const ARTICLE_ID = /^[A-Za-z0-9]{3,16}$/;
 /** The same, for a story that is not in the archive: only an address. */
 const OPEN_URL = "homepage:open-url";
 const MAX_OPEN_URL_LENGTH = 2048;
-/** At most this many open-url messages are looked at per second; a page cannot spam the reader. */
-const OPEN_URL_PER_SECOND = 3;
+/** At most this many open requests are looked at per second; a page cannot spam the reader. */
+const MESSAGES_PER_SECOND = 3;
 
 /** Where the reader was opened from, which decides its back label and where focus returns. */
 type ReaderOrigin = "latest" | "library" | "today";
@@ -153,47 +153,47 @@ export default function App() {
       return Array.from(frames).some((frame) => frame.contentWindow !== null && frame.contentWindow === source);
     };
     let recent: number[] = [];
-    let lastUrl = { href: "", at: 0 };
+    let last = { key: "", at: 0 };
 
     const onMessage = (e: MessageEvent) => {
       const data = e.data as { type?: unknown; id?: unknown; url?: unknown } | null;
       if (!data || typeof data !== "object" || Array.isArray(data)) return;
+      if (data.type !== OPEN_ARTICLE && data.type !== OPEN_URL) return;
+
+      // The same gate for both: only the homepage's own frame, only while the Today tab is
+      // showing (a hidden or covered frame can't have been clicked), and not on top of an
+      // open Reader. Bursts are dropped and an immediate repeat is ignored.
+      if (!fromHomepage(e.source)) return;
+      if (viewRef.current !== "today" || readerOpenRef.current) return;
+      const now = Date.now();
+      recent = recent.filter((t) => now - t < 1000);
+      if (recent.length >= MESSAGES_PER_SECOND) return;
+      recent.push(now);
 
       if (data.type === OPEN_ARTICLE) {
         if (typeof data.id !== "string" || !ARTICLE_ID.test(data.id)) return;
-        if (!fromHomepage(e.source)) return;
         const id = data.id;
-        setReader((current) =>
-          current?.entry.archiveId === id
-            ? current
-            : { entry: entryFromId(id), list: [], origin: "today" },
-        );
+        if (last.key === `a:${id}` && now - last.at < 2000) return;
+        last = { key: `a:${id}`, at: now };
+        setReader({ entry: entryFromId(id), list: [], origin: "today" });
         return;
       }
 
-      if (data.type === OPEN_URL) {
-        if (typeof data.url !== "string" || data.url.length === 0 || data.url.length > MAX_OPEN_URL_LENGTH) return;
-        if (!fromHomepage(e.source)) return;
-        // Only a click on the visible Today page is a request; a hidden or covered frame is not.
-        if (viewRef.current !== "today" || readerOpenRef.current) return;
-        const now = Date.now();
-        recent = recent.filter((t) => now - t < 1000);
-        if (recent.length >= OPEN_URL_PER_SECOND) return;
-        recent.push(now);
-        let parsed: URL;
-        try {
-          parsed = new URL(data.url);
-        } catch {
-          return;
-        }
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
-        if (parsed.username || parsed.password) return;
-        if (!isAllowedUrl(parsed.href, blockedRef.current)) return;
-        const href = parsed.href;
-        if (lastUrl.href === href && now - lastUrl.at < 2000) return;
-        lastUrl = { href, at: now };
-        setReader({ entry: entryFromUrl(href), list: [], origin: "today" });
+      if (typeof data.url !== "string" || data.url.length === 0 || data.url.length > MAX_OPEN_URL_LENGTH) return;
+      let parsed: URL;
+      try {
+        parsed = new URL(data.url);
+      } catch {
+        return;
       }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+      if (parsed.username || parsed.password) return;
+      if (!isAllowedUrl(parsed.href, blockedRef.current)) return;
+      // The model's links arrive with `'` percent-encoded; the publisher's address has the apostrophe.
+      const href = parsed.href.replace(/%27/gi, "'");
+      if (last.key === `u:${href}` && now - last.at < 2000) return;
+      last = { key: `u:${href}`, at: now };
+      setReader({ entry: entryFromUrl(href), list: [], origin: "today" });
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -207,7 +207,9 @@ export default function App() {
     setCursorId(id);
   }, []);
   const openLatest = useCallback((entry: ReaderEntry, list: ReaderEntry[]) => {
-    setReader({ entry, list, origin: "latest" });
+    // Opened by a click or Enter on its row: this is the one story that may be saved. Entries
+    // reached afterwards with j/k, the arrows or the next card come from `list` and may not.
+    setReader({ entry: { ...entry, autoFetch: true }, list, origin: "latest" });
     setLatestCursor(entry.key.replace(/^feed:/, ""));
   }, []);
   const readerRef = useRef(reader);
@@ -258,12 +260,14 @@ export default function App() {
   }, []);
 
   const savePrompt = useCallback(
-    async (prompt: string, sites: string[]) => {
+    async (prompt: string, sites: string[], rebuild: boolean) => {
       await Promise.all([saveSetting("systemPrompt", prompt), saveSetting("blockedSites", sites)]);
       setBlockedSites(sites);
       setSystemPrompt(prompt);
       setShowSettings(false);
-      if (apiKey) {
+      // Only an explicit "Save & rebuild" starts a (paid) build; saving sources or the
+      // archive address, or changing nothing the model reads, never does.
+      if (rebuild && apiKey) {
         setRenderedCode(null);
         build();
       }
@@ -422,6 +426,7 @@ export default function App() {
               active={view === "latest" && !readerOpen && !showSettings}
               reloadToken={sourcesRev}
               saved={saved}
+              blockedSites={blockedSites}
               cursorId={latestCursor}
               onCursor={setLatestCursor}
               onOpen={openLatest}

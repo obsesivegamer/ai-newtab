@@ -29,6 +29,8 @@ export const KEYS = {
   rebuildIntervalHours: "autoRebuildIntervalHours",
   /** Throttled mirror of the live build state, for tabs that open while the worker sleeps. */
   buildSnapshot: "buildSnapshot",
+  /** What the Latest view last fetched, shared by every new tab; see entrypoints/newtab/useLatest.ts. */
+  latestFeed: "latestFeed",
 } as const;
 
 export interface Homepage {
