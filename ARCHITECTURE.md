@@ -112,7 +112,7 @@ archive tools answer with an error result and the build runs on history alone.
 | Tool | Does |
 |---|---|
 | `getArchive` | Lists usable archived articles in a window (`sinceDays` 1-90, `limit` 1-60): metadata, permalink, per-publication counts. No bodies. |
-| `getArchiveArticles` | Fetches up to 12 full texts by id, uploads each as a text file (metadata header, blank line, body), mounts them under `/mnt/session/uploads/archive/`, and returns the *resolved* `mount_path`. |
+| `getArchiveArticles` | Fetches up to 12 texts by id per call (24 mounted per build), cuts each to about 2,000 words for the model, uploads each as a text file (metadata header, blank line, body), mounts them under `/mnt/session/uploads/archive/`, and returns the *resolved* `mount_path`. The reader in the new tab always reads the full text. |
 
 The bridge reads two endpoints and nothing else, both GET: `/api/snapshots?since_days=&limit=`
 and `/api/snapshots/<id>/text`. Amber decides what is "usable" (complete, long enough,

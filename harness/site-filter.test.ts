@@ -21,14 +21,18 @@ test("matches hosts and subdomains without matching lookalikes", () => {
   expect(isBlocked("google.com.evil.test", ["google.com"])).toBe(false);
 });
 
-/** Exercise live and replayed tool dispatch without a network or browser. */
-async function runTools(urls: string[], blockedSites?: string[] | (() => Promise<string[]>), resume = false, afterHistory?: () => void, scrape?: BrowserBridge["getPageHtml"]) {
+/**
+ * Exercise live and replayed tool dispatch without a network or browser.
+ * `historyHosts` are domains the getHistory step shows the model first: getPageHtml
+ * only loads hosts the model has been shown, so a test that scrapes a host needs it here.
+ */
+async function runTools(urls: string[], blockedSites?: string[] | (() => Promise<string[]>), resume = false, afterHistory?: () => void, scrape?: BrowserBridge["getPageHtml"], historyHosts: string[] = []) {
   const results: any[] = [];
   const uploads: string[] = [];
   const calls: string[][] = [];
   const logs: string[] = [];
   const events = [
-    { id: "history", type: "agent.custom_tool_use", name: "getHistory", input: { maxResults: 1 } },
+    { id: "history", type: "agent.custom_tool_use", name: "getHistory", input: { maxResults: historyHosts.length || 1 } },
     { id: "pages", type: "agent.custom_tool_use", name: "getPageHtml", input: { urls } },
   ];
   async function* stream() { if (!resume) yield* events; }
@@ -61,7 +65,17 @@ async function runTools(urls: string[], blockedSites?: string[] | (() => Promise
     set: async () => {}, remove: async () => {},
   };
   const bridge: BrowserBridge = {
-    getHistory: async () => ({ sites: fixtureHistory(), totalSitesSeen: fixtureHistory().length }),
+    getHistory: async () => {
+      const extra = historyHosts.map((domain) => ({
+        ...fixtureHistory()[0]!,
+        domain,
+        titles: [domain],
+        urls: [`https://${domain}/`],
+        relevanceScore: 2,
+      }));
+      const sites = [...extra, ...fixtureHistory()];
+      return { sites, totalSitesSeen: sites.length };
+    },
     getPageHtml: scrape ?? (async ({ urls }) => { calls.push(urls); return { pages: [], failed: urls.map(url => ({ url, reason: "unavailable" })) }; }),
   };
   await runHomepageBuild({ client, store, bridge, blockedSites, resumeSessionId: resume ? "session" : undefined, callbacks: { onLog: line => logs.push(line) } });
@@ -104,7 +118,7 @@ test("never forwards blocked or non-http URLs, including on resume", async () =>
 });
 
 test("only forwards allowed URLs in mixed batches", async () => {
-  const { results, calls } = await runTools(["https://bank.test", "https://public.test"], ["bank.test"]);
+  const { results, calls } = await runTools(["https://bank.test", "https://public.test"], ["bank.test"], false, undefined, undefined, ["public.test"]);
   expect(calls).toEqual([["https://public.test"]]);
   expect(JSON.parse(results[1].content[0].text).failed).toEqual([
     { url: "https://bank.test", reason: "blocked by the user's settings" },
@@ -113,8 +127,10 @@ test("only forwards allowed URLs in mixed batches", async () => {
 });
 
 test("uses defaults when unset and honors an explicitly empty list", async () => {
-  expect((await runTools(["https://mail.google.com"])).calls).toEqual([]);
-  expect((await runTools(["https://mail.google.com"], [])).calls).toEqual([["https://mail.google.com"]]);
+  // google.com is in the history digest, so mail.google.com is a shown host: only the block list decides.
+  const shown = ["google.com"];
+  expect((await runTools(["https://mail.google.com"], undefined, false, undefined, undefined, shown)).calls).toEqual([]);
+  expect((await runTools(["https://mail.google.com"], [], false, undefined, undefined, shown)).calls).toEqual([["https://mail.google.com"]]);
 });
 
 test("always blocks loopback, private and local-network hosts", () => {
@@ -140,7 +156,7 @@ test("drops pages that redirected to a blocked host before uploading them", asyn
       { url: urls[1]!, finalUrl: "https://public.test/", title: "Public", html: "<p>news</p>" },
     ],
     failed: [],
-  }));
+  }), ["google.com", "public.test"]);
   const out = JSON.parse(results[1].content[0].text);
   expect(uploads).toHaveLength(1);
   expect(out.pages.map((p: any) => p.url)).toEqual(["https://public.test/"]);

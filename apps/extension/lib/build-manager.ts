@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
-import { createArchiveBridge } from "./archive";
+import { createArchiveBridge, normalizeArchiveUrl } from "./archive";
 import { browserBridge } from "./browser-bridge";
 import {
   INITIAL_BUILD_STATE,
@@ -14,11 +14,8 @@ import {
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 function archiveHost(url: string): string[] {
-  try {
-    return url.trim() ? [new URL(url).hostname] : [];
-  } catch {
-    return [];
-  }
+  const base = normalizeArchiveUrl(url);
+  return base ? [new URL(base).hostname] : [];
 }
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -161,6 +158,11 @@ export class BuildManager {
       return;
     }
 
+    const archiveBase = normalizeArchiveUrl(archiveUrl);
+    if (archiveUrl.trim() && !archiveBase) {
+      console.warn("[BuildManager] archive URL is not a valid http(s) address; building without the archive");
+    }
+
     this.running = true;
     this.controller = new AbortController();
     this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
@@ -180,8 +182,8 @@ export class BuildManager {
       const result = await runHomepageBuild({
         client,
         bridge: browserBridge,
-        // Empty URL turns the archive off; the build then runs on history alone.
-        archive: archiveUrl.trim() ? createArchiveBridge(archiveUrl) : undefined,
+        // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
+        archive: archiveBase ? createArchiveBridge(archiveBase) : undefined,
         store: extensionStore,
         userSystemPrompt: systemPrompt,
         // The archive's own host is never a page the agent may scrape: its index

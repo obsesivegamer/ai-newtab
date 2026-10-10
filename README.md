@@ -49,9 +49,10 @@ articles it can see.
 > your browsing history (top domains, visit counts, a few page titles) and the
 > cleaned-up HTML of up to 8 pages to the Anthropic API, using your own API key.
 > Those pages are loaded in your signed-in browser, so they can include private
-> content. With the archive on, the full text of up to 12 archived articles per
-> build goes to the same API too. The agent session and every uploaded page and
-> article are deleted when each build ends. Your API key stays in the extension's local storage. More detail in
+> content. With the archive on, the text of archived articles goes to the same
+> API too: at most 24 per build, each cut to about 2,000 words. The agent session
+> and every uploaded page and article are deleted when each build ends. Your API
+> key stays in the extension's local storage. More detail in
 > [ARCHITECTURE.md](./ARCHITECTURE.md#privacy).
 
 ---
@@ -116,7 +117,9 @@ addresses (localhost, private IPs, `.local` and `.internal` hosts) are always bl
 
 **Article archive (Amber).** The address of your Amber server, default
 `http://127.0.0.1:8080`. **Test connection** reads Amber's article list and tells
-you how many readable articles it found, or that Amber isn't running. Leave the
+you how many readable articles it found, or that Amber isn't running. The address
+is saved when the test succeeds or when you click **Save & rebuild**; Cancel
+discards edits. A missing `http://` is added for you. Leave the
 box empty to build from browsing history only. The blocked-sites list above also
 applies to archived articles, matched on the publisher's address.
 
@@ -140,10 +143,12 @@ failed build until the next interval, so it never loops.
 - **Cost.** Each build is a single agent session billed to your API key. What it
   costs depends on the model and on how much it reads. Haiku is the cheapest
   choice, and you can turn off automatic rebuilds to build only when you ask.
-- **What it can see.** It reads your recent archived articles (up to 12 in full),
-  ranks the sites in your history and opens up to 4 live pages per build when the
-  archive is on, or up to 8 when it is off. It skips search engines, webmail, banking and logged-out
-  marketing pages. Anything it can't open is reported, not hidden.
+- **What it can see.** With the archive on, it is asked to read about a dozen of
+  your recent archived articles and to look at a few live pages (about 4); without
+  it, up to 8 live pages. Those numbers are requests in the prompt, not limits. The
+  hard limit for archived articles is 24 per build, with each one cut to about
+  2,000 words for the model. The reader in the new tab always shows the full text.
+  It skips search engines, webmail, banking and logged-out marketing pages. Anything it can't open is reported, not hidden.
 - **Links are real.** Every link on the page comes from a page the agent actually
   read. It's told never to invent a URL.
 - **Interrupted builds.** If Chrome closes mid-build, the new tab offers
@@ -155,11 +160,13 @@ failed build until the next interval, so it never loops.
 
 1. **`getArchive`**: the agent gets the list of your recent Amber articles
    (titles, publication, date, word count, permalink) and per-publication counts.
-2. **`getArchiveArticles`**: it picks up to 12, and the extension fetches their
-   full text from Amber and mounts each into the agent's sandbox as a text file.
+2. **`getArchiveArticles`**: it picks a handful (up to 12 per call, 24 per build),
+   and the extension fetches their text from Amber and mounts each into the
+   agent's sandbox as a text file, cut to about 2,000 words.
 3. **`getHistory`**: a ranked summary of your most-visited domains.
-4. **`getPageHtml`**: up to 4 live pages (8 without the archive), which the
-   extension opens in a background window, cleans up, and mounts as files.
+4. **`getPageHtml`**: a few live pages (the prompt asks for about 4 with the
+   archive, the tool allows up to 8), which the extension opens in a background
+   window, cleans up, and mounts as files.
 5. **`grep` / `read`**: the agent pulls headlines, quotes and links out of those
    files inside its sandbox.
 6. **`write`**: it writes one React component, which the new tab renders.

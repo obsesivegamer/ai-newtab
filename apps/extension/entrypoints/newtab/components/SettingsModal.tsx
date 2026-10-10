@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage/agent-core";
-import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
+import { DEFAULT_ARCHIVE_URL, normalizeArchiveUrl } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { loadSettings, saveSetting } from "@/lib/storage";
 import { btn } from "./ui";
@@ -13,13 +13,10 @@ type ArchiveCheck =
 
 const AMBER_DOWN = "Amber isn't running — start it with ./run.sh";
 
+const NOT_AN_ADDRESS = "That doesn't look like a web address. Try http://127.0.0.1:8080";
+
 /** One cheap read of the archive's list endpoint, turned into a sentence a person can act on. */
-async function testArchive(rawUrl: string): Promise<ArchiveCheck> {
-  const base = rawUrl.trim().replace(/\/+$/, "");
-  if (!base) return { state: "ok", message: "The archive is off. Builds will use your browsing history only." };
-  if (!/^https?:\/\/[^/\s]+/i.test(base)) {
-    return { state: "error", message: "That doesn't look like a web address. Try http://127.0.0.1:8080" };
-  }
+async function testArchive(base: string): Promise<ArchiveCheck> {
   let response: Response;
   try {
     response = await fetch(`${base}/api/snapshots?since_days=365&limit=1`, {
@@ -84,6 +81,8 @@ export function SettingsModal({
   const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
   const [archiveLoaded, setArchiveLoaded] = useState(false);
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
+  /** Bumped whenever the field changes, a test starts, or the modal goes away; a late test result is ignored. */
+  const archiveRequest = useRef(0);
 
   // Loaded here rather than threaded through App, which keeps this section self-contained.
   useEffect(() => {
@@ -95,17 +94,51 @@ export function SettingsModal({
     });
     return () => {
       cancelled = true;
+      archiveRequest.current++;
     };
   }, []);
 
-  const persistArchiveUrl = async () => {
-    if (archiveLoaded) await saveSetting("archiveUrl", archiveUrl.trim());
+  /** The address as it should be saved: "" (archive off), a clean base URL, or null if it can't be one. */
+  const archiveValue = (): string | null => (archiveUrl.trim() === "" ? "" : normalizeArchiveUrl(archiveUrl));
+
+  // Like the prompt box, the address is a draft: it is written only when a test
+  // succeeds or "Save & rebuild" is clicked, never by Cancel.
+  const runArchiveTest = async () => {
+    const value = archiveValue();
+    const request = ++archiveRequest.current;
+    if (value === null) {
+      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
+      return;
+    }
+    if (value === "") {
+      setArchiveCheck({
+        state: "ok",
+        message: "The archive is off. Click Save & rebuild to use browsing history only.",
+      });
+      return;
+    }
+    setArchiveCheck({ state: "testing" });
+    const result = await testArchive(value);
+    if (request !== archiveRequest.current) return;
+    if (result.state === "ok") {
+      await saveSetting("archiveUrl", value);
+      if (request !== archiveRequest.current) return;
+      setArchiveUrl(value);
+    }
+    setArchiveCheck(result);
   };
 
-  const runArchiveTest = async () => {
-    setArchiveCheck({ state: "testing" });
-    await persistArchiveUrl();
-    setArchiveCheck(await testArchive(archiveUrl));
+  const save = async () => {
+    const value = archiveValue();
+    if (value === null) {
+      archiveRequest.current++;
+      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
+      return;
+    }
+    archiveRequest.current++;
+    // Written before the rebuild starts, so the build reads the new address.
+    if (archiveLoaded) await saveSetting("archiveUrl", value);
+    onSave(draft, normalizeBlockList(blockedDraft.split("\n")));
   };
 
   return (
@@ -221,10 +254,10 @@ export function SettingsModal({
             value={archiveUrl}
             disabled={!archiveLoaded}
             onChange={(e) => {
+              archiveRequest.current++;
               setArchiveUrl(e.target.value);
               setArchiveCheck({ state: "idle" });
             }}
-            onBlur={() => void persistArchiveUrl()}
             placeholder={DEFAULT_ARCHIVE_URL}
             aria-describedby="archive-help"
             spellCheck={false}
@@ -232,7 +265,8 @@ export function SettingsModal({
           />
         </label>
         <p id="archive-help" style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
-          Where your saved articles live. Leave empty to build from browsing history only.
+          Where your saved articles live. Leave empty to build from browsing history only. Saved
+          when a test succeeds or you click Save &amp; rebuild.
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10 }}>
           <button
@@ -260,11 +294,7 @@ export function SettingsModal({
             Cancel
           </button>
           <button
-            onClick={() => {
-              const blocked = normalizeBlockList(blockedDraft.split("\n"));
-              // The archive URL is written before the rebuild starts, so the build reads the new one.
-              void persistArchiveUrl().then(() => onSave(draft, blocked));
-            }}
+            onClick={() => void save()}
             style={btn}
           >
             Save &amp; rebuild

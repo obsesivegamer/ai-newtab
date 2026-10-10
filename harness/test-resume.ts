@@ -67,6 +67,9 @@ async function crash(): Promise<never> {
           maxResults: 30,
           totalSitesSeen,
         });
+        // What runHomepageBuild would have recorded: getPageHtml only loads hosts the
+        // model was shown, and the resumed run reads them back from the store.
+        await store.set(STORAGE_KEYS.seenHosts, digest.sites.map((site) => site.domain));
         await client.beta.sessions.events.send(session.id, {
           events: [
             {
