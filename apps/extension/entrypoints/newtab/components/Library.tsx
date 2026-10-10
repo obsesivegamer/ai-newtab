@@ -223,7 +223,7 @@ export function Library({
       {state.status === "error" && state.kind === "down" && (
         <Notice
           title="Amber isn't running."
-          body="Start it with ./run.sh, then try again."
+          body="Start Amber (its run script, or its launchd service), then try again."
           hint={archiveUrl ? `Looking for it at ${archiveUrl}` : undefined}
           action={{ label: "Retry", onClick: onReload }}
         />

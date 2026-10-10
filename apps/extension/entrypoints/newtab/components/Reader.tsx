@@ -11,7 +11,7 @@ type Load =
   | { status: "ready"; article: ArchiveArticle }
   | { status: "error"; message: string };
 
-const UNREACHABLE = "Couldn't reach Amber. Is it running? Start it with ./run.sh";
+const UNREACHABLE = "Couldn't reach Amber. Is it running? Start it (its run script, or its launchd service).";
 
 type FetchResult = { article: ArchiveArticle } | { error: string };
 

@@ -76,7 +76,7 @@ export function BuildProgress({
         <div className="build-panel">
           <div className="meta build-eyebrow">Agent</div>
           <div className="build-narration" ref={narrRef}>
-            {narration || "Warming up — reading what you’ve been browsing…"}
+            {narration || "Warming up — reading your saved articles and what you’ve been browsing…"}
           </div>
 
           {logs.length > 0 && (

@@ -33,7 +33,6 @@ export const STORAGE_KEYS = {
   environmentId: "environmentId",
   activeSessionId: "activeSessionId",
   uploadedFileIds: "uploadedFileIds",
-  seenHosts: "seenHosts",
 } as const;
 
 const ENVIRONMENT_NAME = "homepage-builder-env";

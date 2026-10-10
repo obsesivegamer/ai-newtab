@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage/agent-core";
-import { DEFAULT_ARCHIVE_URL, normalizeArchiveUrl } from "@/lib/archive";
+import {
+  MODEL_CHOICES,
+  normalizeArchiveUrl,
+  normalizeBlockList,
+  type HomepageModel,
+} from "@homepage/agent-core";
+import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { loadSettings, saveSetting } from "@/lib/storage";
 
@@ -10,7 +15,7 @@ type ArchiveCheck =
   | { state: "ok"; message: string }
   | { state: "error"; message: string };
 
-const AMBER_DOWN = "Amber isn't running — start it with ./run.sh";
+const AMBER_DOWN = "Amber isn't running — start it (its run script or launchd service)";
 
 const NOT_AN_ADDRESS = "That doesn't look like a web address. Try http://127.0.0.1:8080";
 

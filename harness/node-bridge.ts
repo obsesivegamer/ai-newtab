@@ -8,13 +8,16 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type {
-  ArchiveArticle,
-  ArchiveArticleMeta,
-  ArchiveBridge,
-  BrowserBridge,
-  KVStore,
-  RawSiteMetadata,
+import {
+  DEFAULT_BLOCKED_SITES,
+  archiveHostOf,
+  normalizeArchiveUrl,
+  type ArchiveArticle,
+  type ArchiveArticleMeta,
+  type ArchiveBridge,
+  type BrowserBridge,
+  type KVStore,
+  type RawSiteMetadata,
 } from "@homepage/agent-core";
 
 /** Harness state (cached agent/environment IDs, active session) and output, next to these scripts. */
@@ -139,7 +142,8 @@ export const nodeBridge: BrowserBridge = {
 /**
  * The Amber archive over its JSON API, for the harness. Mirrors the extension's
  * lib/archive.ts mapping on purpose rather than importing it: the harness must
- * not depend on the extension workspace.
+ * not depend on the extension workspace. Address cleanup is shared through
+ * agent-core's `normalizeArchiveUrl`.
  */
 export const DEFAULT_AMBER_URL = "http://127.0.0.1:8080";
 
@@ -157,7 +161,8 @@ interface AmberSnapshot {
 }
 
 export function createNodeArchiveBridge(baseUrl = DEFAULT_AMBER_URL): ArchiveBridge {
-  const base = baseUrl.trim().replace(/\/+$/, "");
+  const base = normalizeArchiveUrl(baseUrl);
+  if (!base) throw new Error(`Invalid archive URL: ${baseUrl}`);
 
   const getJson = async <T>(path: string, timeoutMs: number): Promise<T> => {
     const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
@@ -213,8 +218,27 @@ export function createNodeArchiveBridge(baseUrl = DEFAULT_AMBER_URL): ArchiveBri
   };
 }
 
+function harnessArchiveUrl(): string {
+  return (process.env.AMBER_URL ?? DEFAULT_AMBER_URL).trim();
+}
+
 /** The harness's archive: `AMBER_URL` if set (empty string turns it off), else the local default. */
 export function harnessArchive(): ArchiveBridge | undefined {
-  const url = process.env.AMBER_URL ?? DEFAULT_AMBER_URL;
-  return url.trim() ? createNodeArchiveBridge(url) : undefined;
+  const url = harnessArchiveUrl();
+  if (!url) return undefined;
+  if (!normalizeArchiveUrl(url)) {
+    console.warn("[harness] AMBER_URL is not a valid http(s) address; running without the archive");
+    return undefined;
+  }
+  return createNodeArchiveBridge(url);
+}
+
+/**
+ * The default blocked sites plus the archive's own host, as the extension's
+ * build-manager does: the archive index lists every saved article, so
+ * getPageHtml must never be pointed at it.
+ */
+export function harnessBlockedSites(): string[] {
+  const host = archiveHostOf(harnessArchiveUrl());
+  return [...DEFAULT_BLOCKED_SITES, ...(host ? [host] : [])];
 }

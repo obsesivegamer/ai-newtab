@@ -28,7 +28,7 @@ service worker        Anthropic loop        sandbox
     ├─ custom_tool_result ─▶│                  │
     │◀─ custom_tool_use ────┤  getArchiveArticles
     ├─ GET /api/snapshots/<id>/text (Amber)    │
-    ├─ files.upload + resources.add ───────────▶  mounts /mnt/session/uploads/archive/<id>.txt
+    ├─ files.upload + resources.add ───────────▶  mounts /mnt/session/uploads/archive/<id>-<last 8 of upload id>.txt
     ├─ custom_tool_result ─▶│                  │
     │◀─ custom_tool_use ────┤  getHistory      │
     ├─ chrome.history ──────┤                  │
@@ -69,6 +69,15 @@ The finished component renders inside a Sandpack iframe
 (`entrypoints/newtab/components/HomepagePreview.tsx`): it is model-written code, so
 it runs sandboxed, not in the extension's own page.
 
+**`homepage:open-article` contract.** The model-written page opens an archived story
+in the native reader with `window.parent.postMessage({ type: "homepage:open-article",
+id }, "*")`. The new-tab page (`entrypoints/newtab/App.tsx`) accepts it only when
+`type` is exactly `"homepage:open-article"`, `id` is a string matching
+`/^[A-Za-z0-9]{3,16}$/` (the same shape the archive tools accept), and the message's
+`source` is the `contentWindow` of an iframe inside `.today-frame`, the Today
+tab's Sandpack frame. Anything else is ignored. The prompt in
+`packages/agent-core/prompt.ts` tells the model to emit exactly this.
+
 ## Layout
 
 ```
@@ -78,6 +87,7 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   prompt.ts               system prompt + per-build kickoff message
   schemas.ts              custom tool input schemas (getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
+  archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
   types.ts                BrowserBridge, ArchiveBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
@@ -93,7 +103,7 @@ apps/extension/           MV3 extension (WXT + React)
     scraper.ts            getPageHtml: load URLs in a background window, sanitize HTML
     protocol.ts           page ↔ worker messages and the five UI build steps
     auto-rebuild.ts       when to rebuild on a schedule
-    storage.ts            every chrome.storage key, settings (incl. archiveUrl), saved homepage
+    storage.ts            chrome.storage keys, settings (incl. archiveUrl), saved homepage
     transpile.ts          TSX → JS for the preview
 
 harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (and an
@@ -124,6 +134,14 @@ host through `isAllowedUrl`, so the agent can't be steered into fetching arbitra
 local services. Archive permalinks (`http://127.0.0.1:8080/<id>`) are never passed
 through `isAllowedUrl`; instead the blocked-sites list is applied to each article's
 `originalUrl` (the publisher's address), both when listing and again before upload.
+
+**Reattach.** The worker's per-build memory (which archive articles are already
+mounted, which hosts the model was shown) is not persisted. On a reattach the
+orchestrator rebuilds it from the session event log: each answered
+`user.custom_tool_result` is joined to the `agent.custom_tool_use` with the same
+id, and the `getArchiveArticles` refs, `getHistory` domains and `getArchive`
+original-URL hosts are read back out of it. The 24-per-build cap and file reuse
+therefore survive a kill.
 
 The same bridge also feeds the deterministic Library and reader in the new-tab page,
 which call it directly and involve no model. The worker's build phases reuse the
@@ -181,9 +199,11 @@ arrived in the history fetch.
 The editable blocked-sites list is enforced in agent-core's tool handlers, not
 just the prompt: blocked domains are excluded from history digests and their
 counts, and blocked or non-HTTP(S) page requests never reach the browser bridge.
-Archived articles are filtered the same way on their publisher URL, and their
-full text, which is sent to the API in the same way as scraped pages, is deleted
-with the rest of the session's uploads.
+Archived articles are filtered the same way on their publisher URL. What the
+model sees of the archive is the listing (titles, authors, publisher URLs, save
+dates and per-publication counts for up to 40 articles per `getArchive` call) and
+the full text of the articles it asks for; the text is sent to the API in the same
+way as scraped pages and deleted with the rest of the session's uploads.
 Each scraped page's final URL is checked again before upload, so a redirect onto
 a blocked host is dropped: the browser still loads it, but nothing it read is
 sent. Loopback, private-IP and local-network hosts are always blocked, whatever

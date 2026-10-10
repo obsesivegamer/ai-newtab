@@ -16,8 +16,8 @@ terminal, a zine.
 
 ## This fork: your article archive, then your browsing
 
-This branch (`personal-archive-homepage`) builds the homepage from the news you
-have already saved, plus what you are browsing right now. The saved articles come
+This fork builds the homepage from the news you have already saved, plus what you
+are browsing right now. The saved articles come
 from [Amber](https://github.com/obsesivegamer/amber-archive), a local archiver that keeps a
 readable, paywall-free copy of each article on your Mac.
 
@@ -33,24 +33,21 @@ readable, paywall-free copy of each article on your Mac.
   so and builds fall back to browsing history only.
 - **Permalinks only work while Amber runs on this Mac.**
 
-Start or restart Amber from its own folder:
-
-```bash
-cd ~/Documents/amber-archive
-./run.sh            # first run installs dependencies; Ctrl-C stops it
-```
+Start Amber the way its own README describes: its run script from `<your Amber
+checkout>`, or its launchd service if you installed one.
 
 Amber needs the version that has the JSON API (`GET /api/snapshots`). After
-updating Amber, stop the running server with Ctrl-C and start it again with
-`./run.sh`. In Settings, **Test connection** tells you how many readable
-articles it can see.
+updating Amber, restart it. In Settings, **Test connection** tells you how many
+readable articles it can see.
 
 > **Privacy, up front.** To build your homepage, the extension sends a summary of
 > your browsing history (top domains, visit counts, a few page titles) and the
 > cleaned-up HTML of up to 8 pages to the Anthropic API, using your own API key.
 > Those pages are loaded in your signed-in browser, so they can include private
-> content. With the archive on, the text of archived articles goes to the same
-> API too: at most 24 per build, each cut to about 2,000 words. The agent session
+> content. With the archive on, the archive listing goes to the same API too:
+> titles, authors, publisher URLs and save dates for up to 40 articles per
+> `getArchive` call, plus per-publication counts. So does the text of archived
+> articles: at most 24 per build, each cut to about 2,000 words. The agent session
 > and every uploaded page and article are deleted when each build ends. Your API
 > key stays in the extension's local storage. More detail in
 > [ARCHITECTURE.md](./ARCHITECTURE.md#privacy).
@@ -81,7 +78,7 @@ If Chrome asks whether to keep the changed new-tab page, choose **Keep it**.
 
 ## Your first homepage
 
-1. Open a new tab and paste your Anthropic API key.
+1. Open a new tab, switch to the **Today** tab, and paste your Anthropic API key.
 2. Click **Build today's homepage**.
 3. Watch it work. The progress view walks through each step: preparing the
    agent, reading your archive and history, opening articles and pages,

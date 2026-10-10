@@ -100,23 +100,21 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
   };
 
   // Archive articles already mounted this run, so a repeat request reuses the file.
+  // Rebuilt from the session's event log on a reattach (see `restoreFromHistory`).
   const mountedArchive = new Map<string, ArchiveRef>();
 
   // Hosts the model has been shown this run (history digest, archive originalUrls).
   // getPageHtml may only load these: a name from a scraped page or an archived
   // article must not be able to steer the signed-in browser somewhere new.
-  // Persisted like upload ids so a re-answered call after a reattach still has them.
-  const savedHosts = opts.resumeSessionId
-    ? await store.get<string[]>(STORAGE_KEYS.seenHosts)
-    : undefined;
-  const seenHosts = new Set<string>(Array.isArray(savedHosts) ? savedHosts : []);
-  const rememberHosts = async (values: string[]) => {
-    const before = seenHosts.size;
+  // Nothing is persisted: on a reattach the event log is replayed and rebuilds it.
+  const seenHosts = new Set<string>();
+  // Older builds persisted this list; drop any copy a killed run left behind.
+  if (!opts.resumeSessionId) await store.remove("seenHosts");
+  const rememberHosts = (values: string[]) => {
     for (const value of values) {
       const host = hostOf(value);
       if (host) seenHosts.add(host);
     }
-    if (seenHosts.size !== before) await store.set(STORAGE_KEYS.seenHosts, [...seenHosts]);
   };
 
   let finalMessage = "";
@@ -135,7 +133,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       switch (event.name) {
         case "getArchive":
           result = await runGetArchive(event, archive, emit, blockedSites);
-          await rememberHosts(result.articles.map((a) => a.originalUrl));
+          rememberHosts(result.articles.map((a) => a.originalUrl));
           break;
         case "getArchiveArticles":
           result = await runGetArchiveArticles(event, {
@@ -150,7 +148,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
           break;
         case "getHistory":
           result = await runGetHistory(event, bridge, emit, blockedSites);
-          await rememberHosts(result.sites.map((site) => site.domain));
+          rememberHosts(result.sites.map((site) => site.domain));
           break;
         case "getPageHtml":
           result = await runGetPageHtml(event, {
@@ -240,6 +238,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     );
 
     for (const event of history) observe(event);
+    restoreFromHistory(history, mountedArchive, rememberHosts);
 
     if (!alreadyDone) {
       // Re-answer any tool call that was left hanging when the stream dropped.
@@ -307,13 +306,74 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     emit.phase("cleanup");
     await Promise.allSettled(uploadedFileIds.map((id) => client.beta.files.delete(id)));
     await store.remove(STORAGE_KEYS.uploadedFileIds);
-    await store.remove(STORAGE_KEYS.seenHosts);
     if (sessionId) {
       await deleteSessionWhenSettled(client, sessionId).catch((err) =>
         emit.log(`session ${sessionId} was not deleted: ${String(err)}`),
       );
     }
     await store.remove(STORAGE_KEYS.activeSessionId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// reattach
+// ---------------------------------------------------------------------------
+
+/**
+ * Rebuild what a killed host held in memory from the session's event log: each
+ * answered `user.custom_tool_result` is joined to the `agent.custom_tool_use`
+ * with the same id, and the archive refs it carried (so the per-build mount cap
+ * and file reuse survive) and the hosts it showed the model (so getPageHtml's
+ * allow-list does) are read back out of the result the model actually received.
+ */
+function restoreFromHistory(
+  history: SessionEvent[],
+  mounted: Map<string, ArchiveRef>,
+  rememberHosts: (values: string[]) => void,
+): void {
+  const uses = new Map<string, CustomToolUse>();
+  for (const event of history) {
+    if (event.type === "agent.custom_tool_use") uses.set(event.id, event);
+  }
+
+  for (const event of history) {
+    if (event.type !== "user.custom_tool_result" || event.is_error) continue;
+    const use = uses.get(event.custom_tool_use_id);
+    if (!use) continue;
+
+    let result: unknown;
+    try {
+      const block = event.content?.find((b) => b.type === "text");
+      result = block && block.type === "text" ? JSON.parse(block.text) : undefined;
+    } catch {
+      continue;
+    }
+    if (typeof result !== "object" || result === null) continue;
+    const list = (key: string): unknown[] => {
+      const value = (result as Record<string, unknown>)[key];
+      return Array.isArray(value) ? value : [];
+    };
+    const field = (item: unknown, key: string): string | undefined => {
+      const value = (item as Record<string, unknown> | null)?.[key];
+      return typeof value === "string" ? value : undefined;
+    };
+
+    switch (use.name) {
+      case "getHistory":
+        rememberHosts(list("sites").flatMap((site) => field(site, "domain") ?? []));
+        break;
+      case "getArchive":
+        rememberHosts(list("articles").flatMap((a) => field(a, "originalUrl") ?? []));
+        break;
+      case "getArchiveArticles":
+        for (const ref of list("articles")) {
+          const id = field(ref, "id");
+          if (id && field(ref, "mountPath") && field(ref, "originalUrl") !== undefined) {
+            mounted.set(id, ref as ArchiveRef);
+          }
+        }
+        break;
+    }
   }
 }
 

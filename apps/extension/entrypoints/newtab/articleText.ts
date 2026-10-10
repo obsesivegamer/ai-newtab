@@ -1,6 +1,7 @@
 /**
- * Amber stores article text as one flattened run: no paragraph breaks, with the
- * page furniture (title, byline, newsletter promos) still in front. This puts a
+ * Article text can arrive flattened (older Amber: one run, no paragraph breaks)
+ * or with blank-line paragraphs (current Amber), and the page furniture (title,
+ * byline, newsletter promos) is still in front. This handles both and puts a
  * readable shape back on it, best-effort. It never drops body text.
  */
 

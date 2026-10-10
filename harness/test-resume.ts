@@ -23,7 +23,7 @@ import {
   ensureEnvironment,
   runHomepageBuild,
 } from "@homepage/agent-core";
-import { FileKVStore, STATE_PATH, harnessArchive, nodeBridge } from "./node-bridge";
+import { FileKVStore, STATE_PATH, harnessArchive, harnessBlockedSites, nodeBridge } from "./node-bridge";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const store = new FileKVStore(STATE_PATH);
@@ -67,9 +67,8 @@ async function crash(): Promise<never> {
           maxResults: 30,
           totalSitesSeen,
         });
-        // What runHomepageBuild would have recorded: getPageHtml only loads hosts the
-        // model was shown, and the resumed run reads them back from the store.
-        await store.set(STORAGE_KEYS.seenHosts, digest.sites.map((site) => site.domain));
+        // getPageHtml only loads hosts the model was shown; the resumed run rebuilds
+        // that list from this result in the session's event log.
         await client.beta.sessions.events.send(session.id, {
           events: [
             {
@@ -116,6 +115,7 @@ async function resume() {
     client,
     bridge: nodeBridge,
     archive: harnessArchive(),
+    blockedSites: harnessBlockedSites(),
     store,
     resumeSessionId: sessionId,
     callbacks: {

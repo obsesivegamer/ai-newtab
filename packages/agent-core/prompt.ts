@@ -151,16 +151,14 @@ case they win, design for a reader, not a dashboard:
 
 ## Editorial judgement
 
-The reader saves long-form news, mostly from the Financial Times, The New York
-Times, The Washington Post, The New Yorker and POLITICO. Their recurring themes
-are AI safety and the labs (Anthropic, OpenAI), US politics and the Trump
-administration, Israel, Iran and the Middle East, Europe and Canada, China, and
-tech business. Treat this as a starting point only: the digest in front of you
-overrides it, so follow what the archive and history actually show.
+Infer who this reader is from the evidence: which publications fill the
+getArchive digest (sources, titles) and which sites dominate the history. Their
+recurring themes are whatever those titles keep returning to; do not assume any.
+If the user's standing instructions describe their interests, those win.
 
-Group items by story across publications: an FT piece, a Times piece and a
-Post piece on the same event are one card with source badges (the publication
-name on each), not three cards. Lead with the newest cluster. Add a "from the
+Group items by story across publications: three publications' pieces on the
+same event are one card with source badges (the publication name on each), not
+three cards. Lead with the newest cluster. Add a "from the
 archive, older" strip of older saved articles — titles, source badges, dates
 and ids from getArchive metadata are enough, with the same three links as any
 archived story; you need not read them.
