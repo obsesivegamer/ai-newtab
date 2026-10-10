@@ -96,6 +96,10 @@ export const DEFAULTS = {
   archiveLimit: 40,
   /** Most article bodies mounted per getArchiveArticles call. */
   maxArchiveArticles: 12,
+  /** Most article bodies mounted in one whole build. */
+  maxArchiveMountsPerBuild: 24,
+  /** Words kept from each mounted article; the native reader has the rest. */
+  archiveWordLimit: 2000,
   /** Cap on titles carried per domain in the digest. */
   sampleTitles: 5,
 } as const;

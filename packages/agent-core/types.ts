@@ -126,7 +126,12 @@ export interface ArchiveRef {
   originalUrl: string;
   /** What `resources.add()` resolved, never the path asked for. */
   mountPath: string;
+  /** Size of the mounted file, which may be a truncated copy. */
   bytes: number;
+  /** Words in the full article, not in the mounted file. */
+  wordCount: number;
+  /** The mounted file stops early and ends with a pointer to the full text. */
+  truncated: boolean;
 }
 
 export interface GetArchiveArticlesResult {

@@ -1,7 +1,14 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { buildHistoryDigest, slugifyUrl } from "./history-digest";
 import { OUTPUT_PATH, buildKickoffMessage } from "./prompt";
-import { DEFAULT_BLOCKED_SITES, isAllowedUrl, isBlocked, normalizeBlockList } from "./site-filter";
+import {
+  DEFAULT_BLOCKED_SITES,
+  hostOf,
+  isAllowedUrl,
+  isBlocked,
+  isSameOrSubdomain,
+  normalizeBlockList,
+} from "./site-filter";
 import { DEFAULTS } from "./schemas";
 import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
 import type {
@@ -95,6 +102,23 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
   // Archive articles already mounted this run, so a repeat request reuses the file.
   const mountedArchive = new Map<string, ArchiveRef>();
 
+  // Hosts the model has been shown this run (history digest, archive originalUrls).
+  // getPageHtml may only load these: a name from a scraped page or an archived
+  // article must not be able to steer the signed-in browser somewhere new.
+  // Persisted like upload ids so a re-answered call after a reattach still has them.
+  const savedHosts = opts.resumeSessionId
+    ? await store.get<string[]>(STORAGE_KEYS.seenHosts)
+    : undefined;
+  const seenHosts = new Set<string>(Array.isArray(savedHosts) ? savedHosts : []);
+  const rememberHosts = async (values: string[]) => {
+    const before = seenHosts.size;
+    for (const value of values) {
+      const host = hostOf(value);
+      if (host) seenHosts.add(host);
+    }
+    if (seenHosts.size !== before) await store.set(STORAGE_KEYS.seenHosts, [...seenHosts]);
+  };
+
   let finalMessage = "";
 
   /**
@@ -111,6 +135,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       switch (event.name) {
         case "getArchive":
           result = await runGetArchive(event, archive, emit, blockedSites);
+          await rememberHosts(result.articles.map((a) => a.originalUrl));
           break;
         case "getArchiveArticles":
           result = await runGetArchiveArticles(event, {
@@ -125,9 +150,18 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
           break;
         case "getHistory":
           result = await runGetHistory(event, bridge, emit, blockedSites);
+          await rememberHosts(result.sites.map((site) => site.domain));
           break;
         case "getPageHtml":
-          result = await runGetPageHtml(event, { client, bridge, sessionId: sessionId!, rememberUpload, emit, blockedSites });
+          result = await runGetPageHtml(event, {
+            client,
+            bridge,
+            sessionId: sessionId!,
+            rememberUpload,
+            emit,
+            blockedSites,
+            seenHosts,
+          });
           break;
         default:
           throw new Error(`Unknown custom tool: ${event.name}`);
@@ -273,6 +307,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     emit.phase("cleanup");
     await Promise.allSettled(uploadedFileIds.map((id) => client.beta.files.delete(id)));
     await store.remove(STORAGE_KEYS.uploadedFileIds);
+    await store.remove(STORAGE_KEYS.seenHosts);
     if (sessionId) {
       await deleteSessionWhenSettled(client, sessionId).catch((err) =>
         emit.log(`session ${sessionId} was not deleted: ${String(err)}`),
@@ -318,6 +353,7 @@ async function runGetPageHtml(
     rememberUpload: (id: string) => Promise<void>;
     emit: Emit;
     blockedSites: string[];
+    seenHosts: Set<string>;
   },
 ): Promise<GetPageHtmlResult> {
   const input = event.input as { urls: string[]; loadDelayMs?: number };
@@ -325,10 +361,16 @@ async function runGetPageHtml(
 
   const allowed: string[] = [];
   const blocked: GetPageHtmlResult["failed"] = [];
+  const notSeen: GetPageHtmlResult["failed"] = [];
   for (const url of input.urls) {
     // Match on the URL the browser will load; malformed URLs never reach the signed-in browser.
-    if (isAllowedUrl(url, ctx.blockedSites)) allowed.push(url);
-    else blocked.push({ url, reason: "blocked by the user's settings" });
+    if (!isAllowedUrl(url, ctx.blockedSites)) {
+      blocked.push({ url, reason: "blocked by the user's settings" });
+      continue;
+    }
+    const host = hostOf(url);
+    if ([...ctx.seenHosts].some((seen) => isSameOrSubdomain(host, seen))) allowed.push(url);
+    else notSeen.push({ url, reason: "not a site from your history or archive" });
   }
 
   // Skip the bridge entirely when nothing is left, so no scraper window opens.
@@ -348,7 +390,7 @@ async function runGetPageHtml(
   if (blocked.length) ctx.emit.log(`blocked: ${blocked.length} url(s)`);
 
   const refs: PageRef[] = [];
-  const mountFailures = [...blocked, ...failed];
+  const mountFailures = [...blocked, ...notSeen, ...failed];
 
   for (const page of pages) {
     try {
@@ -380,7 +422,7 @@ async function runGetPageHtml(
     }
   }
 
-  if (refs.length === 0 && mountFailures.length > 0 && blocked.length === 0) {
+  if (refs.length === 0 && mountFailures.length > 0 && blocked.length === 0 && notSeen.length === 0) {
     throw new Error(
       `No pages could be mounted. Failures: ${mountFailures
         .map((f) => `${f.url} (${f.reason})`)
@@ -393,9 +435,14 @@ async function runGetPageHtml(
 
 const ARCHIVE_UNAVAILABLE = "The article archive is unavailable";
 
+const ARCHIVE_ID = /^[A-Za-z0-9]{3,16}$/;
+
 /**
  * Ask the archive for this many and apply the blocked-sites list here, so blocked
  * articles don't use up `limit` and their publication can be dropped from `sources`.
+ * Amber caps a page at 200, and the library holds fewer than that today; a window
+ * with more than 200 usable articles would leave some blocked publications in
+ * `sources` and would need paging instead.
  */
 const ARCHIVE_FETCH_LIMIT = 200;
 
@@ -408,18 +455,33 @@ function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+/** Keep a date only when it starts with an ISO date; free-text dates are dropped, never guessed at. */
+function isoDateOrUndefined(value: string | undefined): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value) ? value : undefined;
+}
+
+function truncateWords(text: string, max: number): { text: string; truncated: boolean } {
+  const word = /\S+/g;
+  let count = 0;
+  for (let m = word.exec(text); m; m = word.exec(text)) {
+    if (++count > max) return { text: text.slice(0, m.index).trimEnd(), truncated: true };
+  }
+  return { text, truncated: false };
+}
+
 /** Header, blank line, then the body: the model greps the file and reads the top for metadata. */
-function archiveFileText(article: ArchiveArticle): string {
+function archiveFileText(article: ArchiveArticle, body: string, truncated: boolean): string {
   const header = [
     `Title: ${oneLine(article.title)}`,
     `Site: ${oneLine(article.site)}`,
     article.author ? `Author: ${oneLine(article.author)}` : undefined,
-    `Published: ${article.publishedAt ?? "unknown"}`,
+    `Published: ${isoDateOrUndefined(article.publishedAt) ?? "unknown"}`,
     `Saved: ${article.savedAt}`,
     `Permalink: ${article.permalink}`,
     `Original URL: ${article.originalUrl}`,
   ].filter(Boolean);
-  return `${header.join("\n")}\n\n${article.text}`;
+  const tail = truncated ? `\n\n[Truncated for analysis. Full text: ${article.permalink}]` : "";
+  return `${header.join("\n")}\n\n${body}${tail}`;
 }
 
 async function runGetArchive(
@@ -447,19 +509,28 @@ async function runGetArchive(
   // As with history, blocked material is dropped from the counts too: the model is never told it exists.
   const droppedBySite = new Map<string, number>();
   for (const a of dropped) droppedBySite.set(a.site, (droppedBySite.get(a.site) ?? 0) + 1);
-  const keptSites = new Set(kept.map((a) => a.site));
   const sources = listed.sources.flatMap((source) => {
     const gone = droppedBySite.get(source.site) ?? 0;
     if (!gone) return [source];
+    const survivors = kept.filter((a) => a.site === source.site);
     const count = source.count - gone;
-    return count > 0 && keptSites.has(source.site) ? [{ ...source, count }] : [];
+    if (count <= 0 || survivors.length === 0) return [];
+    // `latest` may have been one of the dropped articles.
+    const latest = survivors.reduce(
+      (best, a) => (Date.parse(a.savedAt) > Date.parse(best) ? a.savedAt : best),
+      survivors[0].savedAt,
+    );
+    return [{ ...source, count, latest }];
   });
 
   const result: GetArchiveResult = {
     windowDays: sinceDays,
     totalUsable: Math.max(0, listed.totalUsable - dropped.length),
     sources,
-    articles: kept.slice(0, limit),
+    // Free-text dates are dropped here so the model never has to parse one.
+    articles: kept
+      .slice(0, limit)
+      .map((a) => ({ ...a, publishedAt: isoDateOrUndefined(a.publishedAt) })),
   };
   if (dropped.length) emit.log(`blocked: ${dropped.length} archived article(s)`);
   emit.log(`archive: ${result.articles.length} of ${result.totalUsable} articles`);
@@ -483,28 +554,38 @@ async function runGetArchiveArticles(
   const requested = (Array.isArray(input.ids) ? input.ids : [])
     .filter((id): id is string => typeof id === "string" && id.trim() !== "")
     .map((id) => id.trim());
-  const unique = [...new Set(requested)];
-  if (unique.length === 0) throw new Error("getArchiveArticles needs at least one article id.");
+  const distinct = [...new Set(requested)];
+  if (distinct.length === 0) throw new Error("getArchiveArticles needs at least one article id.");
 
+  // The id becomes a path segment on the archive host, so only plain ids get that far.
+  const unique = distinct.filter((id) => ARCHIVE_ID.test(id));
   const max = DEFAULTS.maxArchiveArticles;
   const ids = unique.slice(0, max);
-  const failed: GetArchiveArticlesResult["failed"] = unique
-    .slice(max)
-    .map((id) => ({ id, reason: `over the ${max}-article limit` }));
+  const failed: GetArchiveArticlesResult["failed"] = [
+    ...distinct.filter((id) => !ARCHIVE_ID.test(id)).map((id) => ({ id, reason: "invalid article id" })),
+    ...unique.slice(max).map((id) => ({ id, reason: `over the ${max}-article limit` })),
+  ];
   ctx.emit.phase("scraping", `${ids.length} archived articles`);
 
   const blockedReason = "blocked by the user's settings";
   const refs: ArchiveRef[] = [];
   let blockedCount = 0;
-  const toFetch: string[] = [];
+  const candidates: string[] = [];
   for (const id of ids) {
     const have = ctx.mounted.get(id);
-    if (!have) toFetch.push(id);
+    if (!have) candidates.push(id);
     else if (isAllowedUrl(have.originalUrl, ctx.blockedSites)) refs.push(have);
     else {
       failed.push({ id, reason: blockedReason });
       blockedCount++;
     }
+  }
+
+  // A whole-build ceiling on what reaches the API, whatever the model asks for.
+  const room = Math.max(0, DEFAULTS.maxArchiveMountsPerBuild - ctx.mounted.size);
+  const toFetch = candidates.slice(0, room);
+  for (const id of candidates.slice(room)) {
+    failed.push({ id, reason: "over the per-build archive limit" });
   }
 
   const fetched: ArchiveArticle[] = [];
@@ -542,15 +623,20 @@ async function runGetArchiveArticles(
 
   for (const article of fetched) {
     try {
-      const filename = `${article.id.replace(/[^A-Za-z0-9_-]+/g, "_") || "article"}.txt`;
-      const file = new File([archiveFileText(article)], filename, { type: "text/plain" });
+      const safeId = article.id.replace(/[^A-Za-z0-9_-]+/g, "_") || "article";
+      const { text, truncated } = truncateWords(article.text, DEFAULTS.archiveWordLimit);
+      const file = new File([archiveFileText(article, text, truncated)], `${safeId}.txt`, {
+        type: "text/plain",
+      });
       const upload = await ctx.client.beta.files.upload({ file });
       await ctx.rememberUpload(upload.id);
 
+      // The upload id keeps each mount path unique, so a re-answered call after a
+      // reattach can't collide with a file it mounted before the host was killed.
       const resource = await ctx.client.beta.sessions.resources.add(ctx.sessionId, {
         type: "file",
         file_id: upload.id,
-        mount_path: `${UPLOAD_ROOT}/archive/${filename}`,
+        mount_path: `${UPLOAD_ROOT}/archive/${safeId}-${upload.id.slice(-8)}.txt`,
       });
 
       const ref: ArchiveRef = {
@@ -562,6 +648,8 @@ async function runGetArchiveArticles(
         // As with pages: what the API resolved, not what we asked for.
         mountPath: resource.mount_path,
         bytes: file.size,
+        wordCount: article.wordCount,
+        truncated,
       };
       ctx.mounted.set(article.id, ref);
       refs.push(ref);
@@ -571,12 +659,7 @@ async function runGetArchiveArticles(
     }
   }
 
-  if (refs.length === 0 && failed.length > 0 && blockedCount === 0) {
-    throw new Error(
-      `No archived articles could be mounted. Failures: ${failed.map((f) => `${f.id} (${f.reason})`).join("; ")}`,
-    );
-  }
-
+  // Failures are reported, never thrown: one bad mount must not hide the ones that worked.
   return { articles: refs, failed };
 }
 

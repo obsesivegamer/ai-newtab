@@ -33,6 +33,7 @@ export const STORAGE_KEYS = {
   environmentId: "environmentId",
   activeSessionId: "activeSessionId",
   uploadedFileIds: "uploadedFileIds",
+  seenHosts: "seenHosts",
 } as const;
 
 const ENVIRONMENT_NAME = "homepage-builder-env";
@@ -118,11 +119,13 @@ function agentDefinition(model: HomepageModel) {
         type: "custom",
         name: "getArchiveArticles",
         description:
-          "Mounts the full text of up to 12 archived articles, chosen by id from " +
-          "getArchive, into your sandbox as plain-text files. Returns a mountPath and " +
-          "byte count per article plus a list of failures. Use grep/read on the " +
-          "returned mountPath. Each file starts with a short header (title, site, " +
-          "dates, links), then a blank line, then the article text.",
+          "Mounts the text of up to 12 archived articles per call (24 per build), chosen " +
+          "by id from getArchive, into your sandbox as plain-text files. Long articles " +
+          "are cut at about 2000 words and say so (truncated: true); the user's own " +
+          "reader has the full text. Returns a mountPath, byte count and word count per " +
+          "article plus a list of failures. Use grep/read on the returned mountPath. " +
+          "Each file starts with a short header (title, site, dates, links), then a " +
+          "blank line, then the article text.",
         input_schema: GET_ARCHIVE_ARTICLES_SCHEMA,
       },
       {
@@ -139,7 +142,10 @@ function agentDefinition(model: HomepageModel) {
         name: "getPageHtml",
         description:
           "Loads URLs in the user's real, logged-in browser, sanitizes the HTML, and " +
-          "mounts each page into your sandbox. Returns a mountPath and byte count per " +
+          "mounts each page into your sandbox. Only sites that appeared in this " +
+          "build's getHistory digest or in a getArchive article's originalUrl are " +
+          "allowed, so call one of those first; any other URL comes back in failed. " +
+          "Returns a mountPath and byte count per " +
           "page plus a list of failures. Use grep/read on the returned mountPath. " +
           "Prefer this over any web fetch: it sees authenticated, JavaScript-rendered " +
           "pages that an anonymous fetch cannot.",

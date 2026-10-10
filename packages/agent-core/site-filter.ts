@@ -22,6 +22,20 @@ function hostname(value: string): string {
   return host.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
 }
 
+/** Normalized host of a URL or bare host, or "" when it cannot be read. */
+export function hostOf(value: string): string {
+  try {
+    return hostname(value);
+  } catch {
+    return "";
+  }
+}
+
+/** True when `host` is `base` or one of its subdomains. */
+export function isSameOrSubdomain(host: string, base: string): boolean {
+  return host === base || host.endsWith(`.${base}`);
+}
+
 /** Accept pasted URLs as well as hosts, and keep the stored list compact. */
 export function normalizeBlockList(lines: string[]): string[] {
   const hosts = lines.flatMap((line) => {

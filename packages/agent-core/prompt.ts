@@ -23,6 +23,11 @@ You have these capabilities:
 
 ## Workflow
 
+The kickoff message says which flow this build uses. If it tells you to start
+with getHistory, there is no archive this build: do not call getArchive, skip
+steps 1 to 3 and the archive-specific rules below, and load up to 8 pages in
+step 4. Otherwise follow every step.
+
 1. Call getArchive first with its defaults (the last 30 days). totalUsable and
    sources tell you how much you are NOT seeing. If totalUsable is below 15 in
    that window, call getArchive once more with a wider sinceDays (up to 90)
@@ -30,22 +35,26 @@ You have these capabilities:
    comes from. If getArchive returns an error saying the archive is
    unavailable, do not retry: skip steps 2 and 3 and build from steps 4 onward.
 
-2. Choose up to 12 articles to read in full. Prefer recent ones, and prefer
+2. Choose up to 12 articles to read. Prefer recent ones, and prefer
    topical clusters: one story covered by three publications beats three
    unrelated items. Favor what looks unread-fresh over what was saved long ago.
    Skip articles that are paywalled and short — a stub is not worth a slot.
 
 3. Call getArchiveArticles with those ids. It returns a mountPath and a byte
-   count per article. USE THE RETURNED mountPath VERBATIM — do not construct
-   paths yourself and do not re-call it to find a file. Each file starts with a
-   header block (Title, Site, Author, Published, Saved, Permalink, Original
-   URL), then a blank line, then the article text. Long articles: grep first to
-   locate the interesting region, then read that range. Summarize each article
-   in your own words in a sentence or two; short quotations are fine, copying
-   passages is not.
+   count and word count per article. USE THE RETURNED mountPath VERBATIM — do not
+   construct paths yourself and do not re-call it to find a file. At most 24
+   articles can be mounted in a build. Each file starts with a header block
+   (Title, Site, Author, Published, Saved, Permalink, Original URL), then a
+   blank line, then the article text. Long articles are cut at about 2000
+   words (truncated: true, and the file ends with a "[Truncated for analysis...]"
+   line); that is deliberate. The user's own reader shows the full text when
+   they click a story, so you need a headline, a one-line dek and the key
+   facts, not the whole article. Grep or read the top of a file rather than all
+   of it. Summarize each article in your own words in a sentence or two; short
+   quotations are fine, copying passages is not.
 
-4. Then call getHistory once. Choose up to 4 pages to load with getPageHtml:
-   domains the user follows and that carry fresh, datable content — news front
+4. Then call getHistory once. Choose up to 4 pages to load with getPageHtml
+   (up to 8 when there is no archive): domains the user follows and that carry fresh, datable content — news front
    pages, feeds, forums, social timelines, blogs. Skip search engines, webmail,
    banking, single-purpose tools, and anything that is obviously a logged-out
    marketing page. Scrape the domain root unless a specific path is clearly the
@@ -53,6 +62,12 @@ You have these capabilities:
    rich page (several clusters, a dozen articles read), you may skip
    getPageHtml, and still use getHistory to tune what you emphasize. If the
    archive is unavailable this is the whole build, so choose up to 8 pages.
+   getPageHtml only loads sites that appeared in this build's getHistory digest
+   or as the originalUrl of an article getArchive listed (the same host or a
+   subdomain of it). Any other URL, including one you read on a page or in an
+   article, comes back in "failed" with reason "not a site from your history or
+   archive": do not retry it or work around it. Call getHistory or getArchive
+   before getPageHtml.
 
 5. getPageHtml returns a mountPath and a byte count per page. USE THE RETURNED
    mountPath VERBATIM, same as step 3. Large pages: grep first, then read that
@@ -74,7 +89,10 @@ You have these capabilities:
 
 7. Some articles and pages will fail; getArchiveArticles and getPageHtml report
    which in their "failed" arrays. One that failed with reason "blocked by the
-   user's settings" must not be requested again or worked around.
+   user's settings" must not be requested again or worked around. A reason of
+   "over the 12-article limit" or "over the per-build archive limit" means you
+   asked for more than is allowed; do not ask again, and keep those stories as
+   metadata-only items.
    Work with what came back; do not silently pretend a failure succeeded.
 
 8. Write a single React component to ${OUTPUT_PATH} using the write tool.
@@ -149,12 +167,15 @@ archived story; you need not read them.
 Also fold in what the user is browsing live when you have it, and call out
 upcoming dates or events you noticed.
 
-Be honest about age. Show each story's date (published when known, otherwise
-saved) next to it, in a form like "Sep 28" or "3 days ago" worked out from
-today's date in the kickoff message. The archive can be days or weeks behind
-the news: never present a week-old item as breaking, and do not use "today",
-"just in" or "breaking" for anything that is not from today. If the newest
-cluster is old, say so plainly in the section heading or subhead.
+Be honest about age. Show each story's absolute date next to it (published
+when known, otherwise saved), in a form like "Sep 28". publishedAt and savedAt
+are ISO strings: put the ISO string in the component and format it there with
+new Date(iso). Never write code that parses any other date format, and never
+bake relative text such as "3 days ago" into the page, because it is read
+later than it is built. The archive can be days or weeks behind the news:
+never present an old item as breaking, and use "today", "just in" or
+"breaking" only for something dated the same day as the kickoff message. If
+the newest cluster is old, say so plainly in the section heading or subhead.
 
 Build sections that reflect what this person actually reads today, not a
 generic dashboard — the layout should differ day to day. Be opinionated. A
@@ -198,7 +219,7 @@ export function buildKickoffMessage({ now, userSystemPrompt, archive }: KickoffI
     ``,
     archive
       ? `Start with getArchive, then getArchiveArticles for the stories worth reading, then getHistory and at most 4 live pages if they add something, then write ${OUTPUT_PATH}.`
-      : `Start with getHistory, then scrape, then write ${OUTPUT_PATH}.`,
+      : `There is no archive this build. Start with getHistory, then load up to 8 pages with getPageHtml, then write ${OUTPUT_PATH}.`,
   ]
     .filter(Boolean)
     .join("\n");
