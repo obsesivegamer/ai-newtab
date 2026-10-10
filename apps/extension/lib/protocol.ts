@@ -57,8 +57,8 @@ export type BuildMsg =
  */
 export const BUILD_STEPS: { label: string; phases: RunPhase[] }[] = [
   { label: "Preparing agent", phases: ["setup", "session-create"] },
-  { label: "Reading your history", phases: ["history"] },
-  { label: "Opening pages in your browser", phases: ["scraping"] },
+  { label: "Reading your archive and history", phases: ["history"] },
+  { label: "Opening articles and pages", phases: ["scraping"] },
   { label: "Analyzing pages", phases: ["analyzing"] },
   { label: "Writing your homepage", phases: ["writing", "cleanup", "done"] },
 ];

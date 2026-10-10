@@ -151,9 +151,21 @@ try {
   await sleep(2500); // let React mount
   const bodyText = await page.evaluate<string>("document.body.innerText");
   check(
-    "renders the API-key setup screen",
-    /Connect your Anthropic API key/i.test(bodyText),
+    "opens on the Library",
+    /Library/.test(bodyText) && /Today/.test(bodyText),
     bodyText.split("\n").filter(Boolean)[0]?.slice(0, 50),
+  );
+
+  // The model-built homepage lives on the Today tab; on a fresh profile it asks for the key.
+  await page.evaluate<string>(
+    `[...document.querySelectorAll("button")].find((b) => b.textContent?.trim().startsWith("Today"))?.click()`,
+  );
+  await sleep(600);
+  const todayText = await page.evaluate<string>("document.body.innerText");
+  check(
+    "Today renders the API-key setup screen",
+    /Connect your Anthropic API key/i.test(todayText),
+    todayText.split("\n").filter(Boolean).slice(0, 3).join(" | ").slice(0, 80),
   );
 
   // Open a build port, send one message, and collect replies for a moment.

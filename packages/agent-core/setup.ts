@@ -1,6 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { HOMEPAGE_SYSTEM_PROMPT } from "./prompt";
-import { GET_HISTORY_SCHEMA, GET_PAGE_HTML_SCHEMA } from "./schemas";
+import {
+  GET_ARCHIVE_ARTICLES_SCHEMA,
+  GET_ARCHIVE_SCHEMA,
+  GET_HISTORY_SCHEMA,
+  GET_PAGE_HTML_SCHEMA,
+} from "./schemas";
 import type { KVStore } from "./types";
 
 /** Models offered in Settings. The first is the default. */
@@ -81,7 +86,7 @@ function agentDefinition(model: HomepageModel) {
   return {
     name: AGENT_NAME,
     model,
-    description: "Builds a personalized homepage from the user's browsing history.",
+    description: "Builds a personalized homepage from the user's saved-article archive and browsing history.",
     system: HOMEPAGE_SYSTEM_PROMPT,
     tools: [
       {
@@ -99,11 +104,36 @@ function agentDefinition(model: HomepageModel) {
       },
       {
         type: "custom",
+        name: "getArchive",
+        description:
+          "Lists the articles the user has saved to their personal news archive over a " +
+          "recent window: id, title, publication, author, dates, word count, paywall flag, " +
+          "original URL and archive permalink for each, plus per-publication counts. " +
+          "Metadata only, no article text. Call this first; one more call with a " +
+          "wider window is fine when the first is thin. " +
+          "Returns an error if no archive is available.",
+        input_schema: GET_ARCHIVE_SCHEMA,
+      },
+      {
+        type: "custom",
+        name: "getArchiveArticles",
+        description:
+          "Mounts the text of up to 12 archived articles per call (24 per build), chosen " +
+          "by id from getArchive, into your sandbox as plain-text files. Long articles " +
+          "are cut at about 2000 words and say so (truncated: true); the user's own " +
+          "reader has the full text. Returns a mountPath, byte count and word count per " +
+          "article plus a list of failures. Use grep/read on the returned mountPath. " +
+          "Each file starts with a short header (title, site, dates, links), then a " +
+          "blank line, then the article text.",
+        input_schema: GET_ARCHIVE_ARTICLES_SCHEMA,
+      },
+      {
+        type: "custom",
         name: "getHistory",
         description:
           "Returns a ranked digest of the user's most-visited domains over a recent " +
           "window: visit counts, unique page counts, last-visit timestamps, relevance " +
-          "scores, and a few sample page titles per domain. Call this first, once.",
+          "scores, and a few sample page titles per domain. Call this once.",
         input_schema: GET_HISTORY_SCHEMA,
       },
       {
@@ -111,7 +141,10 @@ function agentDefinition(model: HomepageModel) {
         name: "getPageHtml",
         description:
           "Loads URLs in the user's real, logged-in browser, sanitizes the HTML, and " +
-          "mounts each page into your sandbox. Returns a mountPath and byte count per " +
+          "mounts each page into your sandbox. Only sites that appeared in this " +
+          "build's getHistory digest or in a getArchive article's originalUrl are " +
+          "allowed, so call one of those first; any other URL comes back in failed. " +
+          "Returns a mountPath and byte count per " +
           "page plus a list of failures. Use grep/read on the returned mountPath. " +
           "Prefer this over any web fetch: it sees authenticated, JavaScript-rendered " +
           "pages that an anonymous fetch cannot.",

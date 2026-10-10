@@ -6,6 +6,7 @@ import {
   type HomepageModel,
   type KVStore,
 } from "@homepage/agent-core";
+import { DEFAULT_ARCHIVE_URL } from "./archive";
 
 /**
  * Everything the extension persists, in one place. All of it lives in
@@ -18,6 +19,7 @@ export const KEYS = {
   homepage: "homepageData",
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
+  archiveUrl: "archiveUrl",
   model: "model",
   autoRebuild: "autoRebuild",
   /** ISO timestamp of the last auto-build *attempted* (success or not). */
@@ -38,6 +40,8 @@ export interface Settings {
   apiKey: string | null;
   systemPrompt: string;
   blockedSites: string[];
+  /** Base URL of the Amber archive. Empty string turns the archive off. */
+  archiveUrl: string;
   model: HomepageModel;
   /** Unset means on — auto-rebuild is opt-out. */
   autoRebuild: boolean;
@@ -63,6 +67,7 @@ export async function loadSettings(): Promise<Settings> {
     KEYS.apiKey,
     KEYS.systemPrompt,
     KEYS.blockedSites,
+    KEYS.archiveUrl,
     KEYS.model,
     KEYS.autoRebuild,
     KEYS.rebuildIntervalHours,
@@ -72,6 +77,7 @@ export async function loadSettings(): Promise<Settings> {
     apiKey: (s[KEYS.apiKey] as string | undefined) ?? null,
     systemPrompt: (s[KEYS.systemPrompt] as string | undefined) ?? "",
     blockedSites: (s[KEYS.blockedSites] as string[] | undefined) ?? [...DEFAULT_BLOCKED_SITES],
+    archiveUrl: (s[KEYS.archiveUrl] as string | undefined) ?? DEFAULT_ARCHIVE_URL,
     // Fall back if a stored model is no longer offered.
     model: MODEL_CHOICES.find((m) => m.id === model)?.id ?? DEFAULT_MODEL,
     autoRebuild: s[KEYS.autoRebuild] !== false,
@@ -79,7 +85,7 @@ export async function loadSettings(): Promise<Settings> {
   };
 }
 
-export async function saveSetting<K extends "apiKey" | "systemPrompt" | "blockedSites" | "model" | "autoRebuild" | "rebuildIntervalHours">(
+export async function saveSetting<K extends "apiKey" | "systemPrompt" | "blockedSites" | "archiveUrl" | "model" | "autoRebuild" | "rebuildIntervalHours">(
   key: K,
   value: Settings[K],
 ): Promise<void> {

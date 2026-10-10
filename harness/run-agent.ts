@@ -11,7 +11,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { runHomepageBuild } from "@homepage/agent-core";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { FileKVStore, OUT_DIR, OUT_PATH, STATE_PATH, nodeBridge } from "./node-bridge";
+import { FileKVStore, OUT_DIR, OUT_PATH, STATE_PATH, harnessArchive, harnessBlockedSites, nodeBridge } from "./node-bridge";
 
 async function main() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -28,6 +28,8 @@ async function main() {
   const result = await runHomepageBuild({
     client,
     bridge: nodeBridge,
+    archive: harnessArchive(),
+    blockedSites: harnessBlockedSites(),
     store,
     userSystemPrompt: process.env.HOMEPAGE_PROMPT,
     callbacks: {

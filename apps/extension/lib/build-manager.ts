@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { runHomepageBuild, type RunPhase } from "@homepage/agent-core";
+import { archiveHostOf, normalizeArchiveUrl, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
+import { createArchiveBridge } from "./archive";
 import { browserBridge } from "./browser-bridge";
 import {
   INITIAL_BUILD_STATE,
@@ -141,7 +142,7 @@ export class BuildManager {
       return; // single-flight: a second start just attaches.
     }
 
-    const { apiKey, systemPrompt, model } = await loadSettings();
+    const { apiKey, systemPrompt, model, archiveUrl } = await loadSettings();
     if (!apiKey) {
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
@@ -150,6 +151,11 @@ export class BuildManager {
       this.state = { ...INITIAL_BUILD_STATE, phase: "error", error: message };
       this.broadcast({ kind: "error", message });
       return;
+    }
+
+    const archiveBase = normalizeArchiveUrl(archiveUrl);
+    if (archiveUrl.trim() && !archiveBase) {
+      console.warn("[BuildManager] archive URL is not a valid http(s) address; building without the archive");
     }
 
     this.running = true;
@@ -171,9 +177,19 @@ export class BuildManager {
       const result = await runHomepageBuild({
         client,
         bridge: browserBridge,
+        // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
+        archive: archiveBase ? createArchiveBridge(archiveBase) : undefined,
         store: extensionStore,
         userSystemPrompt: systemPrompt,
-        blockedSites: async () => (await loadSettings()).blockedSites,
+        // The archive's own host is never a page the agent may scrape: its index
+        // lists every saved article, including ones from blocked sites. Both the
+        // address this build started with and the one in Settings now are blocked,
+        // so changing the setting mid-build can't expose the one in use.
+        blockedSites: async () => {
+          const { blockedSites, archiveUrl: current } = await loadSettings();
+          const hosts = [archiveBase, current].flatMap((url) => (url ? archiveHostOf(url) ?? [] : []));
+          return [...blockedSites, ...hosts];
+        },
         model,
         resumeSessionId,
         signal: this.controller.signal,

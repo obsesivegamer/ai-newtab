@@ -8,7 +8,17 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { BrowserBridge, KVStore, RawSiteMetadata } from "@homepage/agent-core";
+import {
+  DEFAULT_BLOCKED_SITES,
+  archiveHostOf,
+  normalizeArchiveUrl,
+  type ArchiveArticle,
+  type ArchiveArticleMeta,
+  type ArchiveBridge,
+  type BrowserBridge,
+  type KVStore,
+  type RawSiteMetadata,
+} from "@homepage/agent-core";
 
 /** Harness state (cached agent/environment IDs, active session) and output, next to these scripts. */
 export const STATE_PATH = join(import.meta.dir, ".agent-state.json");
@@ -128,3 +138,107 @@ export const nodeBridge: BrowserBridge = {
     return { pages, failed };
   },
 };
+
+/**
+ * The Amber archive over its JSON API, for the harness. Mirrors the extension's
+ * lib/archive.ts mapping on purpose rather than importing it: the harness must
+ * not depend on the extension workspace. Address cleanup is shared through
+ * agent-core's `normalizeArchiveUrl`.
+ */
+export const DEFAULT_AMBER_URL = "http://127.0.0.1:8080";
+
+interface AmberSnapshot {
+  id: string;
+  url: string;
+  final_url: string | null;
+  title: string;
+  site: string;
+  author: string | null;
+  published_at: string | null;
+  created_at: string;
+  word_count: number;
+  paywalled: boolean;
+}
+
+export function createNodeArchiveBridge(baseUrl = DEFAULT_AMBER_URL): ArchiveBridge {
+  const base = normalizeArchiveUrl(baseUrl);
+  if (!base) throw new Error(`Invalid archive URL: ${baseUrl}`);
+
+  const getJson = async <T>(path: string, timeoutMs: number): Promise<T> => {
+    const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`archive responded ${res.status} for ${path}`);
+    return (await res.json()) as T;
+  };
+
+  const toMeta = (s: AmberSnapshot): ArchiveArticleMeta => ({
+    id: s.id,
+    title: s.title,
+    site: s.site,
+    author: s.author ?? undefined,
+    publishedAt: s.published_at ?? undefined,
+    savedAt: s.created_at,
+    wordCount: s.word_count,
+    paywalled: s.paywalled,
+    originalUrl: s.final_url ?? s.url,
+    permalink: `${base}/${s.id}`,
+  });
+
+  return {
+    async listArticles({ sinceDays, limit }) {
+      const list = await getJson<{
+        total_usable: number;
+        sources: Array<{ site: string; count: number; latest: string }>;
+        snapshots: AmberSnapshot[];
+      }>(`/api/snapshots?since_days=${sinceDays}&limit=${limit}`, 10_000);
+      return {
+        totalUsable: list.total_usable,
+        sources: list.sources,
+        articles: list.snapshots.map(toMeta),
+      };
+    },
+
+    async getArticles({ ids }) {
+      const articles: ArchiveArticle[] = [];
+      const failed: Array<{ id: string; reason: string }> = [];
+      await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const body = await getJson<AmberSnapshot & { text: string }>(
+              `/api/snapshots/${encodeURIComponent(id)}/text`,
+              20_000,
+            );
+            articles.push({ ...toMeta(body), text: body.text });
+          } catch (err) {
+            failed.push({ id, reason: String(err) });
+          }
+        }),
+      );
+      return { articles, failed };
+    },
+  };
+}
+
+function harnessArchiveUrl(): string {
+  return (process.env.AMBER_URL ?? DEFAULT_AMBER_URL).trim();
+}
+
+/** The harness's archive: `AMBER_URL` if set (empty string turns it off), else the local default. */
+export function harnessArchive(): ArchiveBridge | undefined {
+  const url = harnessArchiveUrl();
+  if (!url) return undefined;
+  if (!normalizeArchiveUrl(url)) {
+    console.warn("[harness] AMBER_URL is not a valid http(s) address; running without the archive");
+    return undefined;
+  }
+  return createNodeArchiveBridge(url);
+}
+
+/**
+ * The default blocked sites plus the archive's own host, as the extension's
+ * build-manager does: the archive index lists every saved article, so
+ * getPageHtml must never be pointed at it.
+ */
+export function harnessBlockedSites(): string[] {
+  const host = archiveHostOf(harnessArchiveUrl());
+  return [...DEFAULT_BLOCKED_SITES, ...(host ? [host] : [])];
+}

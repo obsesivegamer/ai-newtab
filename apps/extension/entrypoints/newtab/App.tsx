@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
-import { DEFAULT_MODEL, DEFAULT_BLOCKED_SITES, type HomepageModel } from "@homepage/agent-core";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  DEFAULT_MODEL,
+  DEFAULT_BLOCKED_SITES,
+  type ArchiveArticleMeta,
+  type HomepageModel,
+} from "@homepage/agent-core";
 import { DEFAULT_REBUILD_INTERVAL_HOURS } from "@/lib/auto-rebuild";
 import { BUILD_STEPS } from "@/lib/protocol";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
@@ -8,8 +13,17 @@ import { ApiKeySetup } from "./components/ApiKeySetup";
 import { BuildProgress } from "./components/BuildProgress";
 import { HomepagePreview } from "./components/HomepagePreview";
 import { SettingsModal } from "./components/SettingsModal";
-import { btn, errorBox } from "./components/ui";
+import { Library } from "./components/Library";
+import { Reader } from "./components/Reader";
+import { ThemeToggle } from "./components/ThemeToggle";
+import { ViewTabs, type View } from "./components/ViewTabs";
+import { useTheme } from "./uiPrefs";
+import { useArchiveList } from "./useArchiveList";
 import { useHomepageBuild } from "./useHomepageBuild";
+
+/** What the model-built homepage may ask the page to open. Anything else is ignored. */
+const OPEN_ARTICLE = "homepage:open-article";
+const ARTICLE_ID = /^[A-Za-z0-9]{3,16}$/;
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -29,6 +43,22 @@ export default function App() {
   /** The error the user dismissed, so a stale banner doesn't linger. */
   const [dismissedError, setDismissedError] = useState<string | null>(null);
 
+  const { theme, toggle: toggleTheme } = useTheme();
+  const [view, setView] = useState<View>("library");
+  /** The Today pane mounts on first visit and then stays, so Sandpack isn't rebuilt on every switch. */
+  const [todayMounted, setTodayMounted] = useState(false);
+  /** null until settings load; "" means the archive is switched off. */
+  const [archiveUrl, setArchiveUrl] = useState<string | null>(null);
+  const [reader, setReader] = useState<{ id: string; list: ArchiveArticleMeta[] } | null>(null);
+  /** The library row the keyboard cursor sits on; follows the reader's prev/next. */
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  const archive = useArchiveList(archiveUrl);
+
+  useEffect(() => {
+    document.title = view === "today" ? "Today" : "Library";
+    if (view === "today") setTodayMounted(true);
+  }, [view]);
+
   const { state, build, cancel } = useHomepageBuild((code) => setRenderedCode(toRenderable(code)));
 
   // Once a build finishes, drop back to the homepage view.
@@ -47,6 +77,7 @@ export default function App() {
           extensionStore.get<string>(KEYS.activeSessionId),
         ]);
         setApiKey(settings.apiKey);
+        setArchiveUrl(settings.archiveUrl);
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
         setModel(settings.model);
@@ -60,6 +91,55 @@ export default function App() {
     })();
   }, []);
 
+  // The settings modal may have changed the archive address.
+  useEffect(() => {
+    if (showSettings) return;
+    void loadSettings().then((s) => setArchiveUrl(s.archiveUrl));
+  }, [showSettings]);
+
+  // The model-built homepage asks to open an archived story in the native reader.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: unknown; id?: unknown } | null;
+      if (!data || typeof data !== "object" || data.type !== OPEN_ARTICLE) return;
+      if (typeof data.id !== "string" || !ARTICLE_ID.test(data.id)) return;
+      // Only the homepage's own Sandpack frame may ask; the model's code runs in there.
+      const frames = document.querySelectorAll<HTMLIFrameElement>(".today-frame iframe");
+      const fromHomepage = Array.from(frames).some(
+        (frame) => frame.contentWindow !== null && frame.contentWindow === e.source,
+      );
+      if (!fromHomepage) return;
+      const id = data.id;
+      setReader((current) => (current?.id === id ? current : { id, list: [] }));
+      setCursorId(id);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  const openArticle = useCallback((id: string, list: ArchiveArticleMeta[]) => {
+    setReader({ id, list });
+    setCursorId(id);
+  }, []);
+  const navigateReader = useCallback((id: string) => {
+    setReader((r) => (r ? { ...r, id } : r));
+    setCursorId(id);
+  }, []);
+  const closeReader = useCallback(() => setReader(null), []);
+
+  // Put keyboard focus back on the row the reader was opened from.
+  const readerOpen = reader !== null;
+  const wasReaderOpen = useRef(false);
+  useEffect(() => {
+    if (readerOpen) {
+      wasReaderOpen.current = true;
+      return;
+    }
+    if (!wasReaderOpen.current) return;
+    wasReaderOpen.current = false;
+    if (cursorId) document.getElementById(`row-${cursorId}`)?.focus({ preventScroll: true });
+  }, [readerOpen]);
+
   const saveKey = useCallback(async (key: string) => {
     await saveSetting("apiKey", key);
     setApiKey(key);
@@ -71,10 +151,12 @@ export default function App() {
       setBlockedSites(sites);
       setSystemPrompt(prompt);
       setShowSettings(false);
-      setRenderedCode(null);
-      build();
+      if (apiKey) {
+        setRenderedCode(null);
+        build();
+      }
     },
-    [build],
+    [build, apiKey],
   );
 
   // These persist immediately; the worker reads them on its next heartbeat or build.
@@ -91,119 +173,169 @@ export default function App() {
     await saveSetting("rebuildIntervalHours", next);
   }, []);
 
-  if (loading) return <div style={{ padding: 20, textAlign: "center" }}>Loading…</div>;
-  if (!apiKey) return <ApiKeySetup onSave={saveKey} />;
-
-  // With no homepage to fall back to, a running build takes over the tab.
-  if (state.running && (!renderedCode || viewProgress)) {
-    return (
-      <BuildProgress
-        state={state}
-        onCancel={cancel}
-        onBack={renderedCode ? () => setViewProgress(false) : undefined}
-      />
-    );
-  }
-
-  if (!renderedCode) {
-    return (
-      <div style={{ maxWidth: 560, margin: "14vh auto", padding: 24, fontFamily: "system-ui" }}>
-        <h1 style={{ fontSize: 26 }}>Build your homepage</h1>
-        <p style={{ color: "#555", lineHeight: 1.6 }}>
-          The agent reads your browsing history, opens the pages you actually follow, and writes a
-          homepage from what it finds today.
-        </p>
-        {state.error && (
-          <div style={{ ...errorBox, margin: "16px 0", padding: 12, borderRadius: 4 }}>{state.error}</div>
-        )}
-        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
-          <button style={btn} onClick={() => build()}>
-            Build today&apos;s homepage
-          </button>
-          {resumable && (
-            <button style={{ ...btn, backgroundColor: "#555" }} onClick={() => build({ resume: true })}>
-              Resume interrupted build
-            </button>
-          )}
-        </div>
-      </div>
-    );
-  }
-
   const showError = state.error && dismissedError !== state.error;
+  const todayBuilding = state.running;
+
+  // --- the "Today" view: the model-built homepage, unchanged in behaviour ----
+  const renderToday = () => {
+    if (loading) return <div className="pane-msg">Loading…</div>;
+    if (!apiKey) return <ApiKeySetup onSave={saveKey} />;
+
+    // With no homepage to fall back to, a running build takes over the pane.
+    if (state.running && (!renderedCode || viewProgress)) {
+      return (
+        <BuildProgress
+          state={state}
+          onCancel={cancel}
+          onBack={renderedCode ? () => setViewProgress(false) : undefined}
+        />
+      );
+    }
+
+    if (!renderedCode) {
+      return (
+        <div className="gate">
+          <div className="meta gate-eyebrow">Today</div>
+          <h1 className="gate-title">Build your homepage</h1>
+          <p className="gate-body">
+            The agent reads your browsing history and your archive, opens the pages you actually
+            follow, and writes a homepage from what it finds today.
+          </p>
+          {state.error && (
+            <div className="banner error" role="alert">
+              <b>Build failed.</b> {state.error}
+            </div>
+          )}
+          <div className="gate-actions">
+            <button className="solid-btn" onClick={() => build()}>
+              Build today&apos;s homepage
+            </button>
+            {resumable && (
+              <button className="ghost-btn" onClick={() => build({ resume: true })}>
+                Resume interrupted build
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <>
+        {showError && (
+          <div className="banner error banner-row" role="alert">
+            <span>
+              <b>Build failed.</b> {state.error}
+            </span>
+            <button className="ghost-btn small" onClick={() => build()}>
+              Retry
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => setDismissedError(state.error)}
+              title="Dismiss"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+        <div className="today-frame">
+          <HomepagePreview code={renderedCode} />
+        </div>
+      </>
+    );
+  };
+
+  const showRebuild = view === "today" && !loading && !!apiKey && !!renderedCode;
+  const showTodayError = !!showError;
 
   return (
-    <div style={{ height: "100vh", width: "100vw" }}>
-      <div style={{ position: "fixed", top: 20, right: 20, zIndex: 999, display: "flex", gap: 8 }}>
-        {state.running ? (
-          // A build is running in the background (from here, another tab, or the
-          // scheduled rebuild). Let the user watch it without losing this page.
-          <button
-            style={{ ...btn, backgroundColor: "#0a7", display: "flex", alignItems: "center", gap: 8 }}
-            onClick={() => setViewProgress(true)}
-            title="View build progress"
-          >
-            <span
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                background: "white",
-                animation: "hb-pulse 1.2s ease-in-out infinite",
-              }}
-            />
-            Building… {Math.min(state.stepIndex + 1, BUILD_STEPS.length)}/{BUILD_STEPS.length}
+    <div className="shell">
+      <div className="shell-content" aria-hidden={readerOpen || undefined} inert={readerOpen || undefined}>
+        <header className="topbar">
+          <ViewTabs
+            view={view}
+            onChange={setView}
+            todayBusy={todayBuilding}
+            todayError={showTodayError}
+          />
+          <span className="bar-spacer" />
+          {showRebuild &&
+            (state.running ? (
+              // A build is running in the background (from here, another tab, or the
+              // scheduled rebuild). Let the user watch it without losing this page.
+              <button
+                className="ghost-btn small building"
+                onClick={() => setViewProgress(true)}
+                title="View build progress"
+              >
+                <span className="pulse-dot" />
+                Building… {Math.min(state.stepIndex + 1, BUILD_STEPS.length)}/{BUILD_STEPS.length}
+              </button>
+            ) : (
+              <button className="ghost-btn small" onClick={() => build()} title="Rebuild now">
+                Rebuild
+              </button>
+            ))}
+          <button className="ghost-btn small" onClick={() => setShowSettings(true)} title="Settings">
+            Settings
           </button>
-        ) : (
-          <button style={btn} onClick={() => build()} title="Rebuild now">
-            ↻ Rebuild
-          </button>
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+        </header>
+
+        {showTodayError && view !== "today" && (
+          <div className="banner error banner-row banner-slim" role="alert">
+            <span className="banner-text">
+              <b>Today&apos;s build failed.</b> {state.error}
+            </span>
+            <button className="ghost-btn small" onClick={() => setView("today")}>
+              View
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => setDismissedError(state.error)}
+              title="Dismiss"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
         )}
-        <button style={btn} onClick={() => setShowSettings(true)} title="Customize homepage">
-          ⚙️ Settings
-        </button>
+
+        <main className="main">
+          <div className="view-library" hidden={view !== "library"}>
+            <Library
+              state={archive.state}
+              archiveUrl={archiveUrl}
+              onReload={archive.reload}
+              onOpen={openArticle}
+              cursorId={cursorId}
+              onCursor={setCursorId}
+              keysActive={view === "library" && !readerOpen && !showSettings}
+              onOpenSettings={() => setShowSettings(true)}
+            />
+          </div>
+          {todayMounted && (
+            <div className="today-pane" hidden={view !== "today"}>
+              {renderToday()}
+            </div>
+          )}
+        </main>
       </div>
 
-      {showError && (
-        <div
-          style={{
-            ...errorBox,
-            position: "fixed",
-            top: 20,
-            left: 20,
-            right: 260,
-            zIndex: 999,
-            padding: "10px 14px",
-            borderRadius: 6,
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 12,
-          }}
-        >
-          <span style={{ flex: 1 }}>
-            <b>Build failed.</b> {state.error}
-          </span>
-          <button style={{ ...btn, padding: "4px 10px", backgroundColor: "#a02620" }} onClick={() => build()}>
-            Retry
-          </button>
-          <button
-            onClick={() => setDismissedError(state.error)}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "#a02620",
-              cursor: "pointer",
-              fontSize: 16,
-              lineHeight: 1,
-            }}
-            title="Dismiss"
-          >
-            ✕
-          </button>
-        </div>
+      {reader && (
+        <Reader
+          id={reader.id}
+          list={reader.list}
+          archiveUrl={archiveUrl}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onNavigate={navigateReader}
+          onClose={closeReader}
+          keysActive={!showSettings}
+        />
       )}
-
-      <HomepagePreview code={renderedCode} />
 
       {showSettings && (
         <SettingsModal
@@ -217,6 +349,7 @@ export default function App() {
           onChangeInterval={changeInterval}
           onClose={() => setShowSettings(false)}
           onSave={savePrompt}
+          canRebuild={!!apiKey}
         />
       )}
     </div>

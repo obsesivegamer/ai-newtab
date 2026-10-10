@@ -59,12 +59,12 @@ export function BuildProgress({
             })}
           </ol>
 
-          <div style={{ display: "flex", gap: 10 }}>
-            <button className="build-cancel" onClick={onCancel}>
+          <div className="build-actions">
+            <button className="ghost-btn build-cancel" onClick={onCancel}>
               Cancel
             </button>
             {onBack && (
-              <button className="build-cancel" style={{ background: "transparent" }} onClick={onBack}>
+              <button className="ghost-btn" onClick={onBack}>
                 ← Back to homepage
               </button>
             )}
@@ -74,14 +74,14 @@ export function BuildProgress({
 
       <div className="build-right">
         <div className="build-panel">
-          <div className="build-eyebrow">Agent</div>
+          <div className="meta build-eyebrow">Agent</div>
           <div className="build-narration" ref={narrRef}>
-            {narration || "Warming up — reading what you’ve been browsing…"}
+            {narration || "Warming up — reading your saved articles and what you’ve been browsing…"}
           </div>
 
           {logs.length > 0 && (
             <>
-              <div className="build-eyebrow build-log-label">Activity log</div>
+              <div className="meta build-eyebrow build-log-label">Activity log</div>
               <pre className="build-log" ref={logRef}>
                 {logs.slice(-LOG_RETENTION).join("\n")}
               </pre>

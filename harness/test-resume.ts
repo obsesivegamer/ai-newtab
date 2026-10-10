@@ -23,7 +23,7 @@ import {
   ensureEnvironment,
   runHomepageBuild,
 } from "@homepage/agent-core";
-import { FileKVStore, STATE_PATH, nodeBridge } from "./node-bridge";
+import { FileKVStore, STATE_PATH, harnessArchive, harnessBlockedSites, nodeBridge } from "./node-bridge";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const store = new FileKVStore(STATE_PATH);
@@ -67,6 +67,8 @@ async function crash(): Promise<never> {
           maxResults: 30,
           totalSitesSeen,
         });
+        // getPageHtml only loads hosts the model was shown; the resumed run rebuilds
+        // that list from this result in the session's event log.
         await client.beta.sessions.events.send(session.id, {
           events: [
             {
@@ -80,6 +82,19 @@ async function crash(): Promise<never> {
         console.log(`[crash] getPageHtml requested (${event.id}) — DYING WITHOUT ANSWERING`);
         console.log(`[crash] urls: ${JSON.stringify((event.input as any).urls)}`);
         process.exit(0);
+      } else {
+        // The model may open with an archive tool; answer it so the run still reaches getPageHtml.
+        console.log(`[crash] ${event.name} is not part of this test — answering with an error`);
+        await client.beta.sessions.events.send(session.id, {
+          events: [
+            {
+              type: "user.custom_tool_result",
+              custom_tool_use_id: event.id,
+              is_error: true,
+              content: [{ type: "text", text: "The article archive is unavailable. Use getHistory instead." }],
+            },
+          ],
+        });
       }
     }
   }
@@ -99,6 +114,8 @@ async function resume() {
   const result = await runHomepageBuild({
     client,
     bridge: nodeBridge,
+    archive: harnessArchive(),
+    blockedSites: harnessBlockedSites(),
     store,
     resumeSessionId: sessionId,
     callbacks: {

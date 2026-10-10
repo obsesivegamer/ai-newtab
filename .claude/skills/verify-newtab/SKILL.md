@@ -1,0 +1,87 @@
+---
+name: verify-newtab
+description: Visually verify the AI new-tab extension (Library, Reader, Settings, Today, Amber-down) in headless Chrome against a throwaway read-only Amber, in dark and light. Use after any change to apps/extension/entrypoints/newtab (components, styles.css, App.tsx), apps/extension/lib/archive.ts, or anything else that changes what the new-tab page looks like or how it talks to Amber.
+---
+
+# verify-newtab
+
+One command builds nothing by default, starts a throwaway Amber, loads the built extension into headless Chrome, drives the real UI, saves screenshots, and prints DOM assertions. Nothing is written into the repo.
+
+## Run it
+
+From the repo root:
+
+```bash
+# 1. Build first if you changed source (or pass --build to the script)
+npx -y pnpm@10.11.1 build
+
+# 2. Capture + assert
+npx -y bun .claude/skills/verify-newtab/scripts/verify.ts
+```
+
+Options (all optional):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--out <dir>` | fresh dir under the OS temp dir | where the PNGs and `amber.log` go |
+| `--amber-dir <path>` | `~/Documents/amber-archive` | Amber checkout with a `.venv` and the JSON API (`app/api.py`); its `data/` dir is used |
+| `--port <n>` | `8090` | port for the throwaway Amber; `8080` is refused |
+| `--build` | off | run `npx -y pnpm@10.11.1 build` first |
+| `--chrome-port <n>` | random free port | Chrome DevTools port |
+
+`CHROME_PATH` overrides the Chrome binary (default is the macOS Google Chrome path). The script warns when the build is older than the source, so a stale build does not pass for your change. It takes about 15 seconds and exits 0 only when no hard assertion failed.
+
+What it does: starts `python -m uvicorn app.main:app` on `--port` with `AMBER_DATA_DIR` set to the checkout's `data/`, sends only GET requests, sets `archiveUrl` in the fresh profile's `chrome.storage.local`, then captures 1280x900 at 2x for each of the following in **dark and light**. Amber and Chrome are always killed on exit, on error, and on SIGINT/SIGTERM. It never touches port 8080 or Amber's launchd service.
+
+Amber's own startup runs its idempotent `init_db()` against the real data directory (the live Amber already did the same); the script itself never POSTs.
+
+## Screenshots
+
+| File | Shows |
+| --- | --- |
+| `01-library-<theme>.png` | Library, all sources |
+| `02-library-source-chip-<theme>.png` | one source chip active |
+| `03-library-search-<theme>.png` | search results (after pressing `/` and typing) |
+| `04-reader-<theme>.png` | Reader on the newest article |
+| `05-settings-<theme>.png` | Settings modal |
+| `06-today-empty-<theme>.png` | Today tab with no API key |
+| `07-amber-down-<theme>.png` | Library when the archive is unreachable |
+
+Open each PNG with the Read tool and look at it. Passing assertions do not replace looking.
+
+## What to look for
+
+1. Dark theme: warm near-black background (about `rgb(22, 20, 18)`), not cold grey or pure black. Light theme: warm paper, not stark white.
+2. Reader body: serif (Charter), about 20px, line length 62-70ch, generous line height, text contrast at least 7:1 (the script prints the measured value).
+3. One accent colour only (amber in dark, darker amber in light), used for the active tab, active chip, links and the primary button. No second highlight colour.
+4. Metadata (source, author, minutes, dates) is quiet: smaller, muted, monospace or small caps, and clearly below the titles in weight. It must still be readable.
+5. No horizontal overflow or clipped text in the Settings modal, chips, or long titles; the modal scrolls vertically instead.
+6. Reader state: top bar is inert behind it (asserted), focus returns to the opened row on close, and the counter reads "1 of N".
+7. Amber-down: a clear "Amber isn't running" message with the address it tried and a Retry button, not a blank page or a stack trace.
+8. Today with no key: the "Connect your Anthropic API key" setup screen, same typography as the rest.
+9. Anything you changed looks the same in light and dark. Compare the two files side by side.
+
+## Assertions it prints
+
+Library rows > 0, a source chip filters the list, `/` focuses search and search narrows the list, Esc clears it, Reader has more than 3 paragraphs and starts at the top, `.shell-content` (which contains the top bar) is `inert` while the Reader is open, Reader font size / measure / contrast (warnings, not failures), no horizontal overflow in Settings, Today shows the API-key screen, Amber-down notice shows, and no console errors from the extension page (network errors during the Amber-down shots are ignored).
+
+## Attach proof to a PR
+
+These screenshots show the user's real reading list: titles, authors and sources of articles they saved. That is personal data, and the fork is public. **Ask the user before posting any of them**, and prefer posting only the shots that need to be seen (for example Settings, Today and Amber-down contain no articles).
+
+When the user agrees:
+
+1. Never commit the images. Keep them in the temp or `--out` folder.
+2. Open the PR in Claude in Chrome, find the comment box's file input, and `file_upload` each PNG. GitHub inserts an `<img src="https://github.com/user-attachments/assets/...">` per file.
+3. Caption each image with what it proves, with "Before" and "After" when a change replaces something (run the script on the base branch build for "before", with a different `--out`).
+4. Click Comment.
+
+If Chrome is not available, tell the user where the screenshots are.
+
+## Caveats
+
+- No API key in the throwaway profile, so the Today build is not exercised. This verifies the Library, Reader, Settings, Today's empty state and the Amber-down state only. A real build needs `pnpm agent:run` or the extension with a key, and spends credits.
+- Amber must have the JSON API (`/api/snapshots`). If it answers 404 the script captures the "no article API" notice and skips the chip, search and Reader checks; update the checkout and rerun. An empty `data/` dir produces an empty Library, which fails "Library has rows".
+- `--amber-dir` must contain `.venv/bin/python`. A fresh `git worktree` has neither the venv nor data.
+- Chrome 136+ ignores `--load-extension`, so the extension is loaded through the CDP `Extensions` domain with `--enable-unsafe-extension-debugging`; this is why the script owns its own Chrome instead of using your normal profile.
+- The Library shows the last 90 days of snapshots; the numbers in the screenshots change as the archive grows.
