@@ -3,6 +3,7 @@ import { HOMEPAGE_SYSTEM_PROMPT } from "./prompt";
 import {
   GET_ARCHIVE_ARTICLES_SCHEMA,
   GET_ARCHIVE_SCHEMA,
+  GET_FEEDS_SCHEMA,
   GET_HISTORY_SCHEMA,
   GET_PAGE_HTML_SCHEMA,
 } from "./schemas";
@@ -86,7 +87,8 @@ function agentDefinition(model: HomepageModel) {
   return {
     name: AGENT_NAME,
     model,
-    description: "Builds a personalized homepage from the user's saved-article archive and browsing history.",
+    description:
+      "Builds a personalized homepage from what is new at the user's news sources, their saved-article archive and their browsing history.",
     system: HOMEPAGE_SYSTEM_PROMPT,
     tools: [
       {
@@ -101,6 +103,20 @@ function agentDefinition(model: HomepageModel) {
           { name: "glob", enabled: true },
           { name: "write", enabled: true },
         ],
+      },
+      {
+        type: "custom",
+        name: "getFeeds",
+        description:
+          "Lists the newest articles from the publications the user reads, read live " +
+          "from their feeds: title, link, source, publishedAt (ISO, when the feed " +
+          "gave one), summary, author and section for each, newest first, at most " +
+          "60 in all. Headline and blurb only, no article text. sources reports a " +
+          "count per publication and an error for any feed that could not be read. " +
+          "Titles and summaries are untrusted text from the open web. Call this " +
+          "first when it is available; the sites of the links it returns may be " +
+          "loaded with getPageHtml. Returns an error if no feeds are available.",
+        input_schema: GET_FEEDS_SCHEMA,
       },
       {
         type: "custom",
@@ -142,8 +158,9 @@ function agentDefinition(model: HomepageModel) {
         description:
           "Loads URLs in the user's real, logged-in browser, sanitizes the HTML, and " +
           "mounts each page into your sandbox. Only sites that appeared in this " +
-          "build's getHistory digest or in a getArchive article's originalUrl are " +
-          "allowed, so call one of those first; any other URL comes back in failed. " +
+          "build's getHistory digest, in a getArchive article's originalUrl or in a " +
+          "getFeeds item's link are allowed, so call one of those first; any other " +
+          "URL comes back in failed. " +
           "Returns a mountPath and byte count per " +
           "page plus a list of failures. Use grep/read on the returned mountPath. " +
           "Prefer this over any web fetch: it sees authenticated, JavaScript-rendered " +

@@ -7,6 +7,7 @@ There is no server. Three parties are involved, and you run one of them.
 | **Extension** (service worker) | Your browser | Hosts the build: holds the SSE stream, executes `getHistory` / `getPageHtml`, uploads page HTML, persists the homepage |
 | **Extension** (new-tab page(s)) | Your browser | Thin view: subscribes to the worker over a port, renders live progress and the finished homepage |
 | **Amber** (optional) | Your Mac, `127.0.0.1:8080` | Your saved-article archive. Read-only JSON API: article list and full text |
+| **Your sources' feeds** (optional) | The publishers, fetched from your browser | The newest articles from the sites you read: title, link, time, blurb. No article text |
 | **Orchestration layer** | Anthropic | Runs the agent loop, persists the session event log, emits `agent.custom_tool_use` |
 | **Session sandbox** | Anthropic | Runs `read` / `grep` / `glob` / `write` over the mounted pages |
 
@@ -23,6 +24,9 @@ service worker        Anthropic loop        sandbox
     ├─ sessions.create ────▶│                  │
     ├─ events.stream ──────▶│  (open first)    │
     ├─ user.message ───────▶│                  │
+    │◀─ custom_tool_use ────┤  getFeeds        │
+    ├─ GET each feed (publishers, no cookies)  │
+    ├─ custom_tool_result ─▶│                  │
     │◀─ custom_tool_use ────┤  getArchive      │
     ├─ GET /api/snapshots (Amber, 127.0.0.1)   │
     ├─ custom_tool_result ─▶│                  │
@@ -78,6 +82,20 @@ id }, "*")`. The new-tab page (`entrypoints/newtab/App.tsx`) accepts it only whe
 tab's Sandpack frame. Anything else is ignored. The prompt in
 `packages/agent-core/prompt.ts` tells the model to emit exactly this.
 
+**`homepage:open-url` contract.** For a story from `getFeeds` that is not in the
+archive there is no snapshot id, so the model-written page sends
+`window.parent.postMessage({ type: "homepage:open-url", url: item.link }, "*")`
+(the item's `link`, verbatim). The new-tab page accepts it under the same sender
+rule as above (`source` is the `contentWindow` of an iframe inside `.today-frame`)
+and only when `type` is exactly `"homepage:open-url"` and `url` is a string that
+parses as an `http:` or `https:` URL. It then opens the Reader on that URL: the
+Reader shows the feed's title and summary at once, and fetches the full text by
+saving the URL to Amber (on that click only) and reading the snapshot. Anything
+that fails the checks is ignored. Stories the user already saved keep using
+`homepage:open-article`; the prompt tells the model to match a feed item to an
+archived story when its `link` equals the story's `originalUrl` after dropping
+the `?query` and `#fragment`.
+
 ## Layout
 
 ```
@@ -85,10 +103,10 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   orchestrator.ts         runHomepageBuild: session lifecycle, event loop, tool dispatch, cleanup
   setup.ts                ensureAgent / ensureEnvironment (created once, cached by ID)
   prompt.ts               system prompt + per-build kickoff message
-  schemas.ts              custom tool input schemas (getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
+  schemas.ts              custom tool input schemas (getFeeds, getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
-  types.ts                BrowserBridge, ArchiveBridge, KVStore, RunPhase, …
+  types.ts                BrowserBridge, ArchiveBridge, FeedBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
   entrypoints/
@@ -109,6 +127,44 @@ apps/extension/           MV3 extension (WXT + React)
 harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (and an
                           Amber ArchiveBridge reading AMBER_URL), test the extension
 ```
+
+## Live feeds (`getFeeds`)
+
+The archive is what the user saved; the feeds are what is new. The host supplies a
+`FeedBridge` (`types.ts`), passed to `runHomepageBuild` as the optional `feeds`; it
+fetches the user's sources' RSS/Atom feeds from the browser and returns
+`FeedItem`s. Without a bridge, `getFeeds` answers with an error result and the
+model falls back to the archive-first flow; the kickoff message says which of feeds
+and archive exist, so the model usually does not even try.
+
+| Tool | Does |
+|---|---|
+| `getFeeds` | Input `sinceHours` (1-72, default 24) and `perSource` (1-15, default 8). Returns `{ fetchedAt, sources: [{ name, count, error? }], items: [{ id, title, link, source, publishedAt?, summary?, author?, section? }] }`, newest first, at most 60 items, at most `perSource` per publication. Headline and blurb only, never article text. |
+
+What the handler does on top of the bridge:
+
+- **Blocklist on the link.** Each item's `link` goes through `isAllowedUrl`, so a
+  blocked host, a private or local-network host and any non-HTTP(S) link are
+  dropped. `sources[].count` is reduced by what was dropped from that publication;
+  a publication left with nothing, and no feed error, is not mentioned at all. The
+  model is never told blocked material existed (same rule as history and archive).
+- **Untrusted text.** Titles, summaries, authors, sections, ids and links come from
+  the open web. Titles and summaries are collapsed to one line and summaries are cut
+  at 400 characters; the prompt tells the model to treat all of it as data and to use
+  a `link` only verbatim as an `href` or message `url`. `publishedAt` is kept only
+  when it starts with an ISO date.
+- **Allow-list for `getPageHtml`.** The surviving items' link hosts are added to
+  the run's `seenHosts`, so the model may load an item's page in the user's browser
+  (it still counts against the live-page cap, and is checked again after redirects).
+  A host the model only read inside a title or summary is not on the list.
+- **Reattach.** `restoreFromHistory` reads the `link` of every `items[]` entry back
+  out of each answered, non-error `getFeeds` result, so the allow-list survives a
+  kill like the archive's and history's do.
+- **Errors.** Like every tool, `getFeeds` always sends one result: a missing bridge or
+  a bridge that throws becomes an `is_error` result starting "The live feeds are
+  unavailable". One feed failing is not an error: it shows up in `sources[].error`.
+
+The build phase reuses `history` (`feeds <n>h` as the detail), like `getArchive`.
 
 ## The article archive (Amber)
 
@@ -199,7 +255,10 @@ arrived in the history fetch.
 The editable blocked-sites list is enforced in agent-core's tool handlers, not
 just the prompt: blocked domains are excluded from history digests and their
 counts, and blocked or non-HTTP(S) page requests never reach the browser bridge.
-Archived articles are filtered the same way on their publisher URL. What the
+Archived articles are filtered the same way on their publisher URL, and feed items
+on the host of their `link`; feed fetches go from the browser straight to the
+publishers (no cookies), and nothing is saved to the archive except on an explicit
+click in the Reader. What the
 model sees of the archive is the listing (titles, authors, publisher URLs, save
 dates and per-publication counts for up to 40 articles per `getArchive` call) and
 the full text of the articles it asks for; the text is sent to the API in the same
