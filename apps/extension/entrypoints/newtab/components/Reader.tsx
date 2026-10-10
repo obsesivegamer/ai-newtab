@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ArchiveArticle, ArchiveArticleMeta } from "@homepage/agent-core";
 import { createArchiveBridge } from "@/lib/archive";
+import { fetchFullArticle, type FetchFailure, type FetchStage } from "@/lib/archive-save";
 import { toReadable, wordCount } from "../articleText";
 import { formatDate, readingMinutes } from "../format";
+import type { ReaderEntry } from "../readerEntry";
 import { useTextSize, type Theme } from "../uiPrefs";
 import { ThemeToggle } from "./ThemeToggle";
 
 type Load =
   | { status: "loading" }
+  /** An address from the model-built page: nothing is saved until the person asks. */
+  | { status: "idle" }
+  | { status: "fetching"; stage: FetchStage }
   | { status: "ready"; article: ArchiveArticle }
-  | { status: "error"; message: string };
+  | { status: "error"; title: string; message: string; reason?: FetchFailure };
 
 const UNREACHABLE = "Couldn't reach Amber. Is it running? Start it (its run script, or its launchd service).";
 
@@ -19,6 +24,56 @@ interface InFlight {
   promise: Promise<FetchResult>;
   controller: AbortController;
   watchers: number;
+}
+
+const STAGE_TEXT: Record<FetchStage, string> = {
+  checking: "Checking your archive…",
+  saving: "Saving to your archive…",
+  queued: "Waiting in Amber’s queue…",
+  capturing: "Capturing the page…",
+  reading: "Reading the capture…",
+};
+
+/** What to tell the person when the full article could not be had. Calm, and always with a way out. */
+function fetchProblem(reason: FetchFailure, detail?: string): { title: string; message: string } {
+  switch (reason) {
+    case "amber-down":
+      return {
+        title: "Amber isn’t running.",
+        message: "Start Amber to fetch the full article. The headline and summary are all there is until then.",
+      };
+    case "no-api":
+      return {
+        title: "This Amber can’t save articles yet.",
+        message: "It has no save API. Update Amber and restart it, or read the original.",
+      };
+    case "busy":
+      return { title: "Amber is busy.", message: "It has a lot of saves queued. Give it a moment, then try again." };
+    case "invalid-url":
+      return {
+        title: "That link can’t be saved.",
+        message: detail ?? "Amber only saves public web addresses.",
+      };
+    case "capture-failed":
+      return {
+        title: "Amber couldn’t capture this page.",
+        message: detail
+          ? `${detail} The site may have blocked the capture; the original may still open for you.`
+          : "The site may have blocked the capture; the original may still open for you.",
+      };
+    case "paywall-stub":
+      return {
+        title: "No article text came back.",
+        message: "Amber has the page, but the publisher showed a subscription prompt instead of the story.",
+      };
+    case "timeout":
+      return {
+        title: "This is taking a while.",
+        message: "Amber is still working on it, or gave up quietly. Try again in a moment.",
+      };
+    default:
+      return { title: "This article didn’t load.", message: "Something went wrong reaching Amber." };
+  }
 }
 
 function failureMessage(reason: string): string {
@@ -32,38 +87,62 @@ function isTyping(target: EventTarget | null): boolean {
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
 }
 
+/** Seconds since `running` became true; 0 while it is not. */
+function useElapsed(running: boolean): number {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    if (!running) {
+      setSeconds(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+  return seconds;
+}
+
 export function Reader({
-  id,
+  entry,
   list,
   archiveUrl,
   theme,
+  backLabel,
   onToggleTheme,
   onNavigate,
   onClose,
+  onSaved,
   keysActive,
 }: {
-  id: string;
-  /** The Library's current order. Empty when opened from the model-built homepage. */
-  list: ArchiveArticleMeta[];
+  entry: ReaderEntry;
+  /** The list prev/next walks. Empty when opened from the model-built homepage. */
+  list: ReaderEntry[];
   archiveUrl: string | null;
   theme: Theme;
+  /** Names the list the reader came from: "Latest", "Library", "Today". */
+  backLabel: string;
   onToggleTheme: () => void;
-  onNavigate: (id: string) => void;
+  onNavigate: (entry: ReaderEntry) => void;
   onClose: () => void;
+  /** A story from outside the archive is now readable from it. `created` is true when this call saved it. */
+  onSaved: (entry: ReaderEntry, meta: ArchiveArticleMeta, created: boolean) => void;
   keysActive: boolean;
 }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
-  const [attempt, setAttempt] = useState(0);
+  const [run, setRun] = useState({ n: 0, force: false });
+  /** The key of the address-only entry the person pressed "Fetch full article" on. */
+  const [requestedKey, setRequestedKey] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const { size, canShrink, canGrow, shrink, grow } = useTextSize();
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
 
-  const position = list.findIndex((a) => a.id === id);
+  const position = list.findIndex((e) => e.key === entry.key);
   const previous = position > 0 ? list[position - 1] : null;
   const next = position >= 0 && position < list.length - 1 ? list[position + 1] : null;
-  const meta = position >= 0 ? list[position] : null;
 
-  // One request per article id, shared by the main load and the prefetch. It is aborted
+  // One request per archive id, shared by the main load and the prefetch. It is aborted
   // once nothing is watching it any more (the reader moved on), and cached on success.
   const cache = useRef(new Map<string, ArchiveArticle>());
   const inflight = useRef(new Map<string, InFlight>());
@@ -116,43 +195,87 @@ export function Reader({
     [],
   );
 
+  const mayFetch = entry.autoFetch || requestedKey === entry.key;
+
   useEffect(() => {
     if (archiveUrl === null) return;
     if (archiveUrl.trim() === "") {
-      setLoad({ status: "error", message: "The archive is turned off in Settings." });
+      setLoad({
+        status: "error",
+        title: "The archive is turned off.",
+        message: entry.archiveId
+          ? "The archive is turned off in Settings."
+          : "Add your Amber address in Settings to fetch full articles here.",
+      });
       return;
     }
-    const cached = cache.current.get(id);
+    const cached = cache.current.get(entry.archiveId ?? entry.key);
     if (cached) {
       setLoad({ status: "ready", article: cached });
       return;
     }
-    let cancelled = false;
-    setLoad({ status: "loading" });
-    const watcher = watch(id, archiveUrl);
-    void watcher.promise.then((result) => {
-      if (cancelled) return;
-      setLoad("article" in result ? { status: "ready", article: result.article } : { status: "error", message: result.error });
+
+    // Already in Amber: read it.
+    if (entry.archiveId) {
+      let cancelled = false;
+      setLoad({ status: "loading" });
+      const watcher = watch(entry.archiveId, archiveUrl);
+      void watcher.promise.then((result) => {
+        if (cancelled) return;
+        setLoad(
+          "article" in result
+            ? { status: "ready", article: result.article }
+            : { status: "error", title: "This article didn’t load.", message: result.error },
+        );
+      });
+      return () => {
+        cancelled = true;
+        watcher.release();
+      };
+    }
+
+    // From outside the archive: look it up, and save it only when the person has asked.
+    if (!entry.url) {
+      setLoad({ status: "error", title: "This article didn’t load.", message: "There is no address to fetch." });
+      return;
+    }
+    const controller = new AbortController();
+    setLoad(mayFetch ? { status: "fetching", stage: "checking" } : { status: "loading" });
+    void fetchFullArticle(
+      archiveUrl,
+      { url: entry.url, force: run.force, saveIfMissing: mayFetch },
+      { signal: controller.signal, onStatus: (stage) => setLoad({ status: "fetching", stage }) },
+    ).then((result) => {
+      if (controller.signal.aborted) return;
+      if (result.ok) {
+        const article: ArchiveArticle = { ...result.meta, text: result.text };
+        cache.current.set(entry.key, article);
+        setLoad({ status: "ready", article });
+        onSavedRef.current(entry, result.meta, result.created);
+      } else if (result.reason === "not-saved") {
+        setLoad({ status: "idle" });
+      } else if (result.reason !== "aborted") {
+        setLoad({ status: "error", ...fetchProblem(result.reason, result.detail), reason: result.reason });
+      }
     });
-    return () => {
-      cancelled = true;
-      watcher.release();
-    };
-  }, [id, archiveUrl, attempt, watch]);
+    return () => controller.abort();
+    // `entry` is a new object whenever the list rebuilds; its key and address are what identify the work.
+  }, [entry.key, entry.archiveId, entry.url, archiveUrl, run, mayFetch, watch]);
 
   // Each article starts at the top, and the pane takes keyboard focus so space and arrows scroll it.
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
     progressRef.current?.style.setProperty("transform", "scaleX(0)");
     scrollRef.current?.focus({ preventScroll: true });
-  }, [id]);
+  }, [entry.key]);
 
-  // Quietly warm the next article so j feels instant.
+  // Quietly warm the next article so j feels instant. Only what is already saved: nothing is captured unasked.
+  const nextArchiveId = next?.archiveId;
   useEffect(() => {
-    if (!next || !archiveUrl || cache.current.has(next.id) || load.status !== "ready") return;
-    const watcher = watch(next.id, archiveUrl);
+    if (!nextArchiveId || !archiveUrl || cache.current.has(nextArchiveId) || load.status !== "ready") return;
+    const watcher = watch(nextArchiveId, archiveUrl);
     return () => watcher.release();
-  }, [next, archiveUrl, load.status, watch]);
+  }, [nextArchiveId, archiveUrl, load.status, watch]);
 
   useEffect(() => {
     if (!keysActive) return;
@@ -163,10 +286,10 @@ export function Reader({
         onClose();
       } else if ((e.key === "j" || e.key === "ArrowRight") && next) {
         e.preventDefault();
-        onNavigate(next.id);
+        onNavigate(next);
       } else if ((e.key === "k" || e.key === "ArrowLeft") && previous) {
         e.preventDefault();
-        onNavigate(previous.id);
+        onNavigate(previous);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -182,28 +305,34 @@ export function Reader({
   }, []);
 
   const article = load.status === "ready" ? load.article : null;
-  const title = article?.title ?? meta?.title ?? "";
-  const site = article?.site ?? meta?.site ?? "";
-  const author = article?.author ?? meta?.author;
-  const published = formatDate(article?.publishedAt ?? meta?.publishedAt);
-  const saved = formatDate(article?.savedAt ?? meta?.savedAt);
+  const title = article?.title ?? entry.title;
+  const site = article?.site ?? entry.site;
+  const author = article?.author ?? entry.author;
+  const published = formatDate(article?.publishedAt ?? entry.publishedAt);
+  const saved = formatDate(article?.savedAt ?? entry.savedAt);
 
   const readable = useMemo(() => (article ? toReadable(article.text, article.title, article.author) : null), [article]);
-  const words = article ? wordCount(article.text) : (meta?.wordCount ?? 0);
-  const paywalled = article?.paywalled ?? meta?.paywalled ?? false;
+  const words = article ? wordCount(article.text) : (entry.wordCount ?? 0);
+  const paywalled = article?.paywalled ?? entry.paywalled ?? false;
 
-  const originalUrl = article?.originalUrl ?? meta?.originalUrl;
-  const permalink = article?.permalink ?? meta?.permalink;
+  const originalUrl = article?.originalUrl ?? entry.url;
+  const permalink = article?.permalink ?? entry.permalink;
+  // The feed's blurb stands in for the standfirst until the real text is here.
+  const deck = readable ? readable.deck : entry.summary;
+  const waiting = load.status === "fetching" || load.status === "loading";
+  const elapsed = useElapsed(load.status === "fetching");
+
+  const retry = (force = false) => setRun((r) => ({ n: r.n + 1, force }));
 
   return (
     <div className="reader" role="dialog" aria-modal="true" aria-label={title || "Article"}>
       <div className="reader-progress" ref={progressRef} />
       <div className="reader-bar">
-        <button type="button" className="back-btn" onClick={onClose} title="Back to the library (Esc)">
+        <button type="button" className="back-btn" onClick={onClose} title={`Back to ${backLabel} (Esc)`}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M15 5l-7 7 7 7" />
           </svg>
-          Library
+          {backLabel}
         </button>
         <span className="bar-spacer" />
         {position >= 0 && (
@@ -213,12 +342,12 @@ export function Reader({
         )}
         {position >= 0 && (
           <>
-            <button type="button" className="icon-btn" disabled={!previous} onClick={() => previous && onNavigate(previous.id)} title="Previous article (k)" aria-label="Previous article">
+            <button type="button" className="icon-btn" disabled={!previous} onClick={() => previous && onNavigate(previous)} title="Previous article (k)" aria-label="Previous article">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="m6 15 6-6 6 6" />
               </svg>
             </button>
-            <button type="button" className="icon-btn" disabled={!next} onClick={() => next && onNavigate(next.id)} title="Next article (j)" aria-label="Next article">
+            <button type="button" className="icon-btn" disabled={!next} onClick={() => next && onNavigate(next)} title="Next article (j)" aria-label="Next article">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="m6 9 6 6 6-6" />
               </svg>
@@ -242,12 +371,12 @@ export function Reader({
         tabIndex={-1}
         style={{ ["--reader-size" as string]: `${size}px` }}
       >
-        <article className="reader-article" key={id}>
+        <article className="reader-article" key={entry.key}>
           {(title || load.status === "loading") && (
             <header className="reader-head">
-              {site && <p className="reader-site">{site}</p>}
+              {site && site !== title && <p className="reader-site">{site}</p>}
               {title ? <h1 className="reader-title">{title}</h1> : <div className="sk-bar sk-title" />}
-              {readable?.deck && <p className="reader-deck">{readable.deck}</p>}
+              {deck && <p className="reader-deck">{deck}</p>}
               <p className="reader-meta">
                 {author && <span className="by">{author}</span>}
                 {published && <span>{published}</span>}
@@ -271,7 +400,29 @@ export function Reader({
             </header>
           )}
 
-          {load.status === "loading" && (
+          {load.status === "fetching" && (
+            <div className="reader-fetch" role="status" aria-live="polite">
+              <span className="pulse-dot" aria-hidden="true" />
+              <span className="reader-fetch-title">Fetching the full article…</span>
+              <span className="meta reader-fetch-stage">
+                {STAGE_TEXT[load.stage]}
+                {elapsed >= 3 ? ` ${elapsed} s` : ""}
+              </span>
+            </div>
+          )}
+
+          {load.status === "idle" && (
+            <div className="reader-fetch idle">
+              <button type="button" className="solid-btn" onClick={() => setRequestedKey(entry.key)}>
+                Fetch full article
+              </button>
+              <span className="reader-fetch-stage">
+                Saves a readable copy to your Amber archive. Nothing is saved until you ask.
+              </span>
+            </div>
+          )}
+
+          {waiting && (
             <div className="reader-skeleton" aria-hidden="true">
               {Array.from({ length: 9 }, (_, i) => (
                 <div key={i} className="sk-bar" style={{ width: i % 4 === 3 ? "58%" : "100%" }} />
@@ -281,12 +432,18 @@ export function Reader({
 
           {load.status === "error" && (
             <div className="notice reader-notice" role="alert">
-              <p className="notice-title">This article didn&apos;t load.</p>
+              <p className="notice-title">{load.title}</p>
               <p className="notice-body">{load.message}</p>
               <div className="notice-actions">
-                <button type="button" className="ghost-btn" onClick={() => setAttempt((n) => n + 1)}>
-                  Retry
-                </button>
+                {load.reason === "paywall-stub" ? (
+                  <button type="button" className="ghost-btn" onClick={() => retry(true)}>
+                    Try capturing again
+                  </button>
+                ) : (
+                  <button type="button" className="ghost-btn" onClick={() => retry()}>
+                    Try again
+                  </button>
+                )}
                 {originalUrl && (
                   <a className="ghost-btn" href={originalUrl} target="_blank" rel="noopener noreferrer">
                     Open original
@@ -314,7 +471,7 @@ export function Reader({
           {readable && (
             <footer className="reader-foot">
               {next ? (
-                <button type="button" className="next-card" onClick={() => onNavigate(next.id)}>
+                <button type="button" className="next-card" onClick={() => onNavigate(next)}>
                   <span className="meta">Next · {next.site}</span>
                   <span className="next-title">{next.title}</span>
                 </button>

@@ -12,7 +12,7 @@ export { canonicalLink };
  * cookies, so a publisher sees an anonymous reader.
  */
 
-const FEED_TIMEOUT_MS = 8_000;
+const FEED_TIMEOUT_MS = 15_000;
 const SUMMARY_MAX = 300;
 const ACCEPT =
   "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, text/html;q=0.5, */*;q=0.4";

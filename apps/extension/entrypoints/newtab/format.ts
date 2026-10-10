@@ -60,3 +60,45 @@ export function groupByDay(articles: ArchiveArticleMeta[], now = new Date()) {
   }
   return groups;
 }
+
+const clock = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" });
+
+/**
+ * A time as it should read right now: "just now", "12 min ago", "3 h ago", then
+ * the clock time for anything older (the day group says which day). Computed at
+ * display time, never stored.
+ */
+export function relativeTime(iso: string | undefined, now = Date.now()): string {
+  const d = validDate(iso);
+  if (!d) return "";
+  const minutes = Math.floor((now - d.getTime()) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 12 * 60) return `${Math.floor(minutes / 60)} h ago`;
+  return clock.format(d);
+}
+
+/** Like `groupByDay`, for a newest-first list that may be undated at the end; the last hour is its own group. */
+export function groupFeed<T extends { publishedAt?: string }>(items: T[], now = Date.now()) {
+  const groups: Array<{ key: string; label: string; items: T[] }> = [];
+  const today = new Date(now);
+  for (const item of items) {
+    const d = validDate(item.publishedAt);
+    let key: string;
+    let label: string;
+    if (!d) {
+      key = "undated";
+      label = "Date unknown";
+    } else if (now - d.getTime() < 60 * 60_000 && now - d.getTime() > -60_000) {
+      key = "hour";
+      label = "Last hour";
+    } else {
+      key = dayKey(item.publishedAt!);
+      label = dayLabel(item.publishedAt!, today);
+    }
+    const last = groups[groups.length - 1];
+    if (last && last.key === key) last.items.push(item);
+    else groups.push({ key, label, items: [item] });
+  }
+  return groups;
+}

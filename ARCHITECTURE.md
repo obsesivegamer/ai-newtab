@@ -97,6 +97,20 @@ archive (by canonical link) and attaches `archiveId` and `permalink`, and the
 prompt tells the model to use the open-article message for items that have them
 and open-url for the rest.
 
+**Latest and the Reader.** The new-tab page's default view, Latest, is deterministic (no
+model, no API key): the page itself fetches the user's sources' feeds
+(`createFeedBridge`, `lib/feeds.ts`), merges them newest first, and marks stories whose
+link matches an archived article's `originalUrl` as "In Amber". Opening a story in the
+Reader reads it from the archive when it is there; otherwise the Reader shows the
+feed's headline and summary at once and `lib/archive-save.ts` does lookup, then (only
+because the person opened it) `POST /api/save`, poll `/api/jobs/{id}` about every 2 s
+for up to about 90 s, then `/api/snapshots/{id}/text`. A found snapshot that is not
+`usable` is treated as not archived, and failures come back typed (`amber-down`,
+`no-api`, `busy`, `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`). A
+`homepage:open-url` message never triggers a save: the Reader waits for the person to
+press "Fetch full article". Rapid repeats are dropped, and the message is only
+honoured while the Today tab is showing and no Reader is open.
+
 ## Layout
 
 ```
@@ -119,6 +133,7 @@ apps/extension/           MV3 extension (WXT + React)
     build-manager.ts      single-flight build host, broadcast, keepalive, reattach
     browser-bridge.ts     BrowserBridge over chrome.history / chrome.tabs
     archive.ts            ArchiveBridge over fetch to Amber's JSON API; shared by the worker and the new-tab page
+    archive-save.ts       lookup / save / poll / read against Amber's save API: the Reader's "fetch the full article"
     history.ts            getHistory: group and rank chrome.history by domain
     scraper.ts            getPageHtml: load URLs in a background window, sanitize HTML
     protocol.ts           page ↔ worker messages and the five UI build steps

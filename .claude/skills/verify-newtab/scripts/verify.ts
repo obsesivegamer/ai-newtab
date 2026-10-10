@@ -3,11 +3,14 @@
  * (read-only) Amber instance.
  *
  *   npx -y bun .claude/skills/verify-newtab/scripts/verify.ts \
- *     [--out <dir>] [--amber-dir <path>] [--port <n>] [--build] [--chrome-port <n>]
+ *     [--out <dir>] [--amber-dir <path>] [--python <path>] [--data-from <dir>] \
+ *     [--port <n>] [--build] [--chrome-port <n>] [--no-save] [--probe-paywall]
  *
  * What it does:
  *   1. checks the build exists (or builds it with --build) and warns if it is stale,
- *   2. starts Amber from a checkout on --port (default 8090), GET requests only,
+ *   2. COPIES Amber's data dir to a temp dir and starts Amber from --amber-dir on
+ *      --port (default 8090) against the copy, so the Latest -> Reader save flow
+ *      (POST /api/save, a real capture) never writes to the real data,
  *   3. loads the unpacked extension into headless Chrome over CDP's Extensions
  *      domain (Chrome 136+ ignores --load-extension), points archiveUrl at Amber,
  *   4. drives the real UI (mouse clicks, key events) and screenshots dark and light,
@@ -19,6 +22,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
   closeSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -52,7 +56,7 @@ const flag = (name: string) => process.argv.includes(`--${name}`);
 
 if (flag("help") || flag("h")) {
   console.log(
-    "usage: verify.ts [--out <dir>] [--amber-dir <path>] [--port <n>] [--build] [--chrome-port <n>]",
+    "usage: verify.ts [--out <dir>] [--amber-dir <path>] [--python <path>] [--data-from <dir>] [--port <n>] [--build] [--chrome-port <n>] [--no-save] [--probe-paywall]",
   );
   process.exit(0);
 }
@@ -73,9 +77,16 @@ const AMBER = `http://127.0.0.1:${AMBER_PORT}`;
 
 let amberProc: ChildProcess | null = null;
 let chromeProc: ChildProcess | null = null;
+let fixtureServer: { stop(force?: boolean): void } | null = null;
 let profileDir = "";
+let dataCopyDir = "";
 
 function killEverything() {
+  try {
+    fixtureServer?.stop(true);
+  } catch {
+    /* already gone */
+  }
   for (const p of [amberProc, chromeProc]) {
     try {
       if (p?.pid && p.exitCode === null) p.kill("SIGKILL");
@@ -95,6 +106,7 @@ function killEverything() {
     spawnSync("pkill", ["-9", "-f", profileDir], { stdio: "ignore" });
     rmSync(profileDir, { recursive: true, force: true });
   }
+  if (dataCopyDir) rmSync(dataCopyDir, { recursive: true, force: true });
 }
 process.on("exit", killEverything);
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
@@ -204,22 +216,34 @@ if (!existsSync(CHROME)) {
 // ---------------------------------------------------------------------------
 
 const codeDir = resolve(arg("amber-dir") ?? DEFAULT_AMBER);
-const python = join(codeDir, ".venv/bin/python");
-const dataDir = join(codeDir, "data");
+const python = resolve(arg("python") ?? join(codeDir, ".venv/bin/python"));
+const dataSource = resolve(arg("data-from") ?? join(codeDir, "data"));
 
 if (!existsSync(python)) {
-  console.error(`No Amber virtualenv at ${python}. Pass --amber-dir <checkout>.`);
+  console.error(`No Python at ${python}. Pass --amber-dir <checkout> (with a .venv) or --python <interpreter with Amber's deps>.`);
   process.exit(1);
 }
+if (!existsSync(join(codeDir, "app/main.py"))) {
+  console.error(`${codeDir} is not an Amber checkout (no app/main.py). Pass --amber-dir.`);
+  process.exit(1);
+}
+if (!existsSync(dataSource)) {
+  console.error(`No Amber data at ${dataSource}. Pass --data-from <data dir>.`);
+  process.exit(1);
+}
+// Amber is started against a COPY: opening an article may POST /api/save, which writes.
+dataCopyDir = mkdtempSync(join(tmpdir(), "verify-newtab-amber-data-"));
+const dataDir = join(dataCopyDir, "data");
+cpSync(dataSource, dataDir, { recursive: true });
 if ((await answers(`${AMBER}/`)) !== null) {
   console.error(`Something already answers on ${AMBER}. Pick another --port; this script never reuses a server.`);
   process.exit(1);
 }
 
 console.log(`Amber code:  ${codeDir}`);
-console.log(`Amber data:  ${dataDir}`);
+console.log(`Amber data:  ${dataDir}  (a copy of ${dataSource}; deleted on exit)`);
 if (!hasSnaps(dataDir)) console.log("WARNING: that data dir has no snapshots, so the Library will be empty.");
-console.log(`Amber check: ${AMBER}  (GET requests only; log in ${join(OUT, "amber.log")})\n`);
+console.log(`Amber check: ${AMBER}  (log in ${join(OUT, "amber.log")})\n`);
 
 const amberLog = openSync(join(OUT, "amber.log"), "w");
 amberProc = spawn(
@@ -346,6 +370,12 @@ async function main() {
   await page.send("Runtime.enable");
   await page.send("Page.enable");
   await page.send("Log.enable");
+  // A fresh profile defaults archiveUrl to the live Amber on :8080. This script never talks
+  // to it: block it before the first page load, until archiveUrl points at the check instance.
+  await page.send("Network.enable");
+  await page.send("Network.setBlockedURLs", {
+    urls: ["http://127.0.0.1:8080/*", "http://localhost:8080/*", "http://[::1]:8080/*"],
+  });
   await page.send("Emulation.setDeviceMetricsOverride", {
     width: 1280,
     height: 900,
@@ -440,13 +470,287 @@ async function main() {
     await waitFor(`document.querySelector(".shell")`, "app mount");
   }
   const setStorage = (o: object) => page.evaluate(`chrome.storage.local.set(${JSON.stringify(o)})`);
-  const rowCount = () => page.evaluate<number>(`document.querySelectorAll(".row").length`);
+  const rowCount = () => page.evaluate<number>(`document.querySelectorAll(".view-library .row").length`);
   const libraryReady = (ms = 15_000) =>
-    waitFor(`document.querySelector(".row") || document.querySelector(".notice")`, "library rows or notice", ms);
+    waitFor(
+      `document.querySelector(".view-library .row") || document.querySelector(".view-library .notice")`,
+      "library rows or notice",
+      ms,
+    );
+  const snapshotCount = () => {
+    try {
+      return readdirSync(join(dataDir, "snaps")).length;
+    } catch {
+      return 0;
+    }
+  };
+  const text = (selector: string) =>
+    page.evaluate<string>(`document.querySelector(${JSON.stringify(selector)})?.textContent || ""`);
 
   // Fresh profile: first load, then point the archive at the check instance.
   await load();
   await setStorage({ archiveUrl: AMBER });
+
+  // ---- Latest fixtures --------------------------------------------------------
+  // A local feed whose first item is an article Amber already has (so the "In Amber"
+  // marker and the no-save open path are deterministic) and whose second is not.
+  let hasSaveApi = false;
+  {
+    const status = await answers(`${AMBER}/api/lookup?url=${encodeURIComponent("https://example.com/")}`);
+    hasSaveApi = status === 200;
+  }
+  const archivedFixture = await (async () => {
+    try {
+      const r = await fetch(`${AMBER}/api/snapshots?since_days=365&limit=1`);
+      const j = (await r.json()) as any;
+      const snap = j.snapshots?.[0];
+      return snap ? { title: String(snap.title), link: String(snap.final_url ?? snap.url), id: String(snap.id) } : null;
+    } catch {
+      return null;
+    }
+  })();
+  const FIXTURE_NOT_SAVED = "https://example.com/verify-newtab-fixture-not-archived";
+  const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const fixtureXml = () => {
+    const at = new Date().toUTCString();
+    const items = [
+      archivedFixture && { title: archivedFixture.title, link: archivedFixture.link, d: "From the fixture feed: already in the archive." },
+      { title: "Fixture story that is not in the archive yet", link: FIXTURE_NOT_SAVED, d: "From the fixture feed: Amber has never seen this address." },
+    ].filter(Boolean) as Array<{ title: string; link: string; d: string }>;
+    return `<?xml version="1.0"?><rss version="2.0"><channel><title>Verify fixture</title>${items
+      .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${at}</pubDate><description>${esc(i.d)}</description></item>`)
+      .join("")}</channel></rss>`;
+  };
+  fixtureServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response(fixtureXml(), { headers: { "content-type": "application/rss+xml" } }),
+  });
+  const FIXTURE_FEED = `http://127.0.0.1:${fixtureServer.port}/feed.xml`;
+  const LIVE_SAVE_FEEDS = [
+    { id: "guardian", name: "The Guardian", feedUrls: ["https://www.theguardian.com/world/rss"], enabled: true },
+    { id: "ars-technica", name: "Ars Technica", feedUrls: ["https://feeds.arstechnica.com/arstechnica/index"], enabled: true },
+    { id: "bbc", name: "BBC News", feedUrls: ["https://feeds.bbci.co.uk/news/world/rss.xml"], enabled: true },
+  ];
+  const SAVE_SOURCES = LIVE_SAVE_FEEDS.map((s) => s.name);
+  const latestReady = (ms = 40_000) =>
+    waitFor(
+      `document.querySelector(".view-latest .row") || document.querySelector(".view-latest .notice")`,
+      "latest rows or notice",
+      ms,
+    );
+  /** Open Latest's first row matching `where` (a JS predicate over the row element) and return its id. */
+  const rowId = (where: string) =>
+    page.evaluate<string | null>(`(() => {
+      const row = [...document.querySelectorAll(".view-latest .row")].find((r) => (${where})(r));
+      return row ? row.id : null;
+    })()`);
+  let savedRowTitle = "";
+  let savedRowId = "";
+
+  // ---- The Latest flow, one theme at a time ---------------------------------------
+  let latestSavedOnce = false;
+  async function latestFlow(theme: "dark" | "light") {
+    // 08 Latest, as seeded from the archive's sources --------------------------
+    phase = `${theme}:latest`;
+    const before = snapshotCount();
+    await waitFor(`document.querySelector(".view-latest")`, "latest pane");
+    await latestReady();
+    const seeded = await page.evaluate<any>(`(() => ({
+      rows: document.querySelectorAll(".view-latest .row").length,
+      chips: [...document.querySelectorAll(".view-latest .chips .chip")].map((c) => c.textContent.trim()),
+      active: document.querySelector(".tab.active")?.textContent.trim(),
+      updated: document.querySelector(".view-latest .lib-head .meta")?.textContent || "",
+    }))()`);
+    check("Latest is the default tab", seeded.active === "Latest", String(seeded.active));
+    check("Latest has rows from the live feeds", seeded.rows > 0, `${seeded.rows} rows`);
+    check("Latest has source chips with counts", seeded.chips.length > 1 && /\d/.test(seeded.chips[0]), seeded.chips.slice(0, 5).join(" | "));
+    check("Latest says when it was updated", /^Updated /.test(seeded.updated), seeded.updated);
+    check("Loading Latest saved nothing to Amber", snapshotCount() === before, `${before} -> ${snapshotCount()} snapshots`);
+    await shot(`08-latest-${theme}`);
+
+    // Add the fixtures once; every later pass reuses what is in storage.
+    if (theme === "dark" || !latestSavedOnce) {
+      const stored = await page.evaluate<any[]>(`chrome.storage.local.get("sources").then((r) => r.sources || [])`);
+      check("The sources catalog was seeded and stored", stored.length > 0, `${stored.length} sources`);
+      const fixtureSource = { id: "verify-fixture", name: "Verify fixture", feedUrls: [FIXTURE_FEED], enabled: true };
+      const extra = [fixtureSource, ...LIVE_SAVE_FEEDS].filter((x) => !stored.some((s: any) => s.id === x.id));
+      await setStorage({ sources: [...stored, ...extra] });
+      await load();
+      await latestReady();
+    }
+
+    // 09 Marker for an archived item, source chip, search ----------------------
+    phase = `${theme}:latest-chip`;
+    await waitFor(`document.querySelectorAll(".view-latest .chips .chip").length > 3`, "chips after reload");
+    if (archivedFixture) {
+      await waitFor(`document.querySelector(".view-latest .row-amber")`, "In Amber marker", 15_000);
+      const marked = await page.evaluate<string[]>(
+        `[...document.querySelectorAll(".view-latest .row")].filter((r) => r.querySelector(".row-amber")).map((r) => r.querySelector(".row-title").textContent)`,
+      );
+      check(
+        'An archived story is marked "In Amber"',
+        marked.includes(archivedFixture.title),
+        `${marked.length} marked; fixture "${archivedFixture.title.slice(0, 50)}"`,
+      );
+    } else {
+      check('An archived story is marked "In Amber"', false, "Amber has no usable snapshot to build a fixture from", true);
+    }
+    const total = await page.evaluate<number>(`document.querySelectorAll(".view-latest .row").length`);
+    // The fixture source sits at the end of the catalog, behind "N more".
+    if (!(await page.evaluate<boolean>(`!![...document.querySelectorAll(".view-latest .chips .chip")].find((c) => c.textContent.includes("Verify fixture"))`))) {
+      await click(".view-latest .chips .chip.more");
+      await sleep(150);
+    }
+    await click(".view-latest .chips .chip", "Verify fixture");
+    await sleep(200);
+    const filtered = await page.evaluate<string[]>(
+      `[...new Set([...document.querySelectorAll(".view-latest .row .row-site")].map((e) => e.textContent))]`,
+    );
+    check("A Latest source chip filters the stream", filtered.length === 1 && filtered[0] === "Verify fixture", filtered.join(", "));
+    await shot(`09-latest-source-chip-${theme}`);
+    await click(".view-latest .chips .chip", "All");
+    await sleep(150);
+
+    await key("/");
+    await page.send("Input.insertText", { text: "fixture" });
+    await sleep(250);
+    const found = await page.evaluate<number>(`document.querySelectorAll(".view-latest .row").length`);
+    check("Latest search narrows the stream", found > 0 && found < total, `${found} of ${total}`);
+    await key("Escape");
+    await sleep(200);
+    await key("Escape");
+
+    // An archived story opens straight in the Reader, from the archive, without a save.
+    if (archivedFixture) {
+      phase = `${theme}:latest-archived-reader`;
+      const snaps = snapshotCount();
+      const id = await rowId(`(r) => r.querySelector(".row-amber") && r.querySelector(".row-title").textContent === ${JSON.stringify(archivedFixture.title)}`);
+      if (id && (await click(`#${id}`))) {
+        const ok = await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "archived story text");
+        check("An archived Latest story reads straight from Amber", ok);
+        const back = await text(".reader-bar .back-btn");
+        const pos = await text(".reader-bar .bar-pos");
+        check('The Reader names where it came from and walks the Latest list', /Latest/.test(back) && /\d+ of \d+/.test(pos), `${back.trim()} · ${pos.trim()}`);
+        check("Opening an archived story saved nothing new", snapshotCount() === snaps);
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+        const focus = await page.evaluate<boolean>(`!!document.activeElement?.closest?.(".view-latest .row")`);
+        check("Closing the Reader returns focus to its Latest row", focus, undefined, true);
+      } else {
+        check("An archived Latest story reads straight from Amber", false, "row not found");
+      }
+    }
+
+    // 10/11 A live story that is not in Amber: save -> capture -> full text -----
+    if (hasSaveApi && !flag("no-save")) {
+      phase = `${theme}:latest-save`;
+      if (!latestSavedOnce) {
+        const pick = await rowId(
+          `(r) => ${JSON.stringify(SAVE_SOURCES)}.includes(r.querySelector(".row-site")?.textContent) && !r.querySelector(".row-amber")`,
+        );
+        if (!pick) {
+          check("A live Guardian/Ars/BBC story is available to open", false, "no such row in the feeds right now");
+        } else {
+          savedRowId = pick;
+          savedRowTitle = await text(`#${pick} .row-title`);
+          const snaps = snapshotCount();
+          await click(`#${pick}`);
+          const sawFetching = await waitFor(`document.querySelector(".reader-fetch")`, "fetching state", 10_000);
+          check("The Reader shows the feed's summary while fetching", sawFetching && (await text(".reader-title")).length > 0, savedRowTitle.slice(0, 60));
+          await waitFor(`/Capturing|queue|Saving/i.test(document.querySelector(".reader-fetch-stage")?.textContent || "")`, "a progress stage", 15_000);
+          const stage = await text(".reader-fetch");
+          console.log(`  [info] fetching state: ${stage.replace(/\s+/g, " ").trim()}`);
+          await shot(`10-latest-fetching-${theme}`);
+          const done = await waitFor(
+            `document.querySelectorAll(".reader-body p").length > 3 || document.querySelector(".reader-notice")`,
+            "full article or a failure",
+            150_000,
+          );
+          const outcome = await page.evaluate<any>(`({
+            paragraphs: document.querySelectorAll(".reader-body p").length,
+            notice: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+            title: document.querySelector(".reader-title")?.textContent || "",
+          })`);
+          check("The full article arrived from Amber", done && outcome.paragraphs > 3, outcome.notice || `${outcome.paragraphs} paragraphs`);
+          check("Opening a live story saved exactly one snapshot", snapshotCount() === snaps + 1, `${snaps} -> ${snapshotCount()}`);
+          await shot(`11-latest-reader-fetched-${theme}`);
+          latestSavedOnce = true;
+          await key("Escape");
+          await waitFor(`!document.querySelector(".reader")`, "reader to close");
+          const marked = await page.evaluate<boolean>(`!!document.getElementById(${JSON.stringify(pick)})?.querySelector(".row-amber")`);
+          check('The saved story shows "In Amber" without a reload', marked);
+        }
+      } else if (savedRowId) {
+        // Light pass: the same story is in Amber now, so it opens from the archive.
+        const id = await rowId(`(r) => r.querySelector(".row-title").textContent === ${JSON.stringify(savedRowTitle)}`);
+        if (id && (await click(`#${id}`))) {
+          const ok = await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "saved story text", 20_000);
+          check("The story saved earlier now reads from Amber", ok);
+          await shot(`11-latest-reader-fetched-${theme}`);
+          await key("Escape");
+          await waitFor(`!document.querySelector(".reader")`, "reader to close");
+        }
+      }
+    } else if (!hasSaveApi) {
+      check("Amber has the save API (/api/lookup)", false, "update Amber to a build with PR #17; the save flow was skipped", true);
+    }
+
+    // Optional: a paywalled publisher, to see what Amber's capture comes back with -----
+    if (hasSaveApi && flag("probe-paywall") && theme === "dark") {
+      phase = `${theme}:latest-probe`;
+      const id = await rowId(
+        `(r) => ["The New York Times", "Financial Times", "The Wall Street Journal"].includes(r.querySelector(".row-site")?.textContent) && !r.querySelector(".row-amber")`,
+      );
+      if (id && (await click(`#${id}`))) {
+        await waitFor(
+          `document.querySelectorAll(".reader-body p").length > 3 || document.querySelector(".reader-notice")`,
+          "paywalled capture to finish",
+          150_000,
+        );
+        const out = await page.evaluate<any>(`({
+          paragraphs: document.querySelectorAll(".reader-body p").length,
+          note: document.querySelector(".reader-note")?.textContent || "",
+          notice: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+          body: document.querySelector(".reader-notice .notice-body")?.textContent || "",
+        })`);
+        console.log(`  [info] paywalled probe: ${JSON.stringify(out)}`);
+        await shot(`14-latest-probe-paywalled-${theme}`);
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      } else {
+        console.log("  [info] paywalled probe: no un-archived NYT/FT/WSJ row right now");
+      }
+    }
+
+    // 12 Failure path: Amber stopped, open a story it has not got ---------------
+    phase = `${theme}:latest-amber-down`;
+    await setStorage({ archiveUrl: DEAD });
+    await load();
+    await latestReady();
+    const fixtureRow = await rowId(`(r) => /not in the archive yet/.test(r.querySelector(".row-title").textContent)`);
+    if (fixtureRow && (await click(`#${fixtureRow}`))) {
+      const shown = await waitFor(`document.querySelector(".reader-notice")`, "failure notice", 25_000);
+      const notice = await page.evaluate<any>(`({
+        title: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+        actions: [...document.querySelectorAll(".reader-notice .ghost-btn")].map((b) => b.textContent.trim()),
+        summary: !!document.querySelector(".reader-deck"),
+      })`);
+      check(
+        "Amber stopped: a calm message with Try again and Open original",
+        shown && /isn.t running/i.test(notice.title) && notice.actions.includes("Try again") && notice.actions.includes("Open original"),
+        `${notice.title} [${notice.actions.join(", ")}]`,
+      );
+      check("The feed summary stays on screen when the fetch fails", notice.summary);
+      await shot(`12-latest-reader-amber-down-${theme}`);
+      await key("Escape");
+      await waitFor(`!document.querySelector(".reader")`, "reader to close");
+    } else {
+      check("Amber stopped: a calm message with Try again and Open original", false, "fixture row not found");
+    }
+    await setStorage({ archiveUrl: AMBER });
+    await load();
+  }
 
   for (const theme of ["dark", "light"] as const) {
     console.log(`--- ${theme} ---`);
@@ -463,7 +767,12 @@ async function main() {
     }
     check(`theme is ${theme}`, (await page.evaluate<string>(`document.documentElement.dataset.theme`)) === theme);
 
+    // ---- Latest (the default view) -----------------------------------------------
+    await latestFlow(theme);
+
     // 01 Library ------------------------------------------------------------
+    phase = `${theme}:library`;
+    await click(".tab", "Library");
     await libraryReady();
     const total = await rowCount();
     if (noApi) {
@@ -478,13 +787,13 @@ async function main() {
       // 02 Source chip ------------------------------------------------------
       phase = `${theme}:chip`;
       const chip = await page.evaluate<string | null>(`(() => {
-        const c = [...document.querySelectorAll(".chips .chip")].find((b) => !b.classList.contains("more") && !b.classList.contains("empty") && !/^All/.test(b.textContent || ""));
+        const c = [...document.querySelectorAll(".view-library .chips .chip")].find((b) => !b.classList.contains("more") && !b.classList.contains("empty") && !/^All/.test(b.textContent || ""));
         return c ? c.firstChild.textContent.trim() : null;
       })()`);
-      if (chip && (await click(".chips .chip", chip))) {
+      if (chip && (await click(".view-library .chips .chip", chip))) {
         await sleep(200);
         const sites = await page.evaluate<string[]>(
-          `[...new Set([...document.querySelectorAll(".row .row-site")].map((e) => e.textContent))]`,
+          `[...new Set([...document.querySelectorAll(".view-library .row .row-site")].map((e) => e.textContent))]`,
         );
         const n = await rowCount();
         check(
@@ -493,7 +802,7 @@ async function main() {
           `${n} of ${total} rows`,
         );
         await shot(`02-library-source-chip-${theme}`);
-        await click(".chips .chip", "All");
+        await click(".view-library .chips .chip", "All");
         await sleep(150);
       } else {
         check("a source chip exists to click", false, "no chip found");
@@ -502,7 +811,7 @@ async function main() {
       // 03 Search -----------------------------------------------------------
       phase = `${theme}:search`;
       const word = await page.evaluate<string>(`(() => {
-        const titles = [...document.querySelectorAll(".row-title")].map((e) => e.textContent || "");
+        const titles = [...document.querySelectorAll(".view-library .row-title")].map((e) => e.textContent || "");
         const t = titles[Math.min(2, titles.length - 1)] || "";
         const words = t.split(/[^\\p{L}\\p{N}]+/u).filter((w) => w.length >= 5);
         return (words.sort((a, b) => b.length - a.length)[0] || t.split(" ")[0] || "the");
@@ -616,8 +925,9 @@ async function main() {
     phase = `${theme}:amber-down`;
     await setStorage({ archiveUrl: DEAD });
     await load();
+    await click(".tab", "Library");
     const down = await waitFor(
-      `/Amber isn.t running/i.test(document.querySelector(".notice-title")?.textContent || "")`,
+      `/Amber isn.t running/i.test(document.querySelector(".view-library .notice-title")?.textContent || "")`,
       "'Amber isn't running' notice",
     );
     check("Library shows 'Amber isn't running' when the archive is unreachable", down, DEAD);
@@ -628,11 +938,76 @@ async function main() {
     phase = `${theme}:done`;
   }
 
+  // homepage:open-url: a model-built page asks to open an address ----------------
+  // A stored homepage whose one big button posts three messages: a javascript: URL, the
+  // check Amber's own loopback address, and a real address. Only the last may open the
+  // Reader, and nothing may be saved until "Fetch full article" is pressed.
+  if (!flag("no-today-frame")) {
+    phase = "open-url";
+    console.log("--- homepage:open-url ---");
+    const code = `import React from "react";
+export default function App() {
+  const send = (url) => window.parent.postMessage({ type: "homepage:open-url", url }, "*");
+  return <button style={{ position: "fixed", inset: 0, width: "100%", fontSize: 28 }} onClick={() => {
+    send("javascript:alert(1)");
+    send(${JSON.stringify(AMBER + "/")});
+    send(${JSON.stringify(FIXTURE_NOT_SAVED)});
+  }}>open</button>;
+}`;
+    await setStorage({
+      archiveUrl: AMBER,
+      apiKey: "sk-ant-verify-newtab-not-a-real-key",
+      autoRebuild: false,
+      homepageData: { code, timestamp: new Date().toISOString() },
+    });
+    await load();
+    await click(".tab", "Today");
+    const frameUp = await waitFor(`document.querySelector(".today-frame iframe")`, "Today iframe", 20_000);
+    check("Today renders the stored homepage in a frame", frameUp);
+    if (frameUp) {
+      await sleep(8000); // the preview bundler needs a moment before the button exists
+      const snaps = snapshotCount();
+      const box = await page.evaluate<{ x: number; y: number } | null>(`(() => {
+        const r = document.querySelector(".today-frame iframe")?.getBoundingClientRect();
+        return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+      })()`);
+      if (box) {
+        for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+          await page.send("Input.dispatchMouseEvent", {
+            type,
+            x: box.x,
+            y: box.y,
+            button: type === "mouseMoved" ? "none" : "left",
+            clickCount: type === "mouseMoved" ? 0 : 1,
+          });
+        }
+      }
+      const opened = await waitFor(`document.querySelector(".reader .reader-title")`, "the Reader from homepage:open-url", 15_000);
+      check("homepage:open-url opens the Reader on the address", opened);
+      if (opened) {
+        const state = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-title")?.textContent || "",
+          button: !!document.querySelector(".reader-fetch.idle .solid-btn"),
+          fetching: !!document.querySelector(".reader-fetch:not(.idle)"),
+          back: document.querySelector(".reader-bar .back-btn")?.textContent.trim(),
+          href: location.href,
+        })`);
+        check("The host stands in for the title, and nothing was fetched on its own", state.title === "example.com" && !state.fetching, `title "${state.title}"`);
+        check('The Reader waits for "Fetch full article"', state.button);
+        check("A javascript: or loopback address never opened anything", state.title === "example.com", state.title);
+        check("The new tab was not navigated away", state.href.startsWith("chrome-extension://"), state.href);
+        check("Nothing was saved to Amber by the message", snapshotCount() === snaps, `${snaps} -> ${snapshotCount()}`);
+        await shot("13-today-open-url-reader");
+      }
+    }
+    await page.evaluate(`chrome.storage.local.remove(["apiKey", "homepageData", "autoRebuild"])`);
+  }
+
   // Console errors ---------------------------------------------------------------
   console.log("--- console ---");
   const noise = /Failed to load resource|ERR_CONNECTION|Failed to fetch|NetworkError|net::/i;
   const expected = (e: { phase: string; text: string }) =>
-    noise.test(e.text) && (e.phase.endsWith("amber-down") || noApi);
+    noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi);
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(
     "No console errors from the extension page",
