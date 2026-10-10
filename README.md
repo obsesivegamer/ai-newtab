@@ -14,12 +14,44 @@ A morning newspaper is just one look. You can describe any look and the next bui
 follows it: a quiet one-column digest, a dense dashboard, a green-on-black
 terminal, a zine.
 
+## This fork: your article archive, then your browsing
+
+This branch (`personal-archive-homepage`) builds the homepage from the news you
+have already saved, plus what you are browsing right now. The saved articles come
+from [Amber](https://github.com/obsesivegamer/amber-archive), a local archiver that keeps a
+readable, paywall-free copy of each article on your Mac.
+
+- **The archive leads.** The agent lists your recent archived articles, picks the
+  stories worth reading, groups them across publications, and links each one to
+  its Amber permalink. Live browsing history is a supplement, not the base.
+- **A Library and a reader that need no model.** The new tab can list the archive
+  directly and show the full article text from Amber in a reader pane, with no
+  API key and no credits.
+- **Amber has to be running.** The extension talks to Amber's local JSON API at
+  `http://127.0.0.1:8080` (change it in **Settings → Article archive (Amber)**;
+  leave it empty to turn the archive off). If Amber is stopped, the Library says
+  so and builds fall back to browsing history only.
+- **Permalinks only work while Amber runs on this Mac.**
+
+Start or restart Amber from its own folder:
+
+```bash
+cd ~/Documents/amber-archive
+./run.sh            # first run installs dependencies; Ctrl-C stops it
+```
+
+Amber needs the version that has the JSON API (`GET /api/snapshots`). After
+updating Amber, stop the running server with Ctrl-C and start it again with
+`./run.sh`. In Settings, **Test connection** tells you how many readable
+articles it can see.
+
 > **Privacy, up front.** To build your homepage, the extension sends a summary of
 > your browsing history (top domains, visit counts, a few page titles) and the
 > cleaned-up HTML of up to 8 pages to the Anthropic API, using your own API key.
 > Those pages are loaded in your signed-in browser, so they can include private
-> content. The agent session and every uploaded page are deleted when each build
-> ends. Your API key stays in the extension's local storage. More detail in
+> content. With the archive on, the full text of up to 12 archived articles per
+> build goes to the same API too. The agent session and every uploaded page and
+> article are deleted when each build ends. Your API key stays in the extension's local storage. More detail in
 > [ARCHITECTURE.md](./ARCHITECTURE.md#privacy).
 
 ---
@@ -51,8 +83,8 @@ If Chrome asks whether to keep the changed new-tab page, choose **Keep it**.
 1. Open a new tab and paste your Anthropic API key.
 2. Click **Build today's homepage**.
 3. Watch it work. The progress view walks through each step: preparing the
-   agent, reading your history, opening pages in your browser, analyzing them,
-   and writing your homepage.
+   agent, reading your archive and history, opening articles and pages,
+   analyzing them, and writing your homepage.
 
 The first build takes a few minutes. You can close the tab while it runs, since
 the build lives in the extension's background worker and appears in any new tab
@@ -82,6 +114,12 @@ history summaries and URLs requested through `getPageHtml`. A page that redirect
 onto a blocked host is dropped before its content is uploaded. Local-network
 addresses (localhost, private IPs, `.local` and `.internal` hosts) are always blocked.
 
+**Article archive (Amber).** The address of your Amber server, default
+`http://127.0.0.1:8080`. **Test connection** reads Amber's article list and tells
+you how many readable articles it found, or that Amber isn't running. Leave the
+box empty to build from browsing history only. The blocked-sites list above also
+applies to archived articles, matched on the publisher's address.
+
 **Model.** Choose which Claude model writes your page:
 
 - **Claude Sonnet 5.5** (default): the best balance of quality and cost.
@@ -102,8 +140,9 @@ failed build until the next interval, so it never loops.
 - **Cost.** Each build is a single agent session billed to your API key. What it
   costs depends on the model and on how much it reads. Haiku is the cheapest
   choice, and you can turn off automatic rebuilds to build only when you ask.
-- **What it can see.** It ranks the sites in your history and opens up to 8 of
-  them per build. It skips search engines, webmail, banking and logged-out
+- **What it can see.** It reads your recent archived articles (up to 12 in full),
+  ranks the sites in your history and opens up to 4 live pages per build when the
+  archive is on, or up to 8 when it is off. It skips search engines, webmail, banking and logged-out
   marketing pages. Anything it can't open is reported, not hidden.
 - **Links are real.** Every link on the page comes from a page the agent actually
   read. It's told never to invent a URL.
@@ -114,17 +153,21 @@ failed build until the next interval, so it never loops.
 
 ## How it works
 
-1. **`getHistory`**: the agent gets a ranked summary of your most-visited domains.
-2. **`getPageHtml`**: it picks up to 8 pages, which the extension opens in a
-   background window, cleans up, and mounts into the agent's sandbox as files.
-3. **`grep` / `read`**: the agent pulls headlines, posts and links out of those
+1. **`getArchive`**: the agent gets the list of your recent Amber articles
+   (titles, publication, date, word count, permalink) and per-publication counts.
+2. **`getArchiveArticles`**: it picks up to 12, and the extension fetches their
+   full text from Amber and mounts each into the agent's sandbox as a text file.
+3. **`getHistory`**: a ranked summary of your most-visited domains.
+4. **`getPageHtml`**: up to 4 live pages (8 without the archive), which the
+   extension opens in a background window, cleans up, and mounts as files.
+5. **`grep` / `read`**: the agent pulls headlines, quotes and links out of those
    files inside its sandbox.
-4. **`write`**: it writes one React component, which the new tab renders.
+6. **`write`**: it writes one React component, which the new tab renders.
 
 The extension's background worker drives a
 [Claude Managed Agents](https://docs.claude.com) session directly, with no server
-in between. The two custom tools run in the extension because they need
-`chrome.history` and `chrome.tabs`. Everything else happens in the agent's
+in between. The custom tools run in the extension because they need
+`chrome.history`, `chrome.tabs` and the local Amber server. Everything else happens in the agent's
 sandbox, where shell access is off: scraped pages are untrusted input.
 
 See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the event flow, the layout, and
@@ -145,7 +188,8 @@ pnpm test                # unit tests (no API calls; needs Bun)
 pnpm extension:test      # loads the built extension into headless Chrome (no API calls)
 
 cp .env.example .env     # add ANTHROPIC_API_KEY, then:
-pnpm agent:run           # a full build against the real API, with fixture history
+pnpm agent:run           # a full build against the real API, with fixture history and your Amber archive
+                         # (AMBER_URL overrides the address; AMBER_URL= runs without the archive)
 pnpm agent:verify        # check the output actually renders
 ```
 

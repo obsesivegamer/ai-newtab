@@ -1,7 +1,60 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage/agent-core";
+import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
+import { loadSettings, saveSetting } from "@/lib/storage";
 import { btn } from "./ui";
+
+type ArchiveCheck =
+  | { state: "idle" }
+  | { state: "testing" }
+  | { state: "ok"; message: string }
+  | { state: "error"; message: string };
+
+const AMBER_DOWN = "Amber isn't running — start it with ./run.sh";
+
+/** One cheap read of the archive's list endpoint, turned into a sentence a person can act on. */
+async function testArchive(rawUrl: string): Promise<ArchiveCheck> {
+  const base = rawUrl.trim().replace(/\/+$/, "");
+  if (!base) return { state: "ok", message: "The archive is off. Builds will use your browsing history only." };
+  if (!/^https?:\/\/[^/\s]+/i.test(base)) {
+    return { state: "error", message: "That doesn't look like a web address. Try http://127.0.0.1:8080" };
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${base}/api/snapshots?since_days=365&limit=1`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    return { state: "error", message: AMBER_DOWN };
+  }
+  if (response.status === 404) {
+    return {
+      state: "error",
+      message: "Something answered, but it has no article API. Check the address, or update Amber.",
+    };
+  }
+  if (!response.ok) {
+    return { state: "error", message: `Amber answered with an error (${response.status}). Try again in a moment.` };
+  }
+  try {
+    const body = (await response.json()) as { total_usable?: unknown };
+    if (typeof body.total_usable !== "number") throw new Error("unexpected shape");
+    const n = body.total_usable;
+    return {
+      state: "ok",
+      message:
+        n === 0
+          ? "Connected, but no readable articles were saved in the last year."
+          : `Connected. ${n} readable article${n === 1 ? "" : "s"} saved in the last year.`,
+    };
+  } catch {
+    return {
+      state: "error",
+      message: "Something answered, but it isn't Amber's article API. Check the address.",
+    };
+  }
+}
 
 export function SettingsModal({
   initialPrompt,
@@ -28,6 +81,32 @@ export function SettingsModal({
 }) {
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
+  const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
+  const [archiveLoaded, setArchiveLoaded] = useState(false);
+  const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
+
+  // Loaded here rather than threaded through App, which keeps this section self-contained.
+  useEffect(() => {
+    let cancelled = false;
+    void loadSettings().then((s) => {
+      if (cancelled) return;
+      setArchiveUrl(s.archiveUrl);
+      setArchiveLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const persistArchiveUrl = async () => {
+    if (archiveLoaded) await saveSetting("archiveUrl", archiveUrl.trim());
+  };
+
+  const runArchiveTest = async () => {
+    setArchiveCheck({ state: "testing" });
+    await persistArchiveUrl();
+    setArchiveCheck(await testArchive(archiveUrl));
+  };
 
   return (
     <div
@@ -134,6 +213,45 @@ export function SettingsModal({
           When on, the extension rebuilds in the background once your homepage is this old, so
           your next tab shows a fresh one (uses your API key).
         </p>
+        <h3 style={{ margin: "24px 0 0", color: "#333", fontSize: 15 }}>Article archive (Amber)</h3>
+        <label style={{ display: "block", marginTop: 8, color: "#333", fontSize: 14 }}>
+          Archive address
+          <input
+            type="url"
+            value={archiveUrl}
+            disabled={!archiveLoaded}
+            onChange={(e) => {
+              setArchiveUrl(e.target.value);
+              setArchiveCheck({ state: "idle" });
+            }}
+            onBlur={() => void persistArchiveUrl()}
+            placeholder={DEFAULT_ARCHIVE_URL}
+            aria-describedby="archive-help"
+            spellCheck={false}
+            style={{ width: "100%", boxSizing: "border-box", marginTop: 8, padding: "8px 12px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd", fontFamily: "inherit" }}
+          />
+        </label>
+        <p id="archive-help" style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
+          Where your saved articles live. Leave empty to build from browsing history only.
+        </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10 }}>
+          <button
+            onClick={() => void runArchiveTest()}
+            disabled={!archiveLoaded || archiveCheck.state === "testing"}
+            style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd" }}
+          >
+            {archiveCheck.state === "testing" ? "Testing…" : "Test connection"}
+          </button>
+          <span
+            role="status"
+            style={{
+              fontSize: 13,
+              color: archiveCheck.state === "ok" ? "#2e7d32" : archiveCheck.state === "error" ? "#a02620" : "#888",
+            }}
+          >
+            {archiveCheck.state === "ok" || archiveCheck.state === "error" ? archiveCheck.message : ""}
+          </span>
+        </div>
         <div style={{ display: "flex", gap: 12, marginTop: 20, justifyContent: "flex-end" }}>
           <button
             onClick={onClose}
@@ -141,7 +259,14 @@ export function SettingsModal({
           >
             Cancel
           </button>
-          <button onClick={() => onSave(draft, normalizeBlockList(blockedDraft.split("\n")))} style={btn}>
+          <button
+            onClick={() => {
+              const blocked = normalizeBlockList(blockedDraft.split("\n"));
+              // The archive URL is written before the rebuild starts, so the build reads the new one.
+              void persistArchiveUrl().then(() => onSave(draft, blocked));
+            }}
+            style={btn}
+          >
             Save &amp; rebuild
           </button>
         </div>

@@ -6,13 +6,14 @@ There is no server. Three parties are involved, and you run one of them.
 |---|---|---|
 | **Extension** (service worker) | Your browser | Hosts the build: holds the SSE stream, executes `getHistory` / `getPageHtml`, uploads page HTML, persists the homepage |
 | **Extension** (new-tab page(s)) | Your browser | Thin view: subscribes to the worker over a port, renders live progress and the finished homepage |
+| **Amber** (optional) | Your Mac, `127.0.0.1:8080` | Your saved-article archive. Read-only JSON API: article list and full text |
 | **Orchestration layer** | Anthropic | Runs the agent loop, persists the session event log, emits `agent.custom_tool_use` |
 | **Session sandbox** | Anthropic | Runs `read` / `grep` / `glob` / `write` over the mounted pages |
 
 The agent loop runs **in the service worker** (`apps/extension/lib/build-manager.ts`), so a build
 survives closing the tab, shows up in every open tab, and can run headless on a
-`chrome.alarms` schedule. The two custom tools execute in the extension too, because they
-need `chrome.history` and `chrome.tabs`. Anthropic never executes them — it emits an event
+`chrome.alarms` schedule. The custom tools execute in the extension too, because they
+need `chrome.history`, `chrome.tabs` and the local Amber server. Anthropic never executes them — it emits an event
 and waits for a `user.custom_tool_result` on the same authenticated stream. There is no
 inbound connection and no public endpoint.
 
@@ -22,6 +23,13 @@ service worker        Anthropic loop        sandbox
     ├─ sessions.create ────▶│                  │
     ├─ events.stream ──────▶│  (open first)    │
     ├─ user.message ───────▶│                  │
+    │◀─ custom_tool_use ────┤  getArchive      │
+    ├─ GET /api/snapshots (Amber, 127.0.0.1)   │
+    ├─ custom_tool_result ─▶│                  │
+    │◀─ custom_tool_use ────┤  getArchiveArticles
+    ├─ GET /api/snapshots/<id>/text (Amber)    │
+    ├─ files.upload + resources.add ───────────▶  mounts /mnt/session/uploads/archive/<id>.txt
+    ├─ custom_tool_result ─▶│                  │
     │◀─ custom_tool_use ────┤  getHistory      │
     ├─ chrome.history ──────┤                  │
     ├─ custom_tool_result ─▶│                  │
@@ -68,9 +76,9 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   orchestrator.ts         runHomepageBuild: session lifecycle, event loop, tool dispatch, cleanup
   setup.ts                ensureAgent / ensureEnvironment (created once, cached by ID)
   prompt.ts               system prompt + per-build kickoff message
-  schemas.ts              custom tool input schemas and defaults
+  schemas.ts              custom tool input schemas (getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
-  types.ts                BrowserBridge, KVStore, RunPhase, …
+  types.ts                BrowserBridge, ArchiveBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
   entrypoints/
@@ -80,22 +88,54 @@ apps/extension/           MV3 extension (WXT + React)
   lib/
     build-manager.ts      single-flight build host, broadcast, keepalive, reattach
     browser-bridge.ts     BrowserBridge over chrome.history / chrome.tabs
+    archive.ts            ArchiveBridge over fetch to Amber's JSON API; shared by the worker and the new-tab page
     history.ts            getHistory: group and rank chrome.history by domain
     scraper.ts            getPageHtml: load URLs in a background window, sanitize HTML
     protocol.ts           page ↔ worker messages and the five UI build steps
     auto-rebuild.ts       when to rebuild on a schedule
-    storage.ts            every chrome.storage key, settings, saved homepage
+    storage.ts            every chrome.storage key, settings (incl. archiveUrl), saved homepage
     transpile.ts          TSX → JS for the preview
 
-harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge, test the extension
+harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (and an
+                          Amber ArchiveBridge reading AMBER_URL), test the extension
 ```
+
+## The article archive (Amber)
+
+Amber is a separate local app that saves readable copies of articles. This fork's
+agent leads with it. The host supplies an `ArchiveBridge` (`types.ts`), passed to
+`runHomepageBuild` as `archive`; the extension builds it in `lib/archive.ts` from
+the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it), and
+the harness builds an equivalent one from `AMBER_URL`. Without a bridge the
+archive tools answer with an error result and the build runs on history alone.
+
+| Tool | Does |
+|---|---|
+| `getArchive` | Lists usable archived articles in a window (`sinceDays` 1-90, `limit` 1-60): metadata, permalink, per-publication counts. No bodies. |
+| `getArchiveArticles` | Fetches up to 12 full texts by id, uploads each as a text file (metadata header, blank line, body), mounts them under `/mnt/session/uploads/archive/`, and returns the *resolved* `mount_path`. |
+
+The bridge reads two endpoints and nothing else, both GET: `/api/snapshots?since_days=&limit=`
+and `/api/snapshots/<id>/text`. Amber decides what is "usable" (complete, long enough,
+real title), so failed paywall captures never reach the model.
+
+**Loopback rule.** The archive bridge is the *only* loopback access in the system.
+`getPageHtml` still blocks `127.0.0.1`, `localhost` and every private or local-network
+host through `isAllowedUrl`, so the agent can't be steered into fetching arbitrary
+local services. Archive permalinks (`http://127.0.0.1:8080/<id>`) are never passed
+through `isAllowedUrl`; instead the blocked-sites list is applied to each article's
+`originalUrl` (the publisher's address), both when listing and again before upload.
+
+The same bridge also feeds the deterministic Library and reader in the new-tab page,
+which call it directly and involve no model. The worker's build phases reuse the
+existing ones: `getArchive` reports `history`, `getArchiveArticles` reports
+`scraping` (see `BUILD_STEPS` in `lib/protocol.ts`).
 
 ## Verification
 
 | Command | Proves |
 |---|---|
 | `pnpm test` | The history digest is capped, ranked, drops `urls[]`, reports `totalSitesSeen` |
-| `pnpm agent:run` | Full build against the real API: tools, mounting, sandbox grep/read, deliverable, cleanup |
+| `pnpm agent:run` | Full build against the real API: tools, mounting, sandbox grep/read, deliverable, cleanup. Uses Amber at `AMBER_URL` when it is reachable |
 | `pnpm agent:verify` | The deliverable transforms, evaluates and server-renders |
 | `pnpm agent:resume-test` | A build killed with a tool call pending can be reattached and finished |
 | `pnpm agent:retention <sessionId>` | The session and every uploaded page body are actually deleted |
@@ -141,6 +181,9 @@ arrived in the history fetch.
 The editable blocked-sites list is enforced in agent-core's tool handlers, not
 just the prompt: blocked domains are excluded from history digests and their
 counts, and blocked or non-HTTP(S) page requests never reach the browser bridge.
+Archived articles are filtered the same way on their publisher URL, and their
+full text, which is sent to the API in the same way as scraped pages, is deleted
+with the rest of the session's uploads.
 Each scraped page's final URL is checked again before upload, so a redirect onto
 a blocked host is dropped: the browser still loads it, but nothing it read is
 sent. Loopback, private-IP and local-network hosts are always blocked, whatever
