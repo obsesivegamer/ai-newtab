@@ -1,4 +1,7 @@
-import type { FeedBridge, FeedItem, FeedSource, FeedSourceStatus } from "@homepage/agent-core";
+import { canonicalLink, type FeedBridge, type FeedItem, type FeedSource, type FeedSourceStatus } from "@homepage/agent-core";
+
+/** The one definition lives in agent-core, where the `getFeeds` handler uses it to match archived stories. */
+export { canonicalLink };
 
 /**
  * RSS / Atom / RDF feeds for the user's sources.
@@ -133,19 +136,6 @@ function cleanLink(raw: string | undefined): string | undefined {
   }
   url.hash = "";
   return url.toString();
-}
-
-/** A key two spellings of the same article share: no scheme, `www.`, fragment, trailing slash, or query order. */
-export function canonicalLink(link: string): string {
-  try {
-    const u = new URL(link);
-    const params = [...u.searchParams.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    const query = params.length ? `?${params.map(([k, v]) => `${k}=${v}`).join("&")}` : "";
-    const path = u.pathname.replace(/\/+$/, "");
-    return `${u.hostname.toLowerCase().replace(/^www\./, "")}${path}${query}`;
-  } catch {
-    return link;
-  }
 }
 
 /** 12 hex characters of two interleaved FNV-1a-style hashes; stable, not cryptographic. */

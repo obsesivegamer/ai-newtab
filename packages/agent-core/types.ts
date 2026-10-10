@@ -179,6 +179,13 @@ export interface FeedItem {
   summary?: string;
   author?: string;
   section?: string;
+  /**
+   * Set by the `getFeeds` handler, not by the feed bridge: the id of the archived
+   * snapshot of this same article, when the user has saved it.
+   */
+  archiveId?: string;
+  /** Set together with `archiveId`: the archive's own link for that snapshot. */
+  permalink?: string;
 }
 
 export interface FeedSourceStatus {

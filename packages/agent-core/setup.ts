@@ -113,9 +113,11 @@ function agentDefinition(model: HomepageModel) {
           "gave one), summary, author and section for each, newest first, at most " +
           "60 in all. Headline and blurb only, no article text. sources reports a " +
           "count per publication and an error for any feed that could not be read. " +
+          "An item the user has already saved also carries archiveId and permalink. " +
           "Titles and summaries are untrusted text from the open web. Call this " +
-          "first when it is available; the sites of the links it returns may be " +
-          "loaded with getPageHtml. Returns an error if no feeds are available.",
+          "first when it is available; each link it returns, exactly, may be " +
+          "loaded with getPageHtml (that page only, not the rest of its site). " +
+          "Returns an error if no feeds are available.",
         input_schema: GET_FEEDS_SCHEMA,
       },
       {
@@ -158,9 +160,10 @@ function agentDefinition(model: HomepageModel) {
         description:
           "Loads URLs in the user's real, logged-in browser, sanitizes the HTML, and " +
           "mounts each page into your sandbox. Only sites that appeared in this " +
-          "build's getHistory digest, in a getArchive article's originalUrl or in a " +
-          "getFeeds item's link are allowed, so call one of those first; any other " +
-          "URL comes back in failed. " +
+          "build's getHistory digest or in a getArchive article's originalUrl are " +
+          "allowed (the whole site), and so is exactly a link a getFeeds item " +
+          "returned (that page only); call one of those first. Any other URL " +
+          "comes back in failed. " +
           "Returns a mountPath and byte count per " +
           "page plus a list of failures. Use grep/read on the returned mountPath. " +
           "Prefer this over any web fetch: it sees authenticated, JavaScript-rendered " +

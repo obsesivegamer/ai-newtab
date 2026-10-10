@@ -115,6 +115,8 @@ export const DEFAULTS = {
   feedsPerSource: 8,
   /** Most feed items in one getFeeds result, newest first, across all publications. */
   feedsMaxItems: 60,
+  /** How far back the archive is searched for stories a feed item is a copy of. */
+  feedArchiveSinceDays: 365,
   archiveSinceDays: 30,
   archiveLimit: 40,
   /** Most article bodies mounted per getArchiveArticles call. */

@@ -92,9 +92,10 @@ parses as an `http:` or `https:` URL. It then opens the Reader on that URL: the
 Reader shows the feed's title and summary at once, and fetches the full text by
 saving the URL to Amber (on that click only) and reading the snapshot. Anything
 that fails the checks is ignored. Stories the user already saved keep using
-`homepage:open-article`; the prompt tells the model to match a feed item to an
-archived story when its `link` equals the story's `originalUrl` after dropping
-the `?query` and `#fragment`.
+`homepage:open-article`: the `getFeeds` handler itself matches each item to the
+archive (by canonical link) and attaches `archiveId` and `permalink`, and the
+prompt tells the model to use the open-article message for items that have them
+and open-url for the rest.
 
 ## Layout
 
@@ -106,6 +107,7 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   schemas.ts              custom tool input schemas (getFeeds, getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
+  link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the extension's feed parser
   types.ts                BrowserBridge, ArchiveBridge, FeedBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
@@ -139,27 +141,49 @@ and archive exist, so the model usually does not even try.
 
 | Tool | Does |
 |---|---|
-| `getFeeds` | Input `sinceHours` (1-72, default 24) and `perSource` (1-15, default 8). Returns `{ fetchedAt, sources: [{ name, count, error? }], items: [{ id, title, link, source, publishedAt?, summary?, author?, section? }] }`, newest first, at most 60 items, at most `perSource` per publication. Headline and blurb only, never article text. |
+| `getFeeds` | Input `sinceHours` (1-72, default 24) and `perSource` (1-15, default 8). Returns `{ fetchedAt, sources: [{ name, count, error? }], items: [{ id, title, link, source, publishedAt?, summary?, author?, section?, archiveId?, permalink? }] }`, newest first, at most 60 items, at most `perSource` per publication. Headline and blurb only, never article text. `archiveId` and `permalink` are set only when the user has saved that article. |
 
 What the handler does on top of the bridge:
 
 - **Blocklist on the link.** Each item's `link` goes through `isAllowedUrl`, so a
   blocked host, a private or local-network host and any non-HTTP(S) link are
-  dropped. `sources[].count` is reduced by what was dropped from that publication;
-  a publication left with nothing, and no feed error, is not mentioned at all. The
-  model is never told blocked material existed (same rule as history and archive).
+  dropped. The model is never told blocked material existed (same rule as history
+  and archive): `sources[].count` is recomputed from the items actually returned,
+  after every cap; a publication with no items and no feed error is not listed,
+  nor is one whose items were all blocked or whose name is itself a blocked host,
+  and same-named sources are merged.
+- **Normalized links.** `link` is the parsed `href` of the URL with `'`, `"`,
+  backticks and whitespace percent-encoded (`safeLink` in `link.ts`), and links over
+  2000 characters are dropped. The archive's `originalUrl` and `permalink` get the
+  same treatment, in `getArchive` and `getArchiveArticles`.
 - **Untrusted text.** Titles, summaries, authors, sections, ids and links come from
-  the open web. Titles and summaries are collapsed to one line and summaries are cut
-  at 400 characters; the prompt tells the model to treat all of it as data and to use
-  a `link` only verbatim as an `href` or message `url`. `publishedAt` is kept only
-  when it starts with an ISO date.
-- **Allow-list for `getPageHtml`.** The surviving items' link hosts are added to
-  the run's `seenHosts`, so the model may load an item's page in the user's browser
-  (it still counts against the live-page cap, and is checked again after redirects).
-  A host the model only read inside a title or summary is not on the list.
+  the open web. Every text field is collapsed to one line and capped (title 300,
+  summary 400, author 120, section 80, source 80); `id` must look like a hex hash or
+  is regenerated from the link; `publishedAt` is kept only when it starts with an ISO
+  date and is not more than 5 minutes in the future. Fields are rebuilt one by one,
+  so nothing extra from the bridge reaches the model. The prompt tells the model to
+  treat all of it as data.
+- **Archive matching in code.** When an archive bridge exists, the first `getFeeds`
+  of a build lists the last 365 days of the archive (up to 200 articles) once and
+  caches it. An item whose `canonicalLink(link)` equals an archived article's
+  canonical `originalUrl` gets `archiveId` and `permalink`. `canonicalLink` (`link.ts`,
+  re-exported by the extension's `lib/feeds.ts`) drops the scheme, `www.`, the
+  fragment, a trailing slash and tracking parameters, and sorts the rest of the
+  query. If the archive can't be read, items just have no `archiveId`; `getFeeds`
+  still succeeds.
+- **Allow-list for `getPageHtml`.** Feed links are *not* added to the host
+  allow-list. The run keeps `seenFeedLinks`, a set of exact normalized links
+  (`href` with the fragment cleared); `getPageHtml` accepts a URL if it is exactly
+  one of those links or its host passes the existing history-digest /
+  archive-`originalUrl` check. A feed that names a page on some site therefore
+  opens that page only, not the whole site in the user's logged-in browser. It still
+  counts against the live-page cap, and is checked again after redirects.
+- **Recorded after delivery.** Hosts and feed links are remembered only once the
+  result was sent successfully, so a result the model never received grants nothing.
 - **Reattach.** `restoreFromHistory` reads the `link` of every `items[]` entry back
-  out of each answered, non-error `getFeeds` result, so the allow-list survives a
-  kill like the archive's and history's do.
+  out of each answered, non-error `getFeeds` result into `seenFeedLinks`, so the
+  allow-list survives a kill like the archive's and history's do. The log line
+  `restored: N hosts, M archive refs, K feed items` reports what came back.
 - **Errors.** Like every tool, `getFeeds` always sends one result: a missing bridge or
   a bridge that throws becomes an `is_error` result starting "The live feeds are
   unavailable". One feed failing is not an error: it shows up in `sources[].error`.
@@ -192,7 +216,7 @@ through `isAllowedUrl`; instead the blocked-sites list is applied to each articl
 `originalUrl` (the publisher's address), both when listing and again before upload.
 
 **Reattach.** The worker's per-build memory (which archive articles are already
-mounted, which hosts the model was shown) is not persisted. On a reattach the
+mounted, which hosts and feed links the model was shown) is not persisted. On a reattach the
 orchestrator rebuilds it from the session event log: each answered
 `user.custom_tool_result` is joined to the `agent.custom_tool_use` with the same
 id, and the `getArchiveArticles` refs, `getHistory` domains and `getArchive`
