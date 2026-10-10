@@ -41,7 +41,6 @@ const REPO = resolve(import.meta.dir, "../../../..");
 const EXT = join(REPO, "apps/extension/.output/chrome-mv3");
 const DOCS = join(homedir(), "Documents");
 const DEFAULT_AMBER = join(DOCS, "amber-archive");
-const API_WORKTREE = join(DOCS, "amber-archive-json-api");
 const CHROME =
   process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
@@ -94,6 +93,7 @@ function killEverything() {
   if (profileDir) {
     // Anything still carrying our unique temp profile path in its command line is ours.
     spawnSync("pkill", ["-9", "-f", profileDir], { stdio: "ignore" });
+    rmSync(profileDir, { recursive: true, force: true });
   }
 }
 process.on("exit", killEverything);
@@ -153,16 +153,6 @@ function newestMtime(dir: string, skip = new Set(["node_modules", ".output", ".w
   return newest;
 }
 
-function hasApi(dir: string): boolean {
-  try {
-    return readdirSync(join(dir, "app")).some(
-      (f) => f.endsWith(".py") && readFileSync(join(dir, "app", f), "utf8").includes("/api/snapshots"),
-    );
-  } catch {
-    return false;
-  }
-}
-
 function hasSnaps(dataDir: string): boolean {
   try {
     return readdirSync(join(dataDir, "snaps")).length > 0;
@@ -213,29 +203,12 @@ if (!existsSync(CHROME)) {
 // 2. Amber, read-only, on its own port
 // ---------------------------------------------------------------------------
 
-function pickAmberCheckout(): { code: string; note?: string } {
-  const explicit = arg("amber-dir") ?? process.env.AMBER_DIR;
-  if (explicit) return { code: resolve(explicit) };
-  if (hasApi(DEFAULT_AMBER)) return { code: DEFAULT_AMBER };
-  if (existsSync(join(API_WORKTREE, ".venv/bin/python")) && hasApi(API_WORKTREE)) {
-    return {
-      code: API_WORKTREE,
-      note: `${DEFAULT_AMBER} has no JSON API yet, so the code runs from ${API_WORKTREE} (with the real data).`,
-    };
-  }
-  return { code: DEFAULT_AMBER };
-}
-
-const picked = pickAmberCheckout();
-const codeDir = picked.code;
+const codeDir = resolve(arg("amber-dir") ?? DEFAULT_AMBER);
 const python = join(codeDir, ".venv/bin/python");
-let dataDir = process.env.AMBER_DATA_DIR ? resolve(process.env.AMBER_DATA_DIR) : join(codeDir, "data");
-if (!process.env.AMBER_DATA_DIR && !hasSnaps(dataDir) && hasSnaps(join(DEFAULT_AMBER, "data"))) {
-  dataDir = join(DEFAULT_AMBER, "data");
-}
+const dataDir = join(codeDir, "data");
 
 if (!existsSync(python)) {
-  console.error(`No Amber virtualenv at ${python}. Pass --amber-dir <checkout> or set AMBER_DIR.`);
+  console.error(`No Amber virtualenv at ${python}. Pass --amber-dir <checkout>.`);
   process.exit(1);
 }
 if ((await answers(`${AMBER}/`)) !== null) {
@@ -244,8 +217,8 @@ if ((await answers(`${AMBER}/`)) !== null) {
 }
 
 console.log(`Amber code:  ${codeDir}`);
-if (picked.note) console.log(`             (${picked.note})`);
 console.log(`Amber data:  ${dataDir}`);
+if (!hasSnaps(dataDir)) console.log("WARNING: that data dir has no snapshots, so the Library will be empty.");
 console.log(`Amber check: ${AMBER}  (GET requests only; log in ${join(OUT, "amber.log")})\n`);
 
 const amberLog = openSync(join(OUT, "amber.log"), "w");
@@ -596,8 +569,8 @@ async function main() {
         `  [info] reader text: ${reader.fontSize} ${reader.fontFamily}, measure ${reader.measureCh}ch, ` +
           `contrast ${reader.contrast}:1, bg ${reader.bg}, accent ${reader.accent}`,
       );
-      check("Reader font size is about 20px", Math.abs(parseFloat(reader.fontSize) - 20) <= 2, reader.fontSize, true);
-      check("Reader measure is 62-70ch", reader.measureCh >= 60 && reader.measureCh <= 72, `${reader.measureCh}ch`, true);
+      check("Reader font size is about 20px (18-22 accepted)", Math.abs(parseFloat(reader.fontSize) - 20) <= 2, reader.fontSize, true);
+      check("Reader measure is about 62-70ch (60-72 accepted)", reader.measureCh >= 60 && reader.measureCh <= 72, `${reader.measureCh}ch`, true);
       check("Reader text contrast is at least 7:1", reader.contrast >= 7, `${reader.contrast}:1`, true);
       await shot(`04-reader-${theme}`);
       await key("Escape");
