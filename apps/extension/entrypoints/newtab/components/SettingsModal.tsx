@@ -3,10 +3,13 @@ import {
   MODEL_CHOICES,
   normalizeArchiveUrl,
   normalizeBlockList,
+  type FeedSource,
   type HomepageModel,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
+import { probeFeed } from "@/lib/feeds";
+import { addFeedUrl, loadSources, mergeSeeded, saveSources, seedFromArchive } from "@/lib/sources";
 import { loadSettings, saveSetting } from "@/lib/storage";
 
 type ArchiveCheck =
@@ -91,6 +94,32 @@ export function SettingsModal({
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
   /** Bumped whenever the field changes, a test starts, or the modal goes away; a late test result is ignored. */
   const archiveRequest = useRef(0);
+  /** The sources list is a draft too: null while loading, written only by Save. */
+  const [sources, setSources] = useState<FeedSource[] | null>(null);
+  const [sourcesDirty, setSourcesDirty] = useState(false);
+  const [sourcesError, setSourcesError] = useState<string | null>(null);
+  const [feedInput, setFeedInput] = useState("");
+  const [sourceCheck, setSourceCheck] = useState<ArchiveCheck>({ state: "idle" });
+  /** Bumped when the modal goes away, so a late probe or re-seed doesn't touch a dead component. */
+  const sourcesRequest = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSources().then(
+      (list) => {
+        if (!cancelled) setSources(list);
+      },
+      () => {
+        if (cancelled) return;
+        setSources([]);
+        setSourcesError("Couldn't read your saved sources. You can still add some below.");
+      },
+    );
+    return () => {
+      cancelled = true;
+      sourcesRequest.current++;
+    };
+  }, []);
 
   // Loaded here rather than threaded through App, which keeps this section self-contained.
   useEffect(() => {
@@ -154,11 +183,74 @@ export function SettingsModal({
     archiveRequest.current++;
     // Written before the rebuild starts, so the build reads the new address.
     if (archiveLoaded) await saveSetting("archiveUrl", value);
+    if (sources && sourcesDirty) await saveSources(sources);
     onSave(draft, normalizeBlockList(blockedDraft.split("\n")));
   };
 
   const statusClass =
     archiveCheck.state === "ok" ? "ok" : archiveCheck.state === "error" ? "error" : "";
+  const sourceStatusClass =
+    sourceCheck.state === "ok" ? "ok" : sourceCheck.state === "error" ? "error" : "";
+
+  const editSources = (next: FeedSource[]) => {
+    setSources(next);
+    setSourcesDirty(true);
+  };
+
+  const addSource = async () => {
+    const address = feedInput.trim();
+    if (!address || !sources || sourceCheck.state === "testing") return;
+    if (!/^https?:\/\//i.test(address)) {
+      setSourceCheck({ state: "error", message: "Paste a full address starting with https://" });
+      return;
+    }
+    const request = ++sourcesRequest.current;
+    setSourceCheck({ state: "testing" });
+    try {
+      const found = await probeFeed(address);
+      if (request !== sourcesRequest.current) return;
+      editSources(addFeedUrl(sources, found.feedUrl));
+      setFeedInput("");
+      setSourceCheck({
+        state: "ok",
+        message: `Added. ${found.itemCount} article${found.itemCount === 1 ? "" : "s"} in that feed. Click ${saveLabel} to keep it.`,
+      });
+    } catch (err) {
+      if (request !== sourcesRequest.current) return;
+      setSourceCheck({ state: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const reseed = async () => {
+    if (!sources || sourceCheck.state === "testing") return;
+    const value = archiveValue();
+    if (value === null) {
+      setSourceCheck({ state: "error", message: NOT_AN_ADDRESS });
+      return;
+    }
+    const request = ++sourcesRequest.current;
+    setSourceCheck({ state: "testing" });
+    const seeded = await seedFromArchive(value);
+    if (request !== sourcesRequest.current) return;
+    const { sources: merged, added } = mergeSeeded(sources, seeded.sources);
+    if (added.length > 0) editSources(merged);
+    const skipped = seeded.skipped.length
+      ? ` No known feed for ${seeded.skipped.slice(0, 4).join(", ")}${seeded.skipped.length > 4 ? ` and ${seeded.skipped.length - 4} more` : ""}; add their feed addresses above.`
+      : "";
+    if (seeded.archiveError && added.length === 0) {
+      setSourceCheck({ state: "error", message: `${AMBER_DOWN}.${skipped}` });
+    } else if (added.length === 0) {
+      setSourceCheck({
+        state: "ok",
+        message: `Nothing new: your list already covers your archive.${skipped}`,
+      });
+    } else {
+      setSourceCheck({
+        state: "ok",
+        message: `Added ${added.length}: ${added.map((a) => a.name).join(", ")}. Click ${saveLabel} to keep ${added.length === 1 ? "it" : "them"}.${skipped}`,
+      });
+    }
+  };
 
   return (
     <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onClose()}>
@@ -303,6 +395,104 @@ export function SettingsModal({
                 {archiveCheck.state === "ok" || archiveCheck.state === "error"
                   ? archiveCheck.message
                   : ""}
+              </span>
+            </div>
+          </section>
+
+          <section className="set">
+            <h3 className="set-title">Sources</h3>
+            <p id="sources-help" className="set-hint">
+              The publications the Latest view and Today pull current articles from, read from their
+              public feeds. Changes are saved when you click {saveLabel}.
+            </p>
+            {sources === null ? (
+              <p className="src-empty" role="status">
+                Loading your sources…
+              </p>
+            ) : sources.length === 0 ? (
+              <p className="src-empty">
+                No sources yet. Add a feed below, or re-seed from your archive.
+              </p>
+            ) : (
+              <ul className="src-list" aria-describedby="sources-help">
+                {sources.map((s) => (
+                  <li key={s.id} className={`src-row${s.enabled ? "" : " off"}`}>
+                    <div className="src-text">
+                      <span className="src-name">{s.name}</span>
+                      {s.feedUrls.length === 0 ? (
+                        <span className="src-feed">No feed address</span>
+                      ) : (
+                        s.feedUrls.map((u) => (
+                          <span key={u} className="src-feed" title={u}>
+                            {u.replace(/^https?:\/\//i, "")}
+                          </span>
+                        ))
+                      )}
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="switch"
+                      checked={s.enabled}
+                      aria-label={`Include ${s.name}`}
+                      onChange={(e) =>
+                        editSources(
+                          sources.map((x) => (x.id === s.id ? { ...x, enabled: e.target.checked } : x)),
+                        )
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="ghost-btn small"
+                      aria-label={`Remove ${s.name}`}
+                      onClick={() => editSources(sources.filter((x) => x.id !== s.id))}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {sourcesError && <p className="set-status error src-note">{sourcesError}</p>}
+            <div className="src-add">
+              <input
+                type="url"
+                className="field mono"
+                value={feedInput}
+                disabled={sources === null}
+                onChange={(e) => {
+                  setFeedInput(e.target.value);
+                  if (sourceCheck.state !== "testing") setSourceCheck({ state: "idle" });
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void addSource();
+                  }
+                }}
+                placeholder="https://example.com/feed.xml"
+                aria-label="Feed address to add"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => void addSource()}
+                disabled={sources === null || feedInput.trim() === "" || sourceCheck.state === "testing"}
+              >
+                Add
+              </button>
+            </div>
+            <div className="set-test">
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => void reseed()}
+                disabled={sources === null || sourceCheck.state === "testing"}
+              >
+                {sourceCheck.state === "testing" ? "Working…" : "Re-seed from my archive"}
+              </button>
+              <span role="status" className={`set-status ${sourceStatusClass}`}>
+                {sourceCheck.state === "ok" || sourceCheck.state === "error" ? sourceCheck.message : ""}
               </span>
             </div>
           </section>

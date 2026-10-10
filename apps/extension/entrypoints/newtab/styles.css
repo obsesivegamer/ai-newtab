@@ -1393,3 +1393,76 @@ textarea.field {
     padding: 22px 20px 26px;
   }
 }
+
+/* ---- settings: Sources (the catalog of news sites the Latest view reads) ---- */
+.src-list {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.src-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 11px 12px 11px 14px;
+  border-top: 1px solid var(--border);
+}
+.src-row:first-child {
+  border-top: none;
+}
+.src-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.src-name {
+  font-size: 14.5px;
+  color: var(--text);
+}
+.src-row.off .src-name {
+  color: var(--faint);
+}
+.src-feed {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  color: var(--faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.src-empty {
+  margin: 14px 0 0;
+  padding: 16px 14px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.src-note {
+  margin: 10px 0 0;
+}
+.src-add {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+.src-add .field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+@media (max-width: 640px) {
+  .src-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .src-row .ghost-btn {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
+}

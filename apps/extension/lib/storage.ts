@@ -20,6 +20,8 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
+  /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
+  sources: "sources",
   model: "model",
   autoRebuild: "autoRebuild",
   /** ISO timestamp of the last auto-build *attempted* (success or not). */
