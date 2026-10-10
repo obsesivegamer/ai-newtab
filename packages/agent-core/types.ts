@@ -83,6 +83,74 @@ export interface BrowserBridge {
   }): Promise<{ pages: ScrapedPage[]; failed: Array<{ url: string; reason: string }> }>;
 }
 
+/** One saved article in the user's personal archive (Amber), without its body. */
+export interface ArchiveArticleMeta {
+  id: string;
+  title: string;
+  /** Display name of the publication, e.g. "Financial Times". */
+  site: string;
+  author?: string;
+  /** ISO 8601, when the publisher says it ran. Often absent. */
+  publishedAt?: string;
+  /** ISO 8601, when the user saved it. */
+  savedAt: string;
+  wordCount: number;
+  paywalled: boolean;
+  /** The publisher's URL, as saved. */
+  originalUrl: string;
+  /** Stable archive link that reads without a paywall. This is the link to put on the page. */
+  permalink: string;
+}
+
+export interface ArchiveArticle extends ArchiveArticleMeta {
+  /** Plain-text article body. */
+  text: string;
+}
+
+/** What `getArchive` returns to the model. */
+export interface GetArchiveResult {
+  windowDays: number;
+  /** Usable archived articles in the window, before `articles` was capped. */
+  totalUsable: number;
+  /** Per-publication counts over the whole window, not just `articles`. */
+  sources: Array<{ site: string; count: number; latest: string }>;
+  articles: ArchiveArticleMeta[];
+}
+
+/** An archived article whose text now lives in the session sandbox. */
+export interface ArchiveRef {
+  id: string;
+  title: string;
+  site: string;
+  permalink: string;
+  originalUrl: string;
+  /** What `resources.add()` resolved, never the path asked for. */
+  mountPath: string;
+  bytes: number;
+}
+
+export interface GetArchiveArticlesResult {
+  articles: ArchiveRef[];
+  failed: Array<{ id: string; reason: string }>;
+}
+
+/**
+ * The user's personal article archive. Host-supplied like BrowserBridge: the
+ * extension and the Bun harness both implement it over `fetch`. Optional on the
+ * orchestrator — a build without one just has no archive tools to answer.
+ */
+export interface ArchiveBridge {
+  listArticles(args: { sinceDays: number; limit: number }): Promise<{
+    totalUsable: number;
+    sources: GetArchiveResult["sources"];
+    articles: ArchiveArticleMeta[];
+  }>;
+  getArticles(args: { ids: string[] }): Promise<{
+    articles: ArchiveArticle[];
+    failed: Array<{ id: string; reason: string }>;
+  }>;
+}
+
 /** Minimal persistence. `chrome.storage.local` in the extension, a JSON file in Node. */
 export interface KVStore {
   get<T>(key: string): Promise<T | undefined>;
