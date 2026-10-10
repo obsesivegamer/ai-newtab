@@ -5,7 +5,12 @@ import { DEFAULT_BLOCKED_SITES, isAllowedUrl, isBlocked, normalizeBlockList } fr
 import { DEFAULTS } from "./schemas";
 import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
 import type {
+  ArchiveArticle,
+  ArchiveBridge,
+  ArchiveRef,
   BrowserBridge,
+  GetArchiveArticlesResult,
+  GetArchiveResult,
   GetHistoryResult,
   GetPageHtmlResult,
   HomepageBuildResult,
@@ -33,6 +38,8 @@ const UPLOAD_ROOT = "/mnt/session/uploads";
 export interface RunOptions {
   client: Anthropic;
   bridge: BrowserBridge;
+  /** The user's saved-article archive. Without it the archive tools answer with an error. */
+  archive?: ArchiveBridge;
   store: KVStore;
   userSystemPrompt?: string;
   /**
@@ -50,7 +57,7 @@ export interface RunOptions {
 }
 
 export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildResult> {
-  const { client, bridge, store, callbacks, signal } = opts;
+  const { client, bridge, archive, store, callbacks, signal } = opts;
   const emit: Emit = {
     phase: (p, d) => callbacks?.onPhase?.(p, d),
     text: (t) => callbacks?.onText?.(t),
@@ -85,6 +92,9 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     await store.set(STORAGE_KEYS.uploadedFileIds, uploadedFileIds);
   };
 
+  // Archive articles already mounted this run, so a repeat request reuses the file.
+  const mountedArchive = new Map<string, ArchiveRef>();
+
   let finalMessage = "";
 
   /**
@@ -97,8 +107,22 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       const blockedSites = normalizeBlockList(
         (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ?? DEFAULT_BLOCKED_SITES,
       );
-      let result: GetHistoryResult | GetPageHtmlResult;
+      let result: GetHistoryResult | GetPageHtmlResult | GetArchiveResult | GetArchiveArticlesResult;
       switch (event.name) {
+        case "getArchive":
+          result = await runGetArchive(event, archive, emit, blockedSites);
+          break;
+        case "getArchiveArticles":
+          result = await runGetArchiveArticles(event, {
+            client,
+            archive,
+            sessionId: sessionId!,
+            rememberUpload,
+            mounted: mountedArchive,
+            emit,
+            blockedSites,
+          });
+          break;
         case "getHistory":
           result = await runGetHistory(event, bridge, emit, blockedSites);
           break;
@@ -203,6 +227,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
                   text: buildKickoffMessage({
                     now: opts.now ?? new Date(),
                     userSystemPrompt: opts.userSystemPrompt,
+                    archive: Boolean(archive),
                   }),
                 },
               ],
@@ -364,6 +389,195 @@ async function runGetPageHtml(
   }
 
   return { pages: refs, failed: mountFailures };
+}
+
+const ARCHIVE_UNAVAILABLE = "The article archive is unavailable";
+
+/**
+ * Ask the archive for this many and apply the blocked-sites list here, so blocked
+ * articles don't use up `limit` and their publication can be dropped from `sources`.
+ */
+const ARCHIVE_FETCH_LIMIT = 200;
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/** Header, blank line, then the body: the model greps the file and reads the top for metadata. */
+function archiveFileText(article: ArchiveArticle): string {
+  const header = [
+    `Title: ${oneLine(article.title)}`,
+    `Site: ${oneLine(article.site)}`,
+    article.author ? `Author: ${oneLine(article.author)}` : undefined,
+    `Published: ${article.publishedAt ?? "unknown"}`,
+    `Saved: ${article.savedAt}`,
+    `Permalink: ${article.permalink}`,
+    `Original URL: ${article.originalUrl}`,
+  ].filter(Boolean);
+  return `${header.join("\n")}\n\n${article.text}`;
+}
+
+async function runGetArchive(
+  event: CustomToolUse,
+  archive: ArchiveBridge | undefined,
+  emit: Emit,
+  blockedSites: string[],
+): Promise<GetArchiveResult> {
+  if (!archive) throw new Error(`${ARCHIVE_UNAVAILABLE}: none is configured for this build.`);
+  const input = event.input as { sinceDays?: number; limit?: number };
+  const sinceDays = clampInt(input.sinceDays, DEFAULTS.archiveSinceDays, 1, 90);
+  const limit = clampInt(input.limit, DEFAULTS.archiveLimit, 1, 60);
+
+  emit.phase("history", `archive ${sinceDays}d`);
+  let listed: Awaited<ReturnType<ArchiveBridge["listArticles"]>>;
+  try {
+    listed = await archive.listArticles({ sinceDays, limit: ARCHIVE_FETCH_LIMIT });
+  } catch (err) {
+    throw new Error(`${ARCHIVE_UNAVAILABLE}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // The user's blocked hosts apply to where the article came from, not to the archive's own address.
+  const kept = listed.articles.filter((a) => isAllowedUrl(a.originalUrl, blockedSites));
+  const dropped = listed.articles.filter((a) => !kept.includes(a));
+  // As with history, blocked material is dropped from the counts too: the model is never told it exists.
+  const droppedBySite = new Map<string, number>();
+  for (const a of dropped) droppedBySite.set(a.site, (droppedBySite.get(a.site) ?? 0) + 1);
+  const keptSites = new Set(kept.map((a) => a.site));
+  const sources = listed.sources.flatMap((source) => {
+    const gone = droppedBySite.get(source.site) ?? 0;
+    if (!gone) return [source];
+    const count = source.count - gone;
+    return count > 0 && keptSites.has(source.site) ? [{ ...source, count }] : [];
+  });
+
+  const result: GetArchiveResult = {
+    windowDays: sinceDays,
+    totalUsable: Math.max(0, listed.totalUsable - dropped.length),
+    sources,
+    articles: kept.slice(0, limit),
+  };
+  if (dropped.length) emit.log(`blocked: ${dropped.length} archived article(s)`);
+  emit.log(`archive: ${result.articles.length} of ${result.totalUsable} articles`);
+  return result;
+}
+
+async function runGetArchiveArticles(
+  event: CustomToolUse,
+  ctx: {
+    client: Anthropic;
+    archive: ArchiveBridge | undefined;
+    sessionId: string;
+    rememberUpload: (id: string) => Promise<void>;
+    mounted: Map<string, ArchiveRef>;
+    emit: Emit;
+    blockedSites: string[];
+  },
+): Promise<GetArchiveArticlesResult> {
+  if (!ctx.archive) throw new Error(`${ARCHIVE_UNAVAILABLE}: none is configured for this build.`);
+  const input = event.input as { ids?: unknown };
+  const requested = (Array.isArray(input.ids) ? input.ids : [])
+    .filter((id): id is string => typeof id === "string" && id.trim() !== "")
+    .map((id) => id.trim());
+  const unique = [...new Set(requested)];
+  if (unique.length === 0) throw new Error("getArchiveArticles needs at least one article id.");
+
+  const max = DEFAULTS.maxArchiveArticles;
+  const ids = unique.slice(0, max);
+  const failed: GetArchiveArticlesResult["failed"] = unique
+    .slice(max)
+    .map((id) => ({ id, reason: `over the ${max}-article limit` }));
+  ctx.emit.phase("scraping", `${ids.length} archived articles`);
+
+  const blockedReason = "blocked by the user's settings";
+  const refs: ArchiveRef[] = [];
+  let blockedCount = 0;
+  const toFetch: string[] = [];
+  for (const id of ids) {
+    const have = ctx.mounted.get(id);
+    if (!have) toFetch.push(id);
+    else if (isAllowedUrl(have.originalUrl, ctx.blockedSites)) refs.push(have);
+    else {
+      failed.push({ id, reason: blockedReason });
+      blockedCount++;
+    }
+  }
+
+  const fetched: ArchiveArticle[] = [];
+  if (toFetch.length) {
+    let response: Awaited<ReturnType<ArchiveBridge["getArticles"]>>;
+    try {
+      response = await ctx.archive.getArticles({ ids: toFetch });
+    } catch (err) {
+      throw new Error(`${ARCHIVE_UNAVAILABLE}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const asked = new Set(toFetch);
+    const answered = new Set<string>();
+    for (const article of response.articles) {
+      if (!asked.has(article.id) || answered.has(article.id)) continue;
+      answered.add(article.id);
+      // Checked before upload: a blocked article's text never leaves this process.
+      if (isAllowedUrl(article.originalUrl, ctx.blockedSites)) {
+        fetched.push(article);
+      } else {
+        failed.push({ id: article.id, reason: blockedReason });
+        blockedCount++;
+      }
+    }
+    for (const miss of response.failed) {
+      if (!asked.has(miss.id) || answered.has(miss.id)) continue;
+      answered.add(miss.id);
+      failed.push(miss);
+    }
+    // Every requested id gets an answer, even one the archive said nothing about.
+    for (const id of toFetch) {
+      if (!answered.has(id)) failed.push({ id, reason: "not returned by the archive" });
+    }
+  }
+  if (blockedCount) ctx.emit.log(`blocked: ${blockedCount} archived article(s)`);
+
+  for (const article of fetched) {
+    try {
+      const filename = `${article.id.replace(/[^A-Za-z0-9_-]+/g, "_") || "article"}.txt`;
+      const file = new File([archiveFileText(article)], filename, { type: "text/plain" });
+      const upload = await ctx.client.beta.files.upload({ file });
+      await ctx.rememberUpload(upload.id);
+
+      const resource = await ctx.client.beta.sessions.resources.add(ctx.sessionId, {
+        type: "file",
+        file_id: upload.id,
+        mount_path: `${UPLOAD_ROOT}/archive/${filename}`,
+      });
+
+      const ref: ArchiveRef = {
+        id: article.id,
+        title: article.title,
+        site: article.site,
+        permalink: article.permalink,
+        originalUrl: article.originalUrl,
+        // As with pages: what the API resolved, not what we asked for.
+        mountPath: resource.mount_path,
+        bytes: file.size,
+      };
+      ctx.mounted.set(article.id, ref);
+      refs.push(ref);
+      ctx.emit.log(`mounted archive ${article.id} -> ${resource.mount_path} (${file.size}b)`);
+    } catch (err) {
+      failed.push({ id: article.id, reason: `mount failed: ${String(err)}` });
+    }
+  }
+
+  if (refs.length === 0 && failed.length > 0 && blockedCount === 0) {
+    throw new Error(
+      `No archived articles could be mounted. Failures: ${failed.map((f) => `${f.id} (${f.reason})`).join("; ")}`,
+    );
+  }
+
+  return { articles: refs, failed };
 }
 
 // ---------------------------------------------------------------------------
