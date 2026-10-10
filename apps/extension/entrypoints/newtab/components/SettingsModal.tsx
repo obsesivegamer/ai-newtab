@@ -3,7 +3,6 @@ import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage
 import { DEFAULT_ARCHIVE_URL, normalizeArchiveUrl } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { loadSettings, saveSetting } from "@/lib/storage";
-import { btn } from "./ui";
 
 type ArchiveCheck =
   | { state: "idle" }
@@ -98,6 +97,14 @@ export function SettingsModal({
     };
   }, []);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   /** The address as it should be saved: "" (archive off), a clean base URL, or null if it can't be one. */
   const archiveValue = (): string | null => (archiveUrl.trim() === "" ? "" : normalizeArchiveUrl(archiveUrl));
 
@@ -141,165 +148,165 @@ export function SettingsModal({
     onSave(draft, normalizeBlockList(blockedDraft.split("\n")));
   };
 
+  const statusClass =
+    archiveCheck.state === "ok" ? "ok" : archiveCheck.state === "error" ? "error" : "";
+
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        backgroundColor: "rgba(0,0,0,0.5)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 1000,
-      }}
-      onClick={(e) => e.target === e.currentTarget && onClose()}
-    >
-      <div style={{ backgroundColor: "white", borderRadius: 8, padding: 24, width: "90%", maxWidth: 600, maxHeight: "90vh", overflowY: "auto" }}>
-        <h2 style={{ marginTop: 0, color: "#333" }}>Customize your homepage</h2>
-        <p style={{ color: "#666" }}>Standing instructions applied to every build.</p>
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="e.g. 'Focus on tech news and Rust releases', 'Always surface unread GitHub PRs first'"
-          style={{
-            width: "100%",
-            minHeight: 200,
-            padding: 12,
-            fontSize: 14,
-            borderRadius: 4,
-            border: "1px solid #ddd",
-            fontFamily: "inherit",
-          }}
-        />
-        <label style={{ display: "block", marginTop: 16, color: "#333", fontSize: 14 }}>
-          Sites the agent never reads
-          <textarea
-            value={blockedDraft}
-            onChange={(e) => setBlockedDraft(e.target.value)}
-            aria-describedby="blocked-sites-help"
-            style={{ width: "100%", boxSizing: "border-box", minHeight: 120, marginTop: 8, padding: 12, fontSize: 14, borderRadius: 4, border: "1px solid #ddd", fontFamily: "inherit" }}
-          />
-        </label>
-        <p id="blocked-sites-help" style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
-          One per line. Subdomains are included. Use *.example.com for wildcards.
-        </p>
-        <label
-          style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 16, color: "#333", fontSize: 14 }}
-        >
-          Model
-          <select
-            value={model}
-            onChange={(e) => onChangeModel(e.target.value as HomepageModel)}
-            style={{ padding: "4px 8px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd" }}
-          >
-            {MODEL_CHOICES.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            marginTop: 16,
-            color: "#333",
-            fontSize: 14,
-            cursor: "pointer",
-          }}
-        >
-          <input
-            type="checkbox"
-            checked={autoRebuild}
-            onChange={(e) => onToggleAutoRebuild(e.target.checked)}
-          />
-          Rebuild automatically
-        </label>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            marginTop: 10,
-            marginLeft: 24,
-            color: autoRebuild ? "#333" : "#aaa",
-            fontSize: 14,
-          }}
-        >
-          Every
-          <select
-            value={intervalHours}
-            disabled={!autoRebuild}
-            onChange={(e) => onChangeInterval(Number(e.target.value))}
-            style={{ padding: "4px 8px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd" }}
-          >
-            {REBUILD_INTERVAL_CHOICES.map((h) => (
-              <option key={h} value={h}>
-                {h === 24 ? "24 hours (daily)" : `${h} hours`}
-              </option>
-            ))}
-          </select>
-        </label>
-        <p style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
-          When on, the extension rebuilds in the background once your homepage is this old, so
-          your next tab shows a fresh one (uses your API key).
-        </p>
-        <h3 style={{ margin: "24px 0 0", color: "#333", fontSize: 15 }}>Article archive (Amber)</h3>
-        <label style={{ display: "block", marginTop: 8, color: "#333", fontSize: 14 }}>
-          Archive address
-          <input
-            type="url"
-            value={archiveUrl}
-            disabled={!archiveLoaded}
-            onChange={(e) => {
-              archiveRequest.current++;
-              setArchiveUrl(e.target.value);
-              setArchiveCheck({ state: "idle" });
-            }}
-            placeholder={DEFAULT_ARCHIVE_URL}
-            aria-describedby="archive-help"
-            spellCheck={false}
-            style={{ width: "100%", boxSizing: "border-box", marginTop: 8, padding: "8px 12px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd", fontFamily: "inherit" }}
-          />
-        </label>
-        <p id="archive-help" style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
-          Where your saved articles live. Leave empty to build from browsing history only. Saved
-          when a test succeeds or you click Save &amp; rebuild.
-        </p>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10 }}>
+    <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <header className="modal-head">
+          <h2 id="settings-title" className="modal-title">
+            Settings
+          </h2>
           <button
-            onClick={() => void runArchiveTest()}
-            disabled={!archiveLoaded || archiveCheck.state === "testing"}
-            style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd" }}
-          >
-            {archiveCheck.state === "testing" ? "Testing…" : "Test connection"}
-          </button>
-          <span
-            role="status"
-            style={{
-              fontSize: 13,
-              color: archiveCheck.state === "ok" ? "#2e7d32" : archiveCheck.state === "error" ? "#a02620" : "#888",
-            }}
-          >
-            {archiveCheck.state === "ok" || archiveCheck.state === "error" ? archiveCheck.message : ""}
-          </span>
-        </div>
-        <div style={{ display: "flex", gap: 12, marginTop: 20, justifyContent: "flex-end" }}>
-          <button
+            type="button"
+            className="icon-btn"
             onClick={onClose}
-            style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd" }}
+            title="Close"
+            aria-label="Close settings"
           >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
+          </button>
+        </header>
+
+        <div className="modal-body">
+          <section className="set">
+            <label className="set-title" htmlFor="set-prompt">
+              Instructions
+            </label>
+            <p className="set-hint">Standing instructions applied to every build.</p>
+            <textarea
+              id="set-prompt"
+              className="field area"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="e.g. 'Focus on tech news and Rust releases', 'Always surface unread GitHub PRs first'"
+            />
+          </section>
+
+          <section className="set">
+            <label className="set-title" htmlFor="set-blocked">
+              Sites the agent never reads
+            </label>
+            <p id="blocked-sites-help" className="set-hint">
+              One per line. Subdomains are included. Use *.example.com for wildcards.
+            </p>
+            <textarea
+              id="set-blocked"
+              className="field area mono"
+              value={blockedDraft}
+              onChange={(e) => setBlockedDraft(e.target.value)}
+              aria-describedby="blocked-sites-help"
+              spellCheck={false}
+            />
+          </section>
+
+          <section className="set">
+            <label className="set-title" htmlFor="set-model">
+              Model
+            </label>
+            <p className="set-hint">Used for the next build.</p>
+            <div className="select-wrap">
+              <select
+                id="set-model"
+                className="field"
+                value={model}
+                onChange={(e) => onChangeModel(e.target.value as HomepageModel)}
+              >
+                {MODEL_CHOICES.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </section>
+
+          <section className="set">
+            <h3 className="set-title">Rebuild schedule</h3>
+            <label className="set-row">
+              <span>Rebuild automatically</span>
+              <input
+                type="checkbox"
+                className="switch"
+                checked={autoRebuild}
+                onChange={(e) => onToggleAutoRebuild(e.target.checked)}
+              />
+            </label>
+            <label className={`set-row${autoRebuild ? "" : " off"}`}>
+              <span>Every</span>
+              <span className="select-wrap">
+                <select
+                  className="field"
+                  value={intervalHours}
+                  disabled={!autoRebuild}
+                  onChange={(e) => onChangeInterval(Number(e.target.value))}
+                >
+                  {REBUILD_INTERVAL_CHOICES.map((h) => (
+                    <option key={h} value={h}>
+                      {h === 24 ? "24 hours (daily)" : `${h} hours`}
+                    </option>
+                  ))}
+                </select>
+              </span>
+            </label>
+            <p className="set-hint after">
+              When on, the extension rebuilds in the background once your homepage is this old, so
+              your next tab shows a fresh one (uses your API key).
+            </p>
+          </section>
+
+          <section className="set">
+            <label className="set-title" htmlFor="set-archive">
+              Article archive (Amber)
+            </label>
+            <p id="archive-help" className="set-hint">
+              Where your saved articles live. Leave empty to build from browsing history only.
+              Saved when a test succeeds or you click Save &amp; rebuild.
+            </p>
+            <input
+              id="set-archive"
+              type="url"
+              className="field mono"
+              value={archiveUrl}
+              disabled={!archiveLoaded}
+              onChange={(e) => {
+                archiveRequest.current++;
+                setArchiveUrl(e.target.value);
+                setArchiveCheck({ state: "idle" });
+              }}
+              placeholder={DEFAULT_ARCHIVE_URL}
+              aria-describedby="archive-help"
+              spellCheck={false}
+            />
+            <div className="set-test">
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => void runArchiveTest()}
+                disabled={!archiveLoaded || archiveCheck.state === "testing"}
+              >
+                {archiveCheck.state === "testing" ? "Testing…" : "Test connection"}
+              </button>
+              <span role="status" className={`set-status ${statusClass}`}>
+                {archiveCheck.state === "ok" || archiveCheck.state === "error"
+                  ? archiveCheck.message
+                  : ""}
+              </span>
+            </div>
+          </section>
+        </div>
+
+        <footer className="modal-foot">
+          <button type="button" className="ghost-btn" onClick={onClose}>
             Cancel
           </button>
-          <button
-            onClick={() => void save()}
-            style={btn}
-          >
+          <button type="button" className="solid-btn" onClick={() => void save()}>
             Save &amp; rebuild
           </button>
-        </div>
+        </footer>
       </div>
     </div>
   );

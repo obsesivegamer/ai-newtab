@@ -52,6 +52,10 @@ export default function App() {
   const [cursorId, setCursorId] = useState<string | null>(null);
   const archive = useArchiveList(archiveUrl);
 
+  useEffect(() => {
+    document.title = view === "today" ? "Today" : "Library";
+  }, [view]);
+
   const { state, build, cancel } = useHomepageBuild((code) => setRenderedCode(toRenderable(code)));
 
   // Once a build finishes, drop back to the homepage view.
@@ -167,14 +171,19 @@ export default function App() {
 
     if (!renderedCode) {
       return (
-        <div className="today-empty">
-          <h1>Build your homepage</h1>
-          <p>
+        <div className="gate">
+          <div className="meta gate-eyebrow">Today</div>
+          <h1 className="gate-title">Build your homepage</h1>
+          <p className="gate-body">
             The agent reads your browsing history and your archive, opens the pages you actually
             follow, and writes a homepage from what it finds today.
           </p>
-          {state.error && <div className="banner error">{state.error}</div>}
-          <div className="today-empty-actions">
+          {state.error && (
+            <div className="banner error" role="alert">
+              <b>Build failed.</b> {state.error}
+            </div>
+          )}
+          <div className="gate-actions">
             <button className="solid-btn" onClick={() => build()}>
               Build today&apos;s homepage
             </button>
@@ -191,7 +200,7 @@ export default function App() {
     return (
       <>
         {showError && (
-          <div className="banner error banner-row">
+          <div className="banner error banner-row" role="alert">
             <span>
               <b>Build failed.</b> {state.error}
             </span>
