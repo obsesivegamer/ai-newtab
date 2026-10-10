@@ -156,6 +156,56 @@ export interface ArchiveBridge {
   }>;
 }
 
+/** A publication the user reads, with the feeds that list its newest articles. */
+export interface FeedSource {
+  id: string;
+  /** Display name, e.g. "Financial Times". Matches the archive's `site` where they overlap. */
+  name: string;
+  feedUrls: string[];
+  enabled: boolean;
+}
+
+/** One current article from a source's feed. */
+export interface FeedItem {
+  /** Stable hash of the canonical link. */
+  id: string;
+  title: string;
+  /** The publisher's article URL. */
+  link: string;
+  /** Source display name. */
+  source: string;
+  /** ISO 8601 when the feed gave a parseable date. */
+  publishedAt?: string;
+  summary?: string;
+  author?: string;
+  section?: string;
+}
+
+export interface FeedSourceStatus {
+  name: string;
+  count: number;
+  /** Set when the feed could not be fetched or parsed. */
+  error?: string;
+}
+
+/** What `getFeeds` returns to the model. */
+export interface GetFeedsResult {
+  fetchedAt: string;
+  sources: FeedSourceStatus[];
+  items: FeedItem[];
+}
+
+/**
+ * The user's sources' newest articles. Host-supplied (the extension fetches the
+ * feeds from the browser). Optional on the orchestrator.
+ */
+export interface FeedBridge {
+  fetchLatest(args: { sinceHours: number; perSource: number }): Promise<{
+    items: FeedItem[];
+    sources: FeedSourceStatus[];
+  }>;
+}
+
 /** Minimal persistence. `chrome.storage.local` in the extension, a JSON file in Node. */
 export interface KVStore {
   get<T>(key: string): Promise<T | undefined>;
