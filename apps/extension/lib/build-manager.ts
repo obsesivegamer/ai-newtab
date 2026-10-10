@@ -141,9 +141,20 @@ export class BuildManager {
       console.log("[BuildManager] startBuild ignored — a build is already running");
       return; // single-flight: a second start just attaches.
     }
+    // Claim the slot before the first await: the startup tick, the onStartup
+    // listener and an alarm can all call this in the same turn.
+    this.running = true;
 
-    const { apiKey, systemPrompt, model, archiveUrl } = await loadSettings();
+    let settings: Awaited<ReturnType<typeof loadSettings>>;
+    try {
+      settings = await loadSettings();
+    } catch (err) {
+      this.running = false;
+      throw err;
+    }
+    const { apiKey, systemPrompt, model, archiveUrl } = settings;
     if (!apiKey) {
+      this.running = false;
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
       console.warn("[BuildManager] startBuild aborted — no API key in storage");
@@ -158,7 +169,6 @@ export class BuildManager {
       console.warn("[BuildManager] archive URL is not a valid http(s) address; building without the archive");
     }
 
-    this.running = true;
     this.controller = new AbortController();
     this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
     this.broadcast({ kind: "snapshot", state: this.state });

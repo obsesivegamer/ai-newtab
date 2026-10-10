@@ -8,6 +8,8 @@
 export function normalizeArchiveUrl(input: string): string | null {
   const text = input.trim();
   if (!text || /\s/.test(text) || /[?#]/.test(text)) return null;
+  // `http:/host` is a mistyped scheme, not a host called "http".
+  if (/^https?:/i.test(text) && !/^https?:\/\//i.test(text)) return null;
   const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
   let url: URL;
   try {
