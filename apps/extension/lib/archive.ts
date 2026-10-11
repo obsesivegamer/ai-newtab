@@ -1,4 +1,5 @@
 import {
+  anySignal,
   normalizeArchiveUrl,
   type ArchiveArticle,
   type ArchiveArticleMeta,
@@ -48,7 +49,7 @@ function toMeta(base: string, s: ApiSnapshot): ArchiveArticleMeta {
 
 async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
-  const response = await fetch(url, { signal: signal ? AbortSignal.any([timeout, signal]) : timeout });
+  const response = await fetch(url, { signal: signal ? anySignal([timeout, signal]) : timeout });
   if (!response.ok) throw new Error(`archive responded ${response.status} for ${url}`);
   return (await response.json()) as T;
 }

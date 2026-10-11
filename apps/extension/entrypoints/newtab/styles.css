@@ -1611,3 +1611,24 @@ textarea.field {
     animation: none;
   }
 }
+
+/* ---- a passing note (the sources list changed on another device): above the modal, never takes a tap ---- */
+.sync-note {
+  position: fixed;
+  top: calc(var(--safe-top, 0px) + 64px);
+  left: 16px;
+  right: 16px;
+  width: fit-content;
+  margin: 0 auto;
+  z-index: 1100;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.4;
+  pointer-events: none;
+}

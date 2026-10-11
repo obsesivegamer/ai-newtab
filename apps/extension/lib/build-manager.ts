@@ -13,6 +13,7 @@ import {
   type BuildState,
   type PageMsg,
 } from "./protocol";
+import { pushHomepage } from "./phone-sync";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -225,7 +226,11 @@ export class BuildManager {
       });
 
       // Persist the raw TSX; the page transpiles it for preview.
-      await saveHomepage(result.code);
+      const homepage = await saveHomepage(result.code);
+      // Also hand it to Amber so the phone/web version can show it. Best-effort: a failure is only
+      // logged and never holds up the build. Only when an archive address is configured and it is a
+      // local, private-network or tailnet host (`pushHomepage` checks); never a public address.
+      if (archiveBase) void pushHomepage(archiveBase, homepage);
 
       this.state = { ...this.state, running: false, phase: "done" };
       this.broadcast({ kind: "done", code: result.code });

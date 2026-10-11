@@ -18,6 +18,7 @@ pnpm typecheck        # tsc --noEmit across all workspaces
 pnpm test             # bun test harness/ (history-digest, site-filter)
 bun test harness/site-filter.test.ts   # single test file
 
+pnpm web:build        # phone/web version -> apps/web/dist (served by Amber at /app/)
 pnpm agent:run        # full real build via Node/Bun bridge — needs ANTHROPIC_API_KEY in .env, spends credits; reads Amber at AMBER_URL (default http://127.0.0.1:8080) and live feeds from FEEDS (comma-separated feed URLs; default: the archive's sources that we know feeds for, then the first 6 known publications)
 pnpm agent:verify     # deliverable transpiles/evaluates/server-renders
 pnpm agent:resume-test
@@ -33,6 +34,7 @@ Three workspaces:
 
 - `packages/agent-core` — host-agnostic agent loop (`runHomepageBuild` in `orchestrator.ts`). **Must not import `chrome.*`, `browser.*`, or `node:*`**; the host injects a `BrowserBridge`, an optional `ArchiveBridge` and a `KVStore` (`types.ts`). Also holds the system prompt, tool schemas, history digesting, and the blocked-site filter.
 - `apps/extension` — WXT + React. The service worker (`entrypoints/background.ts` → `lib/build-manager.ts`) hosts the build as a single-flight job, so builds survive closing the tab. New-tab pages are thin views that subscribe over a port (`lib/protocol.ts`) and get state snapshots + deltas. The finished homepage is model-written TSX, transpiled (`lib/transpile.ts`) and rendered in a Sandpack iframe — never in the extension page itself.
+- `apps/web` — the phone/web version (Vite + React). Imports the extension's new-tab components/hooks/styles by alias (`@/` = `apps/extension`, `@newtab/` = its `entrypoints/newtab`); never copy them. Swaps only `@/lib/platform` (`IS_WEB`), `@/lib/browser-capture` (stub) and provides a `browser` shim. See "Phone/web version" below.
 - `harness/` — Bun scripts that drive the same orchestrator with a fixture/fetch bridge (`node-bridge.ts`). It cannot see logged-in pages, which is why `getPageHtml` lives in the extension.
 
 Key flows that span files:
@@ -45,6 +47,19 @@ Key flows that span files:
 - **Worker keep-alive/resume:** a 1-minute `chrome.alarms` heartbeat calls `BuildManager.tick()`, which reattaches to a stored `activeSessionId` by replaying the session event log, and also triggers scheduled rebuilds (`lib/auto-rebuild.ts`).
 - **Privacy enforcement lives in agent-core tool handlers** (`site-filter.ts`), not just the prompt: blocked hosts are dropped from digests, blocked/non-HTTP(S) page requests never reach the bridge, scraped pages' final URL (post-redirect) is rechecked before upload, and loopback/private/local-network hosts are always blocked. Session and uploaded files are deleted in a `finally` at the end of every build.
 - `chrome.storage` keys are centralized in `lib/storage.ts`; the new-tab UI prefs (theme, reader text size) have their own keys in `entrypoints/newtab/uiPrefs.ts`.
+
+## Phone/web version
+
+`apps/web` is the reader on a phone, served by Amber at `https://<mac>.<tailnet>.ts.net/app/` (same origin as Amber's API, so `archiveUrl = location.origin`).
+
+- **Build:** `npx -y pnpm@10.11.1 web:build` → `apps/web/dist`, `base: "/app/"`.
+- **Serve:** Amber with `AMBER_WEBAPP_DIR=<repo>/apps/web/dist` and `AMBER_ALLOWED_HOSTS=<mac>.<tailnet>.ts.net`, then `tailscale serve --bg --https=443 http://127.0.0.1:8080`. Never `tailscale funnel`.
+- **Security model:** no login; tailnet-only. Anyone who can reach it can read and save to the archive.
+- **Contracts with Amber:** `GET /api/feedproxy?url=` (feed XML), `GET/PUT /api/homepage` (`{code,timestamp,bytes}`), `GET/PUT /api/sources` (`{sources:[{id,name,feedUrls,enabled}],updated_at}`), JSON-only PUTs. `lib/phone-sync.ts` is the one client; the extension PUTs the homepage after each successful build (when an archive address is set) and the sources when Settings saves them. Both best-effort, logged only.
+- **Not on the phone:** Capture with my browser, building Today (key/model), history, blocked-sites editing. Today is read-only (`TodayStatic`).
+- **One gate:** the `homepage:open-article` / `homepage:open-url` rules live in `entrypoints/newtab/useHomepageOpen.ts`, shared by `App.tsx` and `WebApp.tsx`. Change them there only.
+- **Extension changes must keep working on the web build:** shared code may use `browser.storage.local`/`history` (shimmed) but must gate anything else on `IS_WEB` from `@/lib/platform`, and `apps/web` must still typecheck (`pnpm typecheck` covers it).
+- **Verify:** `~/Documents/amber-archive/.venv/bin/python .claude/skills/verify-newtab/scripts/verify-web.py --amber-dir <Amber checkout with the web routes> --out <dir>`; it uses a data COPY and port 8116, never :8080.
 
 ## Conventions
 

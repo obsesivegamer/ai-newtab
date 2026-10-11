@@ -22,6 +22,8 @@ export const KEYS = {
   archiveUrl: "archiveUrl",
   /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
   sources: "sources",
+  /** Amber's `updated_at` for the sources list as this device last saw it; sent back as `if_updated_at`. See lib/phone-sync.ts. */
+  sourcesSyncStamp: "sourcesSyncStamp",
   /** Version of the one-time catalog migrations already applied (a number); see lib/sources.ts. */
   sourcesMigrated: "sourcesMigrated",
   /** Epoch ms of the last background check of the one-time catalog migration, so it runs at most hourly. */
@@ -104,7 +106,8 @@ export async function loadHomepage(): Promise<Homepage | undefined> {
   return extensionStore.get<Homepage>(KEYS.homepage);
 }
 
-export async function saveHomepage(code: string): Promise<void> {
+export async function saveHomepage(code: string): Promise<Homepage> {
   const homepage: Homepage = { code, timestamp: new Date().toISOString() };
   await extensionStore.set(KEYS.homepage, homepage);
+  return homepage;
 }
