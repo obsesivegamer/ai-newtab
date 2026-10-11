@@ -73,10 +73,13 @@ export function entryFromFeed(item: FeedItem, archived?: ArchiveArticleMeta): Re
   };
 }
 
-/** A bare address (from the model-built page): the host stands in for the title until the text arrives. */
-export function entryFromUrl(href: string): ReaderEntry {
+/**
+ * A bare address (from the model-built page). The page's own headline for it, when it sent one,
+ * is shown as plain text; otherwise the host stands in for the title until the text arrives.
+ */
+export function entryFromUrl(href: string, headline?: string): ReaderEntry {
   const host = new URL(href).hostname.replace(/^www\./, "");
-  return { key: `url:${articleKey(href)}`, title: host, site: host, url: href, autoFetch: false };
+  return { key: `url:${articleKey(href)}`, title: headline || host, site: host, url: href, autoFetch: false };
 }
 
 /**
