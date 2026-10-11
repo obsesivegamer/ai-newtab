@@ -454,6 +454,8 @@ async function main() {
   // While set, Amber's import is answered from here with this status: an Amber without the import
   // API (404) or one with too many imports running (429). The page was still opened and read first.
   let importStubStatus = 0;
+  /** The JSON the stubbed import answers with (default: just a detail). */
+  let importStubBody: object | null = null;
   // The same for the text read-back of a snapshot: Amber "saved the page but cannot show it".
   let textStubStatus = 0;
   page.on("Fetch.requestPaused", (p) => {
@@ -478,7 +480,7 @@ async function main() {
           { name: "Content-Type", value: "application/json" },
           { name: "Access-Control-Allow-Origin", value: "*" },
         ],
-        body: Buffer.from(JSON.stringify({ detail: "stubbed by verify-newtab" })).toString("base64"),
+        body: Buffer.from(JSON.stringify(importStubBody ?? { detail: "stubbed by verify-newtab" })).toString("base64"),
       });
       return;
     }
@@ -1680,6 +1682,40 @@ async function main() {
             check(`After Capture with my browser, ${label}`, shown && hasRetry === retryShown, `${t} [${acts4.join(", ")}]`);
             if (status === 404) await shot(`22-capture-amber-needs-update-${theme}`);
           }
+          // 409: Amber already has a usable copy of the story (here: an archived article's id). That is a
+          // success: its text shows, the story is marked, no error, and no `force` is ever sent.
+          if (archivedFixture) {
+            await openStub(locked.title);
+            const before409 = importPosts;
+            importStubStatus = 409;
+            importStubBody = { detail: "already archived", id: archivedFixture.id };
+            await click(".reader-notice .ghost-btn", "Capture with my browser");
+            await waitFor(`document.querySelector(".reader-fetch")`, "fetching", 10_000);
+            const shown409 = await waitFor(
+              `document.querySelectorAll(".reader-body p").length > 3 || document.querySelector(".reader-notice")`,
+              "the 409 outcome",
+              60_000,
+            );
+            const out409 = await page.evaluate<any>(`({
+              paragraphs: document.querySelectorAll(".reader-body p").length,
+              notice: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+              marked: !!document.getElementById(${JSON.stringify(lockedRow)})?.querySelector(".row-amber"),
+            })`);
+            const sent409 = importBodies[importBodies.length - 1];
+            check(
+              "A 409 'already archived' is a success: the existing copy's text shows, the story is marked, no error, no force sent",
+              shown409 &&
+                out409.paragraphs > 3 &&
+                out409.notice === "" &&
+                out409.marked &&
+                importPosts === before409 + 1 &&
+                !!sent409 &&
+                !/"force"/.test(sent409.raw),
+              `${out409.paragraphs} paragraphs, notice "${out409.notice}", marker ${out409.marked}, ${importPosts - before409} import request(s)`,
+            );
+            importStubStatus = 0;
+            importStubBody = null;
+          }
           importStubStatus = 0;
           await page.send("Fetch.disable");
         }
@@ -2200,7 +2236,7 @@ export default function App() {
   const expected = (e: { phase: string; text: string }) =>
     (/status of 503/.test(e.text) && /latest/.test(e.phase)) || // the fixture "flaky" feed, on purpose
     (/status of 400/.test(e.text) && /save-invariant/.test(e.phase)) || // Amber refusing the uncapturable address
-    (/status of (404|413|429|500|503)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
+    (/status of (404|409|413|429|500|503)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
     (noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi));
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(

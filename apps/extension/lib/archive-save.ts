@@ -251,6 +251,8 @@ export interface ImportResult {
   usable: boolean;
   wordCount: number;
   title?: string;
+  /** Amber already had a usable copy (409): `id` is that copy, nothing was replaced. */
+  existing?: boolean;
 }
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
@@ -263,7 +265,8 @@ function wellFormed(text: string): string {
 /**
  * Hand Amber a page's HTML that this browser already loaded (signed in), so the
  * capture does not depend on Amber's own anonymous fetch. `POST /api/import`; the
- * new snapshot becomes the newest for `url`. `finalUrl` is where the page ended up
+ * new snapshot becomes the newest for `url`. A 409 means a usable copy exists
+ * already and is returned as `existing` (`force` is never sent). `finalUrl` is where the page ended up
  * after redirects; Amber resolves and validates it like `url` and answers 400 when
  * it is private. Throws `ArticleFetchError`.
  */
@@ -296,6 +299,11 @@ export async function importPage(
       wordCount: typeof reply.word_count === "number" ? reply.word_count : 0,
       title: typeof reply.title === "string" ? reply.title : undefined,
     };
+  }
+  // 409: a usable copy of this story (or of its final address) is already archived. An import never
+  // replaces a usable copy, so this is a success: the existing snapshot is what to read.
+  if (status === 409 && typeof reply?.id === "string") {
+    return { id: reply.id, usable: true, wordCount: 0, existing: true };
   }
   const detail = detailOf(reply);
   if (status === 400 && page.finalUrl && detail && /private|local|final_url/i.test(detail)) {

@@ -332,9 +332,41 @@ export async function importFromBrowser(
   const stage = (s: FetchStage) => {
     if (!signal?.aborted) onStatus?.(s);
   };
+  /** Read a snapshot that is in Amber. If that fails it is still saved: `saved-unreadable` carries its id. */
+  const readBack = async (id: string, created: boolean, known: { title?: string; wordCount: number }) => {
+    stage("reading");
+    try {
+      const { text, ...meta } = await readArticle(base, id, signal);
+      return { ok: true, id, text, meta, created } satisfies FullArticleResult;
+    } catch (err) {
+      if (signal?.aborted) return { ok: false, reason: "aborted" } satisfies FullArticleResult;
+      const host = hostOf(args.url);
+      const root = normalizeArchiveUrl(base) ?? base;
+      return {
+        ok: false,
+        reason: "saved-unreadable",
+        detail: err instanceof ArticleFetchError ? err.detail : undefined,
+        id,
+        meta: {
+          id,
+          title: known.title ?? args.title ?? host,
+          site: host,
+          savedAt: new Date().toISOString(),
+          wordCount: known.wordCount,
+          paywalled: false,
+          originalUrl: args.url,
+          permalink: `${root}/${id}`,
+        } satisfies ArchiveArticleMeta,
+      } satisfies FullArticleResult;
+    }
+  };
   try {
-    // A cheap, read-only look before a window opens: no point loading a page if Amber is not there.
-    await lookupArticle(base, args.url, signal);
+    // A cheap, read-only look before a window opens: no point loading a page if Amber is not there,
+    // and none if it already has a usable copy (an import never replaces one): read that instead.
+    const found = await lookupArticle(base, args.url, signal);
+    if (found.found && found.id && found.status === "complete" && found.usable) {
+      return await readBack(found.id, false, { title: found.title, wordCount: 0 });
+    }
 
     stage("browser-opening");
     const page = await captureWithBrowser(args.url, { signal });
@@ -349,32 +381,9 @@ export async function importFromBrowser(
     );
     // Amber has saved the page but found no article in it: the publisher showed this browser a prompt too.
     if (!imported.usable) return { ok: false, reason: "paywall-stub", id: imported.id };
-
-    stage("reading");
-    try {
-      const { text, ...meta } = await readArticle(base, imported.id, signal);
-      return { ok: true, id: imported.id, text, meta, created: true };
-    } catch (err) {
-      if (signal?.aborted) return { ok: false, reason: "aborted" };
-      const host = hostOf(args.url);
-      const root = normalizeArchiveUrl(base) ?? base;
-      return {
-        ok: false,
-        reason: "saved-unreadable",
-        detail: err instanceof ArticleFetchError ? err.detail : undefined,
-        id: imported.id,
-        meta: {
-          id: imported.id,
-          title: imported.title ?? args.title ?? host,
-          site: host,
-          savedAt: new Date().toISOString(),
-          wordCount: imported.wordCount,
-          paywalled: false,
-          originalUrl: args.url,
-          permalink: `${root}/${imported.id}`,
-        } satisfies ArchiveArticleMeta,
-      };
-    }
+    // `existing` is a 409: a usable copy was archived meanwhile (or under the page's final address) and
+    // nothing was stored. That copy is what to show; the story is marked like any other save.
+    return await readBack(imported.id, !imported.existing, { title: imported.title, wordCount: imported.wordCount });
   } catch (err) {
     if (err instanceof ArticleFetchError) return { ok: false, reason: err.reason, detail: err.detail, id: err.id };
     if (signal?.aborted) return { ok: false, reason: "aborted" };
