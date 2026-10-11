@@ -56,13 +56,21 @@ export function holdRemoteRefresh(hold: boolean): void {
 
 /** Own pushes not yet answered: a page-hide push can't know the stamp they are about to produce. */
 let unanswered = 0;
+/** Order in which pushes were issued: when a later push exists, an earlier one's answer must not change the list. */
+let pushSeq = 0;
 
 function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
+  const mine = ++pushSeq;
   const run = async (ifUpdatedAt?: null) => {
     unanswered++;
     try {
       const result = await publishSources(origin, sources, { keepalive, ifUpdatedAt });
-      if (result.status === "conflict") announce(result.sources, "conflict");
+      const latest = mine === pushSeq;
+      if (result.status === "conflict" && latest) announce(result.sources, "conflict");
+      // A conflict answered after a later push was sent has already stored the other device's list
+      // locally; the later push (which wins on Amber) must leave the local list equal to what it sent.
+      // A write from another device inside that window is knowingly overwritten.
+      if (result.status === "ok" && latest && pending === null) await saveSources(sources);
     } finally {
       unanswered--;
     }
