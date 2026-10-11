@@ -9,8 +9,15 @@ import {
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
-import { pushSources } from "@/lib/phone-sync";
-import { addFeedUrl, loadSources, mergeSeeded, saveSources, seedFromArchive } from "@/lib/sources";
+import { fetchRemoteSources, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
+import {
+  addFeedUrl,
+  isSourceBlocked,
+  loadSources,
+  mergeSeeded,
+  saveSources,
+  seedFromArchive,
+} from "@/lib/sources";
 import { loadSettings, saveSetting } from "@/lib/storage";
 
 type ArchiveCheck =
@@ -73,6 +80,7 @@ export function SettingsModal({
   onClose,
   onSave,
   canRebuild = true,
+  onSourcesAdopted,
 }: {
   initialPrompt: string;
   blockedSites: string[];
@@ -86,6 +94,8 @@ export function SettingsModal({
   onSave: (prompt: string, blockedSites: string[], rebuild: boolean) => void;
   /** False without an API key: there is nothing to rebuild with, so only "Save" is offered. */
   canRebuild?: boolean;
+  /** A Save found Amber holding a newer sources list (edited on the phone) and took it as the list. */
+  onSourcesAdopted?: () => void;
 }) {
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
@@ -108,16 +118,23 @@ export function SettingsModal({
   const [sourceCheck, setSourceCheck] = useState<ArchiveCheck>({ state: "idle" });
   /** Bumped when the modal goes away, so a late probe or re-seed doesn't touch a dead component. */
   const sourcesRequest = useRef(0);
+  /** The latest draft and dirty flag, for async work that finishes after the person has kept editing. */
+  const sourcesRef = useRef(sources);
+  sourcesRef.current = sources;
+  const sourcesDirtyRef = useRef(sourcesDirty);
+  sourcesDirtyRef.current = sourcesDirty;
+  /** Amber's stamp for the list that was adopted into the draft; the push on Save is conditional on it. */
+  const remoteStamp = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
     loadSources().then(
       (list) => {
-        if (!cancelled) setSources(list);
+        if (!cancelled) setSources((current) => current ?? list);
       },
       () => {
         if (cancelled) return;
-        setSources([]);
+        setSources((current) => current ?? []);
         setSourcesError("Couldn't read your saved sources. You can still add some below.");
       },
     );
@@ -140,6 +157,32 @@ export function SettingsModal({
       archiveRequest.current++;
     };
   }, []);
+
+  // The phone may have edited the list since this device last saw it. If Amber's stamp differs, its
+  // list goes into the draft (Save keeps it, Cancel drops it). Best-effort and silent when Amber is
+  // unreachable; a draft the person has already edited is left alone.
+  useEffect(() => {
+    if (!archiveLoaded) return;
+    const base = normalizeArchiveUrl(archiveUrl);
+    if (!base) return;
+    const controller = new AbortController();
+    void (async () => {
+      const remote = await fetchRemoteSources(base, controller.signal);
+      if (!remote?.updatedAt || controller.signal.aborted) return;
+      if (remote.updatedAt === (await loadSourcesStamp())) return;
+      if (controller.signal.aborted || sourcesDirtyRef.current) return;
+      remoteStamp.current = remote.updatedAt;
+      setSources(remote.sources);
+      setSourcesDirty(true);
+      setSourceCheck((current) =>
+        current.state === "testing"
+          ? current
+          : { state: "ok", message: "Updated from your phone. Click Save to keep it." },
+      );
+    })();
+    return () => controller.abort();
+    // Once, when the address has loaded: later edits to the field don't re-read.
+  }, [archiveLoaded]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -189,12 +232,20 @@ export function SettingsModal({
     archiveRequest.current++;
     // Written before the rebuild starts, so the build reads the new address.
     if (archiveLoaded) await saveSetting("archiveUrl", value);
-    if (sources && sourcesDirty) {
-      await saveSources(sources);
-      // The phone/web version reads the same list from Amber. Best-effort and never awaited.
-      if (value) void pushSources(value, sources);
+    const blockedNow = normalizeBlockList(blockedDraft.split("\n"));
+    if (sources && sourcesDirty) await saveSources(sources);
+    // The phone/web version reads the same list from Amber. Best-effort and never awaited. Sources on
+    // the blocked list are left out, so the phone never receives a publisher blocked here; a change to
+    // that list alone republishes for the same reason.
+    const blockedChanged = blockedNow.join("\n") !== normalizeBlockList(blockedSites).join("\n");
+    if (sources && value && (sourcesDirty || blockedChanged)) {
+      const shared = sources.filter((s) => !isSourceBlocked(s, blockedNow));
+      const condition = remoteStamp.current === undefined ? {} : { ifUpdatedAt: remoteStamp.current };
+      void publishSources(value, shared, condition).then((result) => {
+        if (result.status === "conflict") onSourcesAdopted?.();
+      });
     }
-    onSave(draft, normalizeBlockList(blockedDraft.split("\n")), rebuild && rebuildMeaningful);
+    onSave(draft, blockedNow, rebuild && rebuildMeaningful);
   };
 
   const statusClass =
@@ -219,7 +270,7 @@ export function SettingsModal({
     try {
       const found = await probeFeed(address);
       if (request !== sourcesRequest.current) return;
-      editSources(addFeedUrl(sources, found.feedUrl));
+      editSources(addFeedUrl(sourcesRef.current ?? sources, found.feedUrl));
       setFeedInput("");
       setSourceCheck({
         state: "ok",
@@ -242,7 +293,7 @@ export function SettingsModal({
     setSourceCheck({ state: "testing" });
     const seeded = await seedFromArchive(value);
     if (request !== sourcesRequest.current) return;
-    const { sources: merged, added } = mergeSeeded(sources, seeded.sources);
+    const { sources: merged, added } = mergeSeeded(sourcesRef.current ?? sources, seeded.sources);
     if (added.length > 0) editSources(merged);
     const skipped = seeded.skipped.length
       ? ` No known feed for ${seeded.skipped.slice(0, 4).join(", ")}${seeded.skipped.length > 4 ? ` and ${seeded.skipped.length - 4} more` : ""}; add their feed addresses above.`

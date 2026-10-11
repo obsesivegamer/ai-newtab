@@ -1,4 +1,4 @@
-import { hostOf, normalizeArchiveUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
+import { anySignal, hostOf, normalizeArchiveUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
 import { createArchiveBridge } from "./archive";
 
 /**
@@ -141,7 +141,7 @@ async function call(
       headers:
         init.body === undefined && init.rawBody === undefined ? undefined : { "Content-Type": "application/json" },
       body: init.rawBody ?? (init.body === undefined ? undefined : JSON.stringify(init.body)),
-      signal: init.signal ? AbortSignal.any([timeout, init.signal]) : timeout,
+      signal: init.signal ? anySignal([timeout, init.signal]) : timeout,
     });
   } catch (err) {
     if (init.signal?.aborted) throw new ArticleFetchError("aborted");

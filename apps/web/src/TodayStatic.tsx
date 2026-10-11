@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchHomepage, type HomepageFetch } from "@/lib/phone-sync";
 import { toRenderable } from "@/lib/transpile";
 import { HomepagePreview } from "@newtab/components/HomepagePreview";
@@ -27,11 +27,22 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
   const [state, setState] = useState<State>({ status: "loading" });
   const [code, setCode] = useState<string | null>(null);
   const [loadedAt, setLoadedAt] = useState(0);
+  /** The last refresh failed while a good page was showing; the page stays, with a note. */
+  const [staleNote, setStaleNote] = useState(false);
+  const showingGood = useRef(false);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
       const result = await fetchHomepage(origin, signal);
       if (signal?.aborted) return;
+      setLoadedAt(Date.now());
+      if (result.status === "error" && showingGood.current) {
+        // Only the first load shows "Couldn't reach Amber": after that, the last good copy stays.
+        setStaleNote(true);
+        return;
+      }
+      setStaleNote(false);
+      showingGood.current = result.status === "ok";
       if (result.status === "ok") {
         setCode((previous) => {
           const next = toRenderable(result.homepage.code);
@@ -39,7 +50,6 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
         });
       }
       setState(result);
-      setLoadedAt(Date.now());
     },
     [origin],
   );
@@ -73,6 +83,11 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
             Refresh
           </button>
         </div>
+        {staleNote && (
+          <p className="meta today-note" role="status">
+            Couldn’t refresh — showing the last copy
+          </p>
+        )}
         <div className="today-frame">
           <HomepagePreview code={code} />
         </div>

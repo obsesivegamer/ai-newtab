@@ -173,10 +173,19 @@ def run() -> None:
                 self.requests: list[tuple[str, str]] = []  # (method, url)
                 self.responses: list[tuple[int, str]] = []
                 self.console_errors: list[str] = []
-                self.page.on("request", lambda r: self.requests.append((r.method, r.url)))
+                self.put_bodies: list[dict] = []  # JSON bodies of PUT /api/sources, in order
+                self.page.on("request", self._request)
                 self.page.on("response", lambda r: self.responses.append((r.status, r.url)))
                 self.page.on("console", self._console)
                 self.page.on("pageerror", lambda e: self.console_errors.append(f"pageerror: {e}"))
+
+            def _request(self, r) -> None:
+                self.requests.append((r.method, r.url))
+                if r.method == "PUT" and r.url.endswith("/api/sources"):
+                    try:
+                        self.put_bodies.append(json.loads(r.post_data or "{}"))
+                    except ValueError:
+                        self.put_bodies.append({})
 
             def _console(self, m) -> None:
                 if m.type != "error":
@@ -184,7 +193,11 @@ def run() -> None:
                 url = (m.location or {}).get("url", "")
                 # Browsers log every non-2xx fetch as a console error. Expected here: "nothing stored
                 # yet" answers, and a live publisher's feed being slow or down (the proxy's 5xx).
-                if any(url.endswith(x) for x in EXPECTED_404) and "404" in m.text:
+                # (also a 409 from the sources precondition, a stubbed 503, and an aborted request in the
+                # failure checks below: the browser logs each of those as a console error)
+                if any(url.endswith(x) for x in EXPECTED_404) and (
+                    "404" in m.text or "409" in m.text or "Failed to load resource" in m.text
+                ):
                     return
                 if "/api/feedproxy" in url:
                     return
@@ -430,6 +443,45 @@ def run() -> None:
                 check("Amber holds the edit", row is not None and row["enabled"] is False, f"{code} {name}")
                 switch.tap()  # back on
                 pg.wait_for_timeout(1800)
+                check("the first PUT carries no precondition (nothing seen from Amber yet)",
+                      "if_updated_at" not in s.put_bodies[0], json.dumps(s.put_bodies[0])[:80])
+                code, body = http("GET", "/api/sources")
+                seen_stamp = json.loads(body)["updated_at"]
+                check("a later PUT sends the stamp it last saw as if_updated_at",
+                      isinstance(s.put_bodies[-1].get("if_updated_at"), str) and len(s.put_bodies) >= 2,
+                      json.dumps({k: v for k, v in s.put_bodies[-1].items() if k != "sources"}))
+
+                # a toggle still waiting out the 800 ms debounce is sent when the page is hidden
+                puts_before = len(s.put_bodies)
+                switch.tap()
+                pg.evaluate("window.dispatchEvent(new Event('pagehide'))")
+                pg.wait_for_timeout(350)
+                check("a pending toggle is flushed on pagehide, before the debounce",
+                      len(s.put_bodies) - puts_before == 1, str(len(s.put_bodies) - puts_before))
+                check("that flush carries the stamp Amber had", s.put_bodies[-1].get("if_updated_at") == seen_stamp,
+                      json.dumps({k: v for k, v in s.put_bodies[-1].items() if k != "sources"}))
+                code, body = http("GET", "/api/sources")
+                row = next((x for x in json.loads(body)["sources"] if x["name"] == name), None)
+                check("Amber holds the toggle that was flushed on pagehide", row is not None and row["enabled"] is False)
+                pg.wait_for_timeout(1200)
+                check("the flushed edit is not sent a second time by the debounce timer",
+                      len(s.put_bodies) - puts_before == 1, str(len(s.put_bodies) - puts_before))
+                # the same when the page goes to the background (visibilitychange -> hidden)
+                switch.tap()  # back on
+                pg.evaluate(
+                    """() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true});
+                               document.dispatchEvent(new Event('visibilitychange')); }""")
+                pg.wait_for_timeout(350)
+                check("a pending toggle is flushed when the page is hidden",
+                      len(s.put_bodies) - puts_before == 2, str(len(s.put_bodies) - puts_before))
+                pg.evaluate(
+                    """() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => false});
+                              document.dispatchEvent(new Event('visibilitychange')); }""")
+                pg.wait_for_timeout(1500)
+                code, body = http("GET", "/api/sources")
+                row = next((x for x in json.loads(body)["sources"] if x["name"] == name), None)
+                check("Amber holds the second flushed edit (back on)", row is not None and row["enabled"] is True)
+
                 # add a feed through the proxy (probe)
                 feed = "https://www.theguardian.com/uk/technology/rss"
                 pg.locator(".src-add input").fill(feed)
@@ -445,6 +497,66 @@ def run() -> None:
                 pg.get_by_role("button", name="Re-seed from my archive").tap()
                 pg.wait_for_timeout(2500)
                 s.shot(f"10-settings-reseed-{theme}.png")
+
+                # ---- stale write: another device wrote first -> 409 -> the phone adopts Amber's list ----
+                def amber_sources() -> dict:
+                    return json.loads(http("GET", "/api/sources")[1])
+
+                def mac_edit(marker_id: str, marker_name: str) -> dict:
+                    """What the extension does: PUT the list with one more (switched off) source, unconditionally."""
+                    time.sleep(1.2)  # Amber's stamps have a one-second resolution
+                    mine = amber_sources()["sources"]
+                    mine.append({"id": marker_id, "name": marker_name,
+                                 "feedUrls": ["https://example.org/feed.xml"], "enabled": False})
+                    code_, body_ = http("PUT", "/api/sources", {"sources": mine})
+                    assert code_ == 200, code_
+                    return json.loads(body_)
+
+                before_names = [x["name"] for x in amber_sources()["sources"]]
+                mac = mac_edit("verify-mac-edit", "Verify Mac Edit")
+                n_puts = len(s.put_bodies)
+                pg.locator(".modal-body").evaluate("e => e.scrollTo(0, 0)")
+                toggled = pg.locator(".src-row .src-name").first.inner_text()
+                pg.locator(".src-row .switch").first.tap()
+                pg.wait_for_timeout(2200)
+                check("a stale edit is sent once, with the stamp the phone had",
+                      len(s.put_bodies) - n_puts == 1 and s.put_bodies[-1].get("if_updated_at") not in (None, mac["updated_at"]),
+                      json.dumps({k: v for k, v in s.put_bodies[-1].items() if k != "sources"}))
+                check("Amber answered that PUT with 409",
+                      any(st == 409 and u.endswith("/api/sources") for st, u in s.responses))
+                names = pg.locator(".src-row .src-name").all_inner_texts()
+                check("the phone adopted the list Amber returned (Mac's added source shows)",
+                      "Verify Mac Edit" in names and names[:-1] == before_names, str(names[-3:]))
+                note = pg.locator(".sync-note")
+                check("a short note says the list was updated from another device",
+                      note.count() == 1 and "Updated from another device" in note.inner_text())
+                check("the note takes no taps (pointer-events: none)",
+                      pg.evaluate("getComputedStyle(document.querySelector('.sync-note')).pointerEvents") == "none")
+                s.shot(f"10b-settings-409-adopted-{theme}.png")
+                held = amber_sources()
+                mine = next((x for x in held["sources"] if x["name"] == toggled), None)
+                check("Amber still holds the Mac's write, not the stale phone edit",
+                      held["updated_at"] == mac["updated_at"] and mine is not None and mine["enabled"] is True,
+                      f"{held['updated_at']} vs {mac['updated_at']}")
+                n_puts = len(s.put_bodies)
+                pg.wait_for_timeout(1200)
+                check("no retry loop after a 409", len(s.put_bodies) == n_puts)
+                pg.wait_for_timeout(4000)
+                check("the note clears itself", pg.locator(".sync-note").count() == 0)
+
+                # a Mac edit is picked up when the page comes back to the foreground (Settings open)
+                mac_edit("verify-mac-edit-2", "Verify Mac Edit Two")
+                pg.evaluate(
+                    """() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true});
+                               document.dispatchEvent(new Event('visibilitychange'));
+                               Object.defineProperty(document, 'hidden', {configurable: true, get: () => false});
+                               document.dispatchEvent(new Event('visibilitychange')); }""")
+                pg.wait_for_timeout(1500)
+                names = pg.locator(".src-row .src-name").all_inner_texts()
+                check("coming back to the page re-reads Amber's list", "Verify Mac Edit Two" in names, str(names[-3:]))
+                n_puts = len(s.put_bodies)
+                pg.wait_for_timeout(1000)
+                check("adopting a refresh sends nothing back", len(s.put_bodies) == n_puts)
             pg.get_by_role("button", name="Done").tap()
             pg.locator(".modal").wait_for(state="detached")
 
@@ -461,6 +573,33 @@ def run() -> None:
             if first:
                 check("sources survive a reload from Amber (disabled/added state intact)",
                       http("GET", "/api/sources")[0] == 200)
+                # opening Settings re-reads Amber's list
+                time.sleep(1.2)
+                held = json.loads(http("GET", "/api/sources")[1])["sources"]
+                held.append({"id": "verify-mac-edit-3", "name": "Verify Mac Edit Three",
+                             "feedUrls": ["https://example.org/feed.xml"], "enabled": False})
+                http("PUT", "/api/sources", {"sources": held})
+                pg.get_by_role("button", name="Settings").tap()
+                pg.locator(".modal").wait_for()
+                pg.wait_for_timeout(1500)
+                check("opening Settings adopts a list Amber changed meanwhile",
+                      "Verify Mac Edit Three" in pg.locator(".src-row .src-name").all_inner_texts())
+                pg.get_by_role("button", name="Done").tap()
+                pg.locator(".modal").wait_for(state="detached")
+                # a failed boot read never wipes what the phone already has
+                n_puts = len(s.put_bodies)
+                pg.route("**/api/sources", lambda route: route.abort() if route.request.method == "GET" else route.continue_())
+                pg.reload(wait_until="networkidle")
+                pg.get_by_role("button", name="Settings").tap()
+                pg.locator(".modal").wait_for()
+                pg.wait_for_timeout(1000)
+                kept = pg.locator(".src-row .src-name").all_inner_texts()
+                check("with Amber's list unreadable at boot, the local list stays (nothing wiped)",
+                      len(kept) >= 3 and "Verify Mac Edit Three" in kept, str(kept[-3:]))
+                check("an unreadable boot read sends nothing", len(s.put_bodies) == n_puts)
+                pg.get_by_role("button", name="Done").tap()
+                pg.locator(".modal").wait_for(state="detached")
+                pg.unroute("**/api/sources")
                 # Today: empty state first
                 pg.get_by_role("button", name="Today").tap()
                 pg.get_by_text("No Today page yet.").wait_for(timeout=10_000)
@@ -502,6 +641,27 @@ def run() -> None:
         check("Today renders in the sandboxed Sandpack frame", frame is not None and frame.locator("body *").count() > 5)
         pg.wait_for_timeout(1500)
         s.shot("12-today-dark.png")
+
+        # A refresh that fails while a good page is showing keeps that page, with a note.
+        pg.route("**/api/homepage", lambda route: route.fulfill(status=503, body="down"))
+        pg.evaluate(
+            """() => { window.__realNow = Date.now; Date.now = () => window.__realNow() + 6 * 60_000;
+                       Object.defineProperty(document, 'hidden', {configurable: true, get: () => true});
+                       document.dispatchEvent(new Event('visibilitychange'));
+                       Object.defineProperty(document, 'hidden', {configurable: true, get: () => false});
+                       document.dispatchEvent(new Event('visibilitychange')); }""")
+        pg.wait_for_timeout(1500)
+        check("a failed background refresh shows a small note",
+              pg.locator(".today-note").count() == 1 and "showing the last copy" in pg.locator(".today-note").inner_text())
+        check("...and keeps the last good page (frame still there, no error screen)",
+              pg.locator(".today-frame iframe").count() >= 1 and pg.get_by_text("Couldn’t reach Amber.").count() == 0)
+        s.shot("12b-today-refresh-failed.png")
+        s.overflow("Today (refresh failed)")
+        pg.unroute("**/api/homepage")
+        pg.locator(".today-strip button").tap()
+        pg.wait_for_timeout(1500)
+        check("a successful refresh clears the note", pg.locator(".today-note").count() == 0)
+        pg.evaluate("() => { Date.now = window.__realNow; }")  # real clock again for the rest of the page
         s.overflow("Today")
         s.small_targets("Today strip and tabs", ".web-tabbar")
 
@@ -582,6 +742,35 @@ def run() -> None:
             s.page.wait_for_timeout(500)
         s.page.wait_for_timeout(1500)
         s.shot("12-today-light.png")
+        s.close()
+
+        # ---- Today when Amber can't be reached on the first load: the full error state -----------
+        print("\n== Today, first load fails ==")
+        s = Session("dark")
+        s.page.route("**/api/homepage", lambda route: route.abort())
+        s.page.goto(APP, wait_until="networkidle")
+        s.page.get_by_role("button", name="Today").tap()
+        s.page.get_by_text("Couldn’t reach Amber.").wait_for(timeout=15_000)
+        check("an initial load that fails shows 'Couldn’t reach Amber.'", True)
+        check("...with no 'showing the last copy' note", s.page.locator(".today-note").count() == 0)
+        s.shot("12c-today-first-load-failed.png")
+        s.close()
+
+        # ---- iOS < 17.4 has no AbortSignal.any: the app must still load everything ---------------
+        print("\n== no AbortSignal.any ==")
+        s = Session("dark")
+        s.page.add_init_script("delete AbortSignal.any;")
+        s.page.goto(APP, wait_until="networkidle")
+        check("the init script removed AbortSignal.any", s.page.evaluate("typeof AbortSignal.any") == "undefined")
+        s.page.locator(".view-latest button.row").first.wait_for(timeout=60_000)
+        check("Latest loads without AbortSignal.any", s.page.locator(".view-latest button.row").count() > 0)
+        s.page.get_by_role("button", name="Library").tap()
+        s.page.locator(".view-library button.row").first.wait_for(timeout=20_000)
+        check("Library loads without AbortSignal.any", s.page.locator(".view-library button.row").count() > 0)
+        s.page.get_by_role("button", name="Today").tap()
+        s.page.locator(".today-strip").wait_for(timeout=20_000)
+        check("Today loads without AbortSignal.any", s.page.locator(".today-frame").count() == 1)
+        check("no console errors (no AbortSignal.any)", not s.console_errors, "; ".join(s.console_errors[:3]))
         s.close()
 
         # ---- sizes: no overflow at 375, 390 and 430 ----------------------------------------------

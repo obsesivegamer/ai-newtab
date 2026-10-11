@@ -80,6 +80,8 @@ if (!Number.isInteger(AMBER_PORT) || AMBER_PORT < 1024 || AMBER_PORT > 65535 || 
 }
 const AMBER = `http://127.0.0.1:${AMBER_PORT}`;
 const FIXTURE_HOST = "verify-fixture.example";
+/** A tailnet-style name (only this Chrome resolves it, to the fixture): the one kind of non-IP name that may be shared with. */
+const SHARE_HOST = "verify-share.ts.net";
 const CAPTURE_HOST = "example.org";
 
 // ---------------------------------------------------------------------------
@@ -307,7 +309,7 @@ async function main() {
       // public-looking name that only this Chrome resolves (to the fixture server on 127.0.0.1).
       // example.org is where the "Capture with my browser" fixture stories live: Amber must see a public
       // name it can resolve (it validates the address of an import), while this Chrome loads it from here.
-      `--host-resolver-rules=MAP ${FIXTURE_HOST} 127.0.0.1, MAP ${CAPTURE_HOST} 127.0.0.1`,
+      `--host-resolver-rules=MAP ${FIXTURE_HOST} 127.0.0.1, MAP ${CAPTURE_HOST} 127.0.0.1, MAP ${SHARE_HOST} 127.0.0.1`,
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${profileDir}`,
       "about:blank",
@@ -414,7 +416,11 @@ async function main() {
     }
   });
   page.on("Log.entryAdded", (p) => {
-    if (p.entry?.level === "error") consoleErrors.push({ phase, text: p.entry.text });
+    if (p.entry?.level !== "error") return;
+    // Settings reads Amber's shared sources list when it opens: a 404 means "none stored yet", a 409 is the
+    // precondition refusing a stale write. The browser logs both as errors; they are the designed answers.
+    if (/\/api\/sources$/.test(p.entry.url ?? "") && /status of (404|409)\b/.test(p.entry.text ?? "")) return;
+    consoleErrors.push({ phase, text: p.entry.text });
   });
 
   // Requests the page makes to anything but Amber and itself (feeds, mostly), while `collect` is set.
@@ -688,6 +694,10 @@ async function main() {
   const hits = new Map<string, number>();
   const hitsTo = (host: string, path = "") =>
     [...hits].filter(([k]) => k.startsWith(`${host}${path}`)).reduce((n, [, v]) => n + v, 0);
+  /** PUT requests only, by Host and path: what the extension tried to publish. */
+  const putHits = new Map<string, number>();
+  const putsTo = (host: string, path = "") =>
+    [...putHits].filter(([k]) => k.startsWith(`${host}${path}`)).reduce((n, [, v]) => n + v, 0);
   /** The "flaky" feed answers 503 until this is set. */
   let flakyUp = false;
   const flakyXml = () => {
@@ -703,6 +713,7 @@ async function main() {
       const url = new URL(req.url);
       const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
       hits.set(`${host}${url.pathname}`, (hits.get(`${host}${url.pathname}`) ?? 0) + 1);
+      if (req.method === "PUT") putHits.set(`${host}${url.pathname}`, (putHits.get(`${host}${url.pathname}`) ?? 0) + 1);
       const xml = { headers: { "content-type": "application/rss+xml" } };
       if (url.pathname === "/sso/login") {
         return new Response(loginPage, { headers: { "content-type": "text/html; charset=utf-8" } });
@@ -2150,6 +2161,156 @@ export default function App() {
       await key("Escape");
       await waitFor(`!document.querySelector(".modal")`, "settings to close");
       await page.evaluate(`chrome.storage.local.remove("systemPrompt")`);
+
+      // Sharing the sources list with the phone through Amber: stamp, adoption on open, 409, blocked
+      // publishers left out, and only to local / private / tailnet hosts.
+      phase = "settings-sync";
+      {
+        const jsonHeaders = { "content-type": "application/json" };
+        const probe = await fetch(`${AMBER}/api/sources`).catch(() => null);
+        const probeBody: any = probe ? await probe.json().catch(() => ({})) : {};
+        const supported = !!probe && (probe.status === 200 || (probe.status === 404 && /no sources/i.test(String(probeBody.detail))));
+        if (!supported) {
+          console.log("  (this Amber has no /api/sources: the phone-sync checks are skipped)");
+        } else {
+          const putAmber = async (sources: any[]) => {
+            const r = await fetch(`${AMBER}/api/sources`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ sources }) });
+            return (await r.json()) as { updated_at: string };
+          };
+          const amberNow = async () => (await (await fetch(`${AMBER}/api/sources`)).json()) as { sources: any[]; updated_at: string };
+          const names = (list: any[]) => list.map((x) => x.name);
+          const store = (keys: string[]) => page.evaluate<any>(`chrome.storage.local.get(${JSON.stringify(keys)})`);
+          const before = await store(["sources", "blockedSites", "archiveUrl"]);
+          const base: any[] = before.sources ?? [];
+          const BLOCKED_HOST = "blocked.verify-sync.example";
+          const phoneEdit = { id: "verify-phone-edit", name: "Verify Phone Edit", feedUrls: ["https://example.org/feed.xml"], enabled: false };
+          const blockedSource = { id: "verify-blocked", name: "Verify Blocked", feedUrls: [`https://${BLOCKED_HOST}/feed.xml`], enabled: false };
+          const openSettings = async () => {
+            await click(".topbar button", "Settings");
+            await waitFor(`document.querySelector(".modal")`, "settings modal");
+            await waitFor(`document.querySelector("#set-archive") && !document.querySelector("#set-archive").disabled`, "archive field");
+          };
+          const closeSettings = async () => {
+            await waitFor(`!document.querySelector(".modal")`, "settings to close");
+            await sleep(300);
+          };
+          const listText = () => page.evaluate<string>(`document.querySelector(".modal .src-list")?.innerText || ""`);
+
+          // 1. the phone wrote since this device last looked: Settings adopts its list into the draft
+          await page.evaluate(`chrome.storage.local.remove("sourcesSyncStamp")`);
+          await setStorage({ sources: base });
+          const firstStamp = (await putAmber([...base, phoneEdit])).updated_at;
+          await load();
+          await openSettings();
+          const adopted = await waitFor(`/Verify Phone Edit/.test(document.querySelector(".modal .src-list")?.innerText || "")`, "the phone's list in the draft", 8000);
+          check("Settings adopts a list the phone changed, into the draft", adopted);
+          const adoptedNote = await text(".modal .src-add + .set-test .set-status");
+          check('...and says "Updated from your phone"', /Updated from your phone/.test(adoptedNote), adoptedNote.slice(0, 80));
+          await shot("25-settings-updated-from-phone");
+          await key("Escape");
+          await closeSettings();
+          const afterCancel = await store(["sources", "sourcesSyncStamp"]);
+          check(
+            "Cancel leaves the stored list and stamp as they were",
+            !names(afterCancel.sources ?? []).includes("Verify Phone Edit") && afterCancel.sourcesSyncStamp === undefined,
+            `stamp ${afterCancel.sourcesSyncStamp}`,
+          );
+
+          // 2. Save keeps it, conditional on the stamp that was adopted; the stamp is remembered
+          await openSettings();
+          await waitFor(`/Verify Phone Edit/.test(document.querySelector(".modal .src-list")?.innerText || "")`, "the phone's list again", 8000);
+          await click(".modal-foot button", "Save");
+          await closeSettings();
+          await sleep(1200);
+          const afterSave = await store(["sources", "sourcesSyncStamp"]);
+          const held = await amberNow();
+          check("Save keeps the adopted list", names(afterSave.sources ?? []).includes("Verify Phone Edit"));
+          check(
+            "the push after Save succeeded and its stamp is remembered",
+            typeof afterSave.sourcesSyncStamp === "string" && afterSave.sourcesSyncStamp === held.updated_at && held.updated_at >= firstStamp,
+            `${afterSave.sourcesSyncStamp} vs ${held.updated_at}`,
+          );
+
+          // 3. a source whose publisher is on the blocked list never goes to the phone
+          await setStorage({ sources: [...(afterSave.sources ?? []), blockedSource], blockedSites: [BLOCKED_HOST] });
+          await load();
+          await openSettings();
+          await sleep(800); // the open-time read finds nothing newer
+          await click(".src-row .switch");
+          await sleep(150);
+          await click(".modal-foot button", "Save");
+          await closeSettings();
+          await sleep(1200);
+          const withBlocked = await store(["sources"]);
+          const sharedNow = await amberNow();
+          check("the blocked publisher stays in this device's list", names(withBlocked.sources ?? []).includes("Verify Blocked"));
+          check(
+            "...but Amber (so the phone) never receives it",
+            !names(sharedNow.sources).includes("Verify Blocked") && sharedNow.sources.length === (withBlocked.sources ?? []).length - 1,
+            `${sharedNow.sources.length} shared vs ${(withBlocked.sources ?? []).length} local`,
+          );
+
+          // 4. someone else wrote between opening Settings and Save: 409, their list is adopted, one note, no loop
+          await setStorage({ sources: sharedNow.sources, blockedSites: before.blockedSites ?? [] });
+          await load();
+          await openSettings();
+          await sleep(800);
+          await sleep(1200);
+          const phoneEdit2 = { ...phoneEdit, id: "verify-phone-edit-2", name: "Verify Phone Edit Two" };
+          const theirs = await putAmber([...sharedNow.sources, phoneEdit2]);
+          await click(".src-row .switch");
+          await sleep(150);
+          await click(".modal-foot button", "Save");
+          await closeSettings();
+          const noted = await waitFor(`/Updated from your phone/.test(document.querySelector(".sync-note")?.textContent || "")`, "the sync note", 8000);
+          check('a stale Save is answered by a note: "Updated from your phone"', noted);
+          await shot("26-sync-note-after-409");
+          await sleep(800);
+          const afterConflict = await store(["sources", "sourcesSyncStamp"]);
+          const heldAfter = await amberNow();
+          check(
+            "the newer list was adopted into storage, with its stamp",
+            names(afterConflict.sources ?? []).includes("Verify Phone Edit Two") && afterConflict.sourcesSyncStamp === theirs.updated_at,
+            `stamp ${afterConflict.sourcesSyncStamp} vs ${theirs.updated_at}`,
+          );
+          check("Amber still holds the other device's write (nothing was overwritten, no retry)", heldAfter.updated_at === theirs.updated_at);
+
+          // 5. only to local, private-network or tailnet hosts
+          const sourcesHits = () => putsTo(FIXTURE_HOST, "/api/sources");
+          const shareHits = () => putsTo(SHARE_HOST, "/api/sources");
+          const editAndSave = async () => {
+            await load();
+            await openSettings();
+            await sleep(600);
+            await click(".src-row .switch");
+            await sleep(150);
+            await click(".modal-foot button", "Save");
+            await closeSettings();
+            await sleep(1200);
+          };
+          const hitsBefore = { public: sourcesHits(), share: shareHits() };
+          await setStorage({ archiveUrl: `http://${FIXTURE_HOST}:${fixtureServer!.port}` });
+          await editAndSave();
+          check(
+            "a public archive address is never sent the sources list",
+            sourcesHits() - hitsBefore.public === 0,
+            `${sourcesHits() - hitsBefore.public} PUT(s) to ${FIXTURE_HOST}`,
+          );
+          await setStorage({ archiveUrl: `http://${SHARE_HOST}:${fixtureServer!.port}` });
+          await editAndSave();
+          check(
+            "a *.ts.net archive address is (positive control)",
+            shareHits() - hitsBefore.share === 1,
+            `${shareHits() - hitsBefore.share} PUT(s) to ${SHARE_HOST}`,
+          );
+
+          // put everything back
+          await setStorage({ sources: base, archiveUrl: before.archiveUrl ?? AMBER });
+          await page.evaluate(`chrome.storage.local.remove(["sourcesSyncStamp"${before.blockedSites ? "" : ', "blockedSites"'}])`);
+          if (before.blockedSites) await setStorage({ blockedSites: before.blockedSites });
+          await load();
+        }
+      }
 
       // open-article obeys the same gate: visible Today tab, no Reader open, from the frame only.
       if (archivedFixture) {

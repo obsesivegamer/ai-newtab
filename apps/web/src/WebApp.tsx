@@ -4,12 +4,14 @@ import { loadSettings } from "@/lib/storage";
 import { Latest } from "@newtab/components/Latest";
 import { Library } from "@newtab/components/Library";
 import { Reader } from "@newtab/components/Reader";
+import { SyncNote } from "@newtab/components/SyncNote";
 import { ThemeToggle } from "@newtab/components/ThemeToggle";
 import { ViewTabs, type View } from "@newtab/components/ViewTabs";
 import { articleKey, entryFromArchive, type ReaderEntry } from "@newtab/readerEntry";
 import { useTheme } from "@newtab/uiPrefs";
 import { useArchiveList } from "@newtab/useArchiveList";
 import { useHomepageOpen } from "@newtab/useHomepageOpen";
+import { onSourcesAdopted } from "./sync";
 import { TodayStatic } from "./TodayStatic";
 import { WebSettings } from "./WebSettings";
 
@@ -32,6 +34,8 @@ export default function WebApp() {
   const [blockedSites, setBlockedSites] = useState<string[]>(DEFAULT_BLOCKED_SITES);
   const [showSettings, setShowSettings] = useState(false);
   const [sourcesRev, setSourcesRev] = useState(0);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
+  const clearSyncNote = useCallback(() => setSyncNote(null), []);
   const [reader, setReader] = useState<{ entry: ReaderEntry; list: ReaderEntry[]; origin: ReaderOrigin } | null>(null);
   const [cursorId, setCursorId] = useState<string | null>(null);
   const [latestCursor, setLatestCursor] = useState<string | null>(null);
@@ -41,6 +45,16 @@ export default function WebApp() {
   useEffect(() => {
     void loadSettings().then((s) => setBlockedSites(s.blockedSites));
   }, []);
+
+  // Another device (the Mac) changed the sources: Latest reads the new list, and a line says so.
+  useEffect(
+    () =>
+      onSourcesAdopted(() => {
+        setSourcesRev((n) => n + 1);
+        setSyncNote("Updated from another device");
+      }),
+    [],
+  );
 
   useEffect(() => {
     document.title = TITLES[view];
@@ -206,6 +220,7 @@ export default function WebApp() {
           }}
         />
       )}
+      <SyncNote message={syncNote} onDone={clearSyncNote} />
     </div>
   );
 }

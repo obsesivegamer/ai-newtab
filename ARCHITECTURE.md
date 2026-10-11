@@ -288,8 +288,40 @@ is best-effort and never blocks a build or a settings save):
 
 | Endpoint | Written by | Read by | Shape |
 |---|---|---|---|
-| `PUT /api/homepage` | the worker, after each successful build, when an archive address is configured (`pushHomepage`) | web Today (`GET`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`) |
-| `PUT /api/sources` | Settings → Sources → Save in the extension; the web Settings on every edit, debounced 800 ms (`pushSources`) | web on load (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }] }`, answered with `updated_at` |
+| `PUT /api/homepage` | the worker, after each successful build, when the archive address is a shareable host (`pushHomepage`) | web Today (`GET`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`) |
+| `PUT /api/sources` | Settings → Sources → Save in the extension (or a change to the blocked-sites list), when the archive address is a shareable host; the web Settings on every edit, debounced 800 ms (`publishSources`) | web on load, when Settings opens and when the page is shown again; the extension when its Settings opens (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }], if_updated_at? }`, answered with `{ count, updated_at }` |
+
+**Who may receive them.** Both pushes go through one check in `phone-sync.ts`
+(`isShareableArchiveHost`): the archive host must be loopback (`localhost`,
+`127.0.0.0/8`, `[::1]`), private IPv4 (`10/8`, `172.16/12`, `192.168/16`),
+Tailscale's CGNAT range (`100.64.0.0/10`) or a `*.ts.net` / `*.local` name. Otherwise
+nothing is sent (a console warning names the host). Reading is not limited, and the web
+app, which only ever talks to the Amber that served it, is exempt (`IS_WEB`).
+The extension also drops every source that `isSourceBlocked` reports against its own
+current blocked list before publishing, so the phone never receives a blocked publisher.
+
+**Source sync is optimistic.** Amber's list carries `updated_at` (one-second
+resolution). Each device keeps the stamp it last saw (`KEYS.sourcesSyncStamp`: chrome
+storage in the extension, `localStorage` through the shim on the phone) and sends it as
+`if_updated_at`; Amber writes only if its stamp is that value and otherwise answers
+`409 { detail, updated_at, sources }` without writing. `publishSources` then adopts the
+returned list and stamp into storage, reports `conflict`, and does not retry. A first
+push (no stamp) is unconditional, and so is a PUT without the field (last write wins).
+Everything is best-effort: a failed read or write is silent and never clears a list.
+
+- Phone (`src/sync.ts`): the boot read adopts Amber's list and stamp (a failed read
+  leaves the local list alone); `refreshRemoteSources` re-reads when Settings opens and
+  when the page becomes visible again, unless a feed probe is running or an edit is
+  pending; a conflict or refresh that changes the list announces it, and `WebApp` shows
+  the shared `SyncNote` ("Updated from another device") and reloads Latest. A pending
+  debounced edit is flushed on `pagehide` and when the page becomes hidden, with
+  `fetch(..., { keepalive: true })`. Pushes otherwise run one at a time so a second never
+  carries a stamp the first is about to replace.
+- Extension (`SettingsModal`): when it opens it reads `/api/sources`; if Amber's stamp
+  differs from the stored one and the draft is untouched, the list goes into the draft
+  with "Updated from your phone" (Save keeps it, Cancel drops it). Save sends the stamp
+  it adopted, or the stored one; a 409 stores Amber's list and stamp and `App` shows
+  the same `SyncNote` ("Updated from your phone").
 
 Other web-specific behaviour:
 
@@ -324,6 +356,7 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   prompt.ts               system prompt + per-build kickoff message
   schemas.ts              custom tool input schemas (getFeeds, getArchive, getArchiveArticles, getHistory, getPageHtml) and defaults
   history-digest.ts       narrows raw history to fit a tool result
+  abort.ts                anySignal: AbortSignal.any with a fallback for Safari < 17.4 (iPhone), used wherever a timeout is combined with a caller's signal
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
   link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the feed parser
   feeds.ts                parseFeed (RSS, Atom, RDF and Google News sitemaps), fetchSourceFeeds, mergeSourceFetches, createFeedBridge,
@@ -354,7 +387,7 @@ apps/extension/           MV3 extension (WXT + React)
     protocol.ts           page ↔ worker messages and the five UI build steps
     auto-rebuild.ts       when to rebuild on a schedule
     storage.ts            chrome.storage keys, settings (incl. archiveUrl), saved homepage
-    phone-sync.ts         PUT/GET /api/homepage and /api/sources: what the extension and the phone share through Amber
+    phone-sync.ts         PUT/GET /api/homepage and /api/sources (stamp + 409 handling, shareable-host check): what the extension and the phone share through Amber
     platform.ts           IS_WEB = false (apps/web aliases it to true)
     transpile.ts          TSX → JS for the preview
 
@@ -479,7 +512,7 @@ existing ones: `getArchive` reports `history`, `getArchiveArticles` reports
 | `pnpm agent:resume-test` | A build killed with a tool call pending can be reattached and finished |
 | `pnpm agent:retention <sessionId>` | The session and every uploaded page body are actually deleted |
 | `pnpm extension:test` | In headless Chrome: worker registers, new tab renders, port protocol answers, `chrome.history` reads |
-| `.claude/skills/verify-newtab/scripts/verify-web.py` | The phone version in an iPhone-14 emulation against a throwaway Amber on a data copy: feeds only via the proxy, tap-to-save, Reader prev/next, Settings sync, Today from a published page, the open-article gate, no overflow at 375/390/430 |
+| `.claude/skills/verify-newtab/scripts/verify-web.py` | The phone version in an iPhone-14 emulation against a throwaway Amber on a data copy: feeds only via the proxy, tap-to-save, Reader prev/next, Settings sync (stamp, 409 adoption, pagehide flush, re-read on show, unreadable boot read), Today from a published page and after a failed refresh, the open-article gate, no `AbortSignal.any`, no overflow at 375/390/430 |
 
 The `agent:*` commands need `ANTHROPIC_API_KEY` in `.env` and spend API credits. The
 harness's bridge uses fixture history and a plain `fetch`, so it can't see
@@ -559,7 +592,9 @@ reading, and `sources.json`) is stored in Amber's data directory and served to
 anyone who can reach it. Nothing in it reaches Anthropic: there is no key, build or
 model there. Never expose it with `tailscale funnel`. The published Today page is
 model-written code and runs only in the sandboxed Sandpack frame, under the same
-open-request gate as in the extension.
+open-request gate as in the extension. The extension publishes to Amber only when the
+archive address is loopback, a private or Tailscale address, or a `*.ts.net` / `*.local`
+name (see "Who may receive them" above), and leaves out sources on its blocked list.
 
 The session event log persists every domain, title and scraped page body server-side
 until deleted, and uploaded files persist independently. `runHomepageBuild` deletes

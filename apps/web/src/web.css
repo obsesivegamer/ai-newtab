@@ -254,6 +254,16 @@ html.web .tab {
   text-transform: none;
   font-size: 12.5px;
 }
+.today-note {
+  flex: none;
+  margin: 0;
+  padding: 8px max(var(--gutter), var(--safe-right)) 8px max(var(--gutter), var(--safe-left));
+  border-bottom: 1px solid var(--border);
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 12.5px;
+  color: var(--muted);
+}
 .web .today-frame {
   position: relative;
   overflow: hidden;

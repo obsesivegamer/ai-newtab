@@ -16,6 +16,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { Latest } from "./components/Latest";
 import { Library } from "./components/Library";
 import { Reader } from "./components/Reader";
+import { SyncNote } from "./components/SyncNote";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ViewTabs, type View } from "./components/ViewTabs";
 import { entryFromArchive, articleKey, type ReaderEntry } from "./readerEntry";
@@ -65,6 +66,9 @@ export default function App() {
   const [saved, setSaved] = useState<Map<string, ArchiveArticleMeta>>(() => new Map());
   /** Bumped when Settings closes: the sources may have changed. */
   const [sourcesRev, setSourcesRev] = useState(0);
+  /** A passing line shown when the sources list was replaced by the one Amber holds (edited on the phone). */
+  const [syncNote, setSyncNote] = useState<string | null>(null);
+  const clearSyncNote = useCallback(() => setSyncNote(null), []);
   const archive = useArchiveList(archiveUrl);
 
   useEffect(() => {
@@ -415,8 +419,13 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onSave={savePrompt}
           canRebuild={!!apiKey}
+          onSourcesAdopted={() => {
+            setSyncNote("Updated from your phone");
+            setSourcesRev((n) => n + 1);
+          }}
         />
       )}
+      <SyncNote message={syncNote} onDone={clearSyncNote} />
     </div>
   );
 }

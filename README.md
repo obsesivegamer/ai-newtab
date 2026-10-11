@@ -250,13 +250,30 @@ Screen** for a full-screen app. This needs an Amber that has the web-app routes
 - **Today is built on your Mac.** After each successful build the extension
   hands the page to Amber (`PUT /api/homepage`), and the phone shows it with the
   time it was built. Until you have built one, the phone says "No Today page
-  yet." There is no API key, build or model on the phone.
+  yet." There is no API key, build or model on the phone. If a later refresh
+  can't reach Amber, the phone keeps the last copy and says "Couldn't refresh —
+  showing the last copy".
 - **Sources are shared.** Saving **Settings → Sources** in the extension also
   sends the list to Amber (`PUT /api/sources`); the phone adopts it on load, and
-  edits made on the phone are sent back. Without a stored list the phone seeds
-  from your archive like the extension does.
+  edits made on the phone are sent back (also when you close the page or switch
+  away, so a toggle is not lost). Without a stored list the phone seeds
+  from your archive like the extension does. Each device sends the version
+  stamp it last saw with its edit, so one device can't silently overwrite the
+  other's newer list: the phone re-reads Amber's list when Settings opens and
+  when you come back to the page, and a refused write is replaced by Amber's
+  list with a short "Updated from another device" note; the extension does
+  the same when its Settings opens ("Updated from your phone", still yours to
+  Save or Cancel). A source whose publisher is on your Mac's blocked-sites list
+  is left out of what the phone receives.
 - **Tapping a story saves it** exactly as on the Mac (a tap, never a swipe or
   prev/next), through Amber's `POST /api/save`.
+- **Only to your own network.** The extension publishes Today and the
+  sources only when the archive address (Settings → Article archive) is this
+  computer (`localhost`, `127.0.0.0/8`, `[::1]`), a private IPv4 address
+  (`10/8`, `172.16/12`, `192.168/16`), a Tailscale address (`100.64.0.0/10`),
+  or a name ending in `.ts.net` or `.local`. Any other address (a public host,
+  or a bare name like `http://mac`) is never sent them. Use the `.ts.net` name
+  or the IP address of your Mac.
 - **Not on the phone:** *Capture with my browser* (it needs your Mac's signed-in
   browser), building Today, browsing history, and editing the blocked-sites list
   (the phone uses the default list).

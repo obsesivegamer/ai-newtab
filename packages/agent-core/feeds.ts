@@ -1,4 +1,5 @@
 import type { FeedBridge, FeedItem, FeedSource, FeedSourceStatus } from "./types";
+import { anySignal } from "./abort";
 import { canonicalLink, isTrackingParam, linkId } from "./link";
 import { hostOf, isPrivateHost, isSameOrSubdomain } from "./site-filter";
 
@@ -584,7 +585,7 @@ async function fetchText(url: string, signal?: AbortSignal): Promise<string> {
     credentials: "omit",
     redirect: "follow",
     headers: { Accept: ACCEPT },
-    signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
+    signal: signal ? anySignal([timeout, signal]) : timeout,
   });
   if (response.url && !isPrivateHost(hostOf(url)) && isPrivateHost(hostOf(response.url))) {
     void response.body?.cancel().catch(() => {});

@@ -228,7 +228,8 @@ export class BuildManager {
       // Persist the raw TSX; the page transpiles it for preview.
       const homepage = await saveHomepage(result.code);
       // Also hand it to Amber so the phone/web version can show it. Best-effort: a failure is only
-      // logged and never holds up the build. Only when an archive address is configured.
+      // logged and never holds up the build. Only when an archive address is configured and it is a
+      // local, private-network or tailnet host (`pushHomepage` checks); never a public address.
       if (archiveBase) void pushHomepage(archiveBase, homepage);
 
       this.state = { ...this.state, running: false, phase: "done" };

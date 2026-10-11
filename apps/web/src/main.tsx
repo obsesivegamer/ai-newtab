@@ -5,7 +5,7 @@ import { KEYS } from "@/lib/storage";
 import "@newtab/styles.css";
 import "./web.css";
 import { installFeedProxy } from "./feedProxy";
-import { adoptRemoteSources } from "./sync";
+import { adoptRemoteSources, startSourceSync } from "./sync";
 import WebApp from "./WebApp";
 
 /** Dark unless the person chose otherwise or their device prefers light. */
@@ -27,8 +27,10 @@ async function boot() {
   // The archive is the Amber that served this page: there is no address to set.
   await browser.storage.local.set({ [KEYS.archiveUrl]: location.origin });
   // The sources list Amber holds (shared with the extension) wins; otherwise it is seeded from the archive.
-  // Never holds the page up for long: same-origin, and given a few seconds at most.
+  // Never holds the page up for long: same-origin, and given a few seconds at most. A failed or timed-out
+  // read leaves the local list exactly as it was.
   await adoptRemoteSources(location.origin, AbortSignal.timeout(4_000)).catch(() => false);
+  startSourceSync(location.origin);
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
       <WebApp />

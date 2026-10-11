@@ -3,7 +3,13 @@ import type { FeedSource } from "@homepage/agent-core";
 import { probeFeed } from "@/lib/feeds";
 import { addFeedUrl, loadSources, mergeSeeded, seedFromArchive } from "@/lib/sources";
 import type { Theme } from "@newtab/uiPrefs";
-import { flushSourcePush, saveAndPushSources } from "./sync";
+import {
+  flushSourcePush,
+  holdRemoteRefresh,
+  onSourcesAdopted,
+  refreshRemoteSources,
+  saveAndPushSources,
+} from "./sync";
 
 type Check = { state: "idle" } | { state: "testing" } | { state: "ok"; message: string } | { state: "error"; message: string };
 
@@ -30,30 +36,48 @@ export function WebSettings({
   const [check, setCheck] = useState<Check>({ state: "idle" });
   const changed = useRef(false);
   const alive = useRef(true);
+  /** The list as it is now. Async work (a probe, a re-seed) reads it when it finishes, never a copy from when it began. */
+  const latest = useRef<FeedSource[] | null>(null);
+
+  const show = (list: FeedSource[]) => {
+    latest.current = list;
+    setSources(list);
+  };
 
   useEffect(() => {
     alive.current = true;
     loadSources().then(
-      (list) => alive.current && setSources(list),
+      (list) => alive.current && latest.current === null && show(list),
       () => {
-        if (!alive.current) return;
-        setSources([]);
+        if (!alive.current || latest.current !== null) return;
+        show([]);
         setError("Couldn’t read your saved sources. You can still add some below.");
       },
     );
+    // The Mac may have changed the list since this page last looked: take Amber's, if it differs.
+    void refreshRemoteSources(origin);
+    const stop = onSourcesAdopted((list) => alive.current && show(list));
     return () => {
       alive.current = false;
+      stop();
     };
-  }, []);
+  }, [origin]);
+
+  // A re-read must not swap the list while a feed address is being checked.
+  useEffect(() => {
+    holdRemoteRefresh(check.state === "testing");
+    return () => holdRemoteRefresh(false);
+  }, [check.state]);
 
   const close = () => {
     flushSourcePush();
     onClose(changed.current);
   };
 
-  const edit = (next: FeedSource[]) => {
+  const edit = (change: (current: FeedSource[]) => FeedSource[]) => {
+    const next = change(latest.current ?? []);
     changed.current = true;
-    setSources(next);
+    show(next);
     void saveAndPushSources(origin, next);
   };
 
@@ -68,7 +92,7 @@ export function WebSettings({
     try {
       const found = await probeFeed(address);
       if (!alive.current) return;
-      edit(addFeedUrl(sources, found.feedUrl));
+      edit((current) => addFeedUrl(current, found.feedUrl));
       setFeedInput("");
       setCheck({
         state: "ok",
@@ -85,8 +109,8 @@ export function WebSettings({
     setCheck({ state: "testing" });
     const seeded = await seedFromArchive(origin);
     if (!alive.current) return;
-    const { sources: merged, added } = mergeSeeded(sources, seeded.sources);
-    if (added.length > 0) edit(merged);
+    const { sources: merged, added } = mergeSeeded(latest.current ?? [], seeded.sources);
+    if (added.length > 0) edit(() => merged);
     const skipped = seeded.skipped.length
       ? ` No known feed for ${seeded.skipped.slice(0, 4).join(", ")}${seeded.skipped.length > 4 ? ` and ${seeded.skipped.length - 4} more` : ""}; add their feed addresses above.`
       : "";
@@ -170,14 +194,16 @@ export function WebSettings({
                       checked={s.enabled}
                       aria-label={`Include ${s.name}`}
                       onChange={(e) =>
-                        edit(sources.map((x) => (x.id === s.id ? { ...x, enabled: e.target.checked } : x)))
+                        edit((current) =>
+                          current.map((x) => (x.id === s.id ? { ...x, enabled: e.target.checked } : x)),
+                        )
                       }
                     />
                     <button
                       type="button"
                       className="ghost-btn small"
                       aria-label={`Remove ${s.name}`}
-                      onClick={() => edit(sources.filter((x) => x.id !== s.id))}
+                      onClick={() => edit((current) => current.filter((x) => x.id !== s.id))}
                     >
                       Remove
                     </button>
