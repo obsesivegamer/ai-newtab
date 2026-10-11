@@ -199,7 +199,7 @@ Amber the HTML:
    (404/405), `too-big` (413 or the size check), `busy` (429), `invalid-url` (400,
    422), `forbidden` (403), `import-timeout` (the 60 s ran out: Amber may still
    finish, and a retry may save a second copy, which the notice says) and
-   `amber-error` ("Amber answered 500", for any status not listed). A 409 `{detail: "already archived", id}` (a usable copy of the story or of its final address exists; an import never replaces one, and `force` is never sent) is a success: that snapshot's text is read and shown and the story is marked, with no error. The same holds before any window opens: if the click-time lookup already finds a usable copy it is read instead of capturing.
+   `amber-error` ("Amber answered 500", for any status not listed). A 400 `final_url is a different site` becomes the off-site message (naming the page's host), `final_url is a private or local address` becomes `private-address`, and a 408 is `upload-timeout` ("The upload to Amber took too long. Try again."). A 409 `{detail: "already archived", id}` (a usable copy of the story or of its final address exists; an import never replaces one, and `force` is never sent) is a success: that snapshot's text is read and shown and the story is marked, with no error. The same holds before any window opens: if the click-time lookup already finds a usable copy it is read instead of capturing.
 5. A response with `usable: false` means Amber found no article in the page either:
    the reader says "Your browser also got a subscription prompt. Are you signed in
    to <host>?" with Open original (and the same button as a retry). Otherwise the

@@ -1,4 +1,4 @@
-import { normalizeArchiveUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
+import { hostOf, normalizeArchiveUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
 import { createArchiveBridge } from "./archive";
 
 /**
@@ -39,6 +39,8 @@ export type FetchFailure =
   | "private-address"
   /** Amber took longer than the import's time limit; it may still finish. */
   | "import-timeout"
+  /** Amber gave up waiting for the request body (408). */
+  | "upload-timeout"
   /** Amber answered with a status no case here covers. `detail` says which. */
   | "amber-error"
   /** The import worked and the page is saved, but reading its text back failed. */
@@ -306,9 +308,14 @@ export async function importPage(
     return { id: reply.id, usable: true, wordCount: 0, existing: true };
   }
   const detail = detailOf(reply);
-  if (status === 400 && page.finalUrl && detail && /private|local|final_url/i.test(detail)) {
+  // Amber's stable strings for the page's final address: another site (an SSO host, a shortener) or a private one.
+  if (status === 400 && page.finalUrl && detail && /different site/i.test(detail)) {
+    throw new ArticleFetchError("off-site", hostOf(page.finalUrl), undefined);
+  }
+  if (status === 400 && page.finalUrl && detail && /private or local|local urls/i.test(detail)) {
     throw new ArticleFetchError("private-address", detail);
   }
+  if (status === 408) throw new ArticleFetchError("upload-timeout", detail);
   // 422: Amber took the page but could not turn it into a snapshot.
   if (status === 400 || status === 422) throw new ArticleFetchError("invalid-url", detail);
   if (status === 403) throw new ArticleFetchError("forbidden", detail);

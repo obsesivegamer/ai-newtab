@@ -72,6 +72,8 @@ function fetchProblem(
           title: "The page ended up on a private or local address.",
           message: "Nothing was stored.",
         };
+      case "upload-timeout":
+        return { title: "The upload to Amber took too long.", message: "Nothing was stored. Try again." };
       case "import-timeout":
         return {
           title: "Amber took too long to take the page.",

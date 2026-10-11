@@ -1662,14 +1662,18 @@ async function main() {
         // Amber failures after a good page read (the import answer is stubbed; the page was still opened).
         if (theme === "dark") {
           await page.send("Fetch.enable", { patterns: [{ urlPattern: `${AMBER}/api/import*` }] });
-          for (const [status, title, label, retryShown] of [
-            [404, /Update Amber/, "an Amber without the import API says to update it, with no retry", false],
-            [413, /too large/, "a page that is too large says so, with no retry", false],
-            [429, /Amber is busy/, "a busy Amber says so, and the button is the retry", true],
-            [500, /Amber answered 500/, "an unexpected Amber status is named, not 'Amber isn't running'", true],
+          for (const [status, title, label, retryShown, stubBody] of [
+            [404, /Update Amber/, "an Amber without the import API says to update it, with no retry", false, null],
+            [413, /too large/, "a page that is too large says so, with no retry", false, null],
+            [429, /Amber is busy/, "a busy Amber says so, and the button is the retry", true, null],
+            [500, /Amber answered 500/, "an unexpected Amber status is named, not 'Amber isn't running'", true, null],
+            [408, /upload to Amber took too long/, "a 408 says the upload took too long, with the retry", true, null],
+            [400, /sent your browser to/, "a 400 'final_url is a different site' is the off-site message, naming the page's host", true, { detail: "final_url is a different site" }],
+            [400, /private or local address/, "a 400 'final_url is a private or local address' is the private-address message, with no retry", false, { detail: "final_url is a private or local address" }],
           ] as const) {
             await openStub(locked.title);
             importStubStatus = status;
+            importStubBody = stubBody;
             await click(".reader-notice .ghost-btn", "Capture with my browser");
             const shown = await waitFor(
               `${title}.test(document.querySelector(".reader-notice .notice-title")?.textContent || "") && !document.querySelector(".reader-fetch")`,
@@ -1680,6 +1684,7 @@ async function main() {
             const acts4 = await actions();
             const hasRetry = acts4.includes("Capture with my browser");
             check(`After Capture with my browser, ${label}`, shown && hasRetry === retryShown, `${t} [${acts4.join(", ")}]`);
+            importStubBody = null;
             if (status === 404) await shot(`22-capture-amber-needs-update-${theme}`);
           }
           // 409: Amber already has a usable copy of the story (here: an archived article's id). That is a
@@ -2236,7 +2241,7 @@ export default function App() {
   const expected = (e: { phase: string; text: string }) =>
     (/status of 503/.test(e.text) && /latest/.test(e.phase)) || // the fixture "flaky" feed, on purpose
     (/status of 400/.test(e.text) && /save-invariant/.test(e.phase)) || // Amber refusing the uncapturable address
-    (/status of (404|409|413|429|500|503)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
+    (/status of (400|404|408|409|413|429|500|503)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
     (noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi));
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(
