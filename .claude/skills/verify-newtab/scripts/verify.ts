@@ -583,18 +583,21 @@ async function main() {
       .join("")}</channel></rss>`;
   };
   // A Google News sitemap, the only listing Reuters publishes: parsed as a feed. Two English stories
-  // (one with a keyword, one whose section comes from its path) and one in a /fr/ edition that is left out.
+  // (one with a keyword, one whose section comes from its path), a /de/ story that declares German
+  // (kept: a German publisher's own sitemap) and a /fr/ story declared "en" (left out).
   const SITEMAP_TITLE = "Fixture sitemap story from the world desk";
   const SITEMAP_TITLE_2 = "Fixture sitemap story with a keyword";
   const SITEMAP_TITLE_FR = "Histoire de fixture en francais";
+  const SITEMAP_TITLE_DE = "Fixture-Geschichte aus dem deutschen Dienst";
   const sitemapXml = () => {
     const at = new Date().toISOString();
-    const url = (loc: string, title: string, keywords = "") =>
-      `<url><loc>${loc}</loc><lastmod>${at}</lastmod><news:news><news:publication><news:name>Verify sitemap</news:name><news:language>en</news:language></news:publication><news:publication_date>${at}</news:publication_date><news:title>${esc(title)}</news:title>${keywords ? `<news:keywords>${keywords}</news:keywords>` : ""}</news:news><image:image><image:loc>https://example.com/pic.jpg</image:loc></image:image></url>`;
+    const url = (loc: string, title: string, keywords = "", language = "en") =>
+      `<url><loc>${loc}</loc><lastmod>${at}</lastmod><news:news><news:publication><news:name>Verify sitemap</news:name><news:language>${language}</news:language></news:publication><news:publication_date>${at}</news:publication_date><news:title>${esc(title)}</news:title>${keywords ? `<news:keywords>${keywords}</news:keywords>` : ""}</news:news><image:image><image:loc>https://example.com/pic.jpg</image:loc></image:image></url>`;
     return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">${[
       url("https://example.com/world/india/verify-newtab-sitemap-1/", SITEMAP_TITLE),
       url("https://example.com/business/verify-newtab-sitemap-2/", SITEMAP_TITLE_2, "Markets, Oil"),
       url("https://example.com/fr/monde/verify-newtab-sitemap-fr/", SITEMAP_TITLE_FR),
+      url("https://example.com/de/politik/verify-newtab-sitemap-de/", SITEMAP_TITLE_DE, "", "de"),
     ].join("")}</urlset>`;
   };
   // How often each path was asked for, by the Host the request came in under.
@@ -741,7 +744,7 @@ async function main() {
     await sleep(150);
 
     // A news sitemap (Reuters has no RSS) is read as a feed: its stories show up, one per entry,
-    // and an entry from a /fr/ edition is left out.
+    // an entry from a /fr/ edition declared "en" is left out, a /de/ one declared "de" is kept.
     {
       if (!(await page.evaluate<boolean>(`!![...document.querySelectorAll(".view-latest .chips .chip")].find((c) => c.textContent.includes("Verify sitemap"))`))) {
         await click(".view-latest .chips .chip.more");
@@ -753,8 +756,12 @@ async function main() {
         `[...document.querySelectorAll(".view-latest .row .row-title")].map((e) => e.textContent)`,
       );
       check(
-        "A news sitemap's stories appear in Latest (a /fr/ entry does not)",
-        titles.includes(SITEMAP_TITLE) && titles.includes(SITEMAP_TITLE_2) && !titles.includes(SITEMAP_TITLE_FR) && titles.length === 2,
+        "A news sitemap's stories appear in Latest (a mislabelled /fr/ entry does not, a real /de/ one does)",
+        titles.includes(SITEMAP_TITLE) &&
+          titles.includes(SITEMAP_TITLE_2) &&
+          titles.includes(SITEMAP_TITLE_DE) &&
+          !titles.includes(SITEMAP_TITLE_FR) &&
+          titles.length === 3,
         titles.join(" | "),
       );
       await click(".view-latest .chips .chip", "All");

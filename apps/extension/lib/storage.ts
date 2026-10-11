@@ -24,6 +24,8 @@ export const KEYS = {
   sources: "sources",
   /** Version of the one-time catalog migrations already applied (a number); see lib/sources.ts. */
   sourcesMigrated: "sourcesMigrated",
+  /** Epoch ms of the last background check of the one-time catalog migration, so it runs at most hourly. */
+  sourcesMigrationTriedAt: "sourcesMigrationTriedAt",
   model: "model",
   autoRebuild: "autoRebuild",
   /** ISO timestamp of the last auto-build *attempted* (success or not). */

@@ -78,9 +78,10 @@ export const DEFAULT_FEEDS: readonly KnownSource[] = [
     id: "wsj",
     name: "The Wall Street Journal",
     aliases: ["WSJ", "Wall Street Journal", "wsj.com"],
-    // Dow Jones moved its feeds from feeds.a.dj.com (frozen in 2025) to feeds.content.dowjones.io;
-    // the feed hosts are listed so a feed address added by hand joins this source.
-    hosts: ["wsj.com", "dowjones.io", "dj.com"],
+    // Dow Jones moved its feeds from feeds.a.dj.com (frozen in 2025) to feeds.content.dowjones.io.
+    // That host also serves MarketWatch and Barron's feeds, so it is not listed as WSJ's: blocking
+    // dowjones.io still blocks the source by its feed addresses.
+    hosts: ["wsj.com"],
     feeds: [
       "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
       "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
@@ -195,8 +196,7 @@ function nameKey(text: string): string {
 
 const BY_KEY = new Map<string, KnownSource>();
 for (const known of DEFAULT_FEEDS) {
-  // Only the main host is a name: the others are feed hosts or other TLDs ("dj.com" is not "DJ").
-  for (const label of [known.name, ...known.aliases, known.hosts[0]]) BY_KEY.set(nameKey(label), known);
+  for (const label of [known.name, ...known.aliases, ...known.hosts]) BY_KEY.set(nameKey(label), known);
 }
 
 /** The known publication for an archive `site` name or a bare host, if any. */
