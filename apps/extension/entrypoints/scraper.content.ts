@@ -1,7 +1,13 @@
 /**
- * Injected on demand by lib/scraper.ts (never auto-registered). Scrolls the page
- * to trigger lazy-loaded content, then returns its title and body HTML.
+ * Injected on demand by lib/scraper.ts and lib/browser-capture.ts (never
+ * auto-registered). Scrolls the page to trigger lazy-loaded content, then returns
+ * its title and body HTML. When lib/browser-capture.ts has set `__rawDocument` in
+ * this isolated world first, it returns the document's untouched outerHTML instead
+ * (attributes, scripts and all), which is what Amber's extractor needs; that copy
+ * is capped at 12 MB and never truncated: a larger page comes back with
+ * `tooBig` and no html.
  */
+const MAX_RAW_CHARS = 12 * 1024 * 1024;
 export default defineContentScript({
   registration: "runtime",
   main() {
@@ -33,6 +39,12 @@ export default defineContentScript({
     const convertPageToHTML = async () => {
       // Scroll the page first to trigger lazy-loaded content
       await scrollPage();
+
+      if ((globalThis as { __rawDocument?: boolean }).__rawDocument) {
+        const html = document.documentElement.outerHTML;
+        const tooBig = html.length > MAX_RAW_CHARS;
+        return { url: location.href, title: document.title, html: tooBig ? "" : html, tooBig };
+      }
 
       // Return raw HTML and title after scrolling
       return {

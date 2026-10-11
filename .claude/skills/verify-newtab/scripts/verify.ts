@@ -16,6 +16,15 @@
  *   4. drives the real UI (mouse clicks, key events) and screenshots dark and light,
  *   5. prints cheap DOM assertions and kills everything it started.
  *
+ * "Capture with my browser" (needs an Amber with POST /api/import; skipped with a warning
+ * otherwise): three fixture stories live on example.org, which only this Chrome maps to the
+ * fixture server. The server answers a subscription stub unless the request carries the cookie
+ * `member=1` (set in the Chrome profile), so Amber's own anonymous capture would only ever get a
+ * stub. The script seeds that stub through /api/import, as Amber's crawler result would land, and
+ * then drives the Reader: stub notice -> click -> page opened in the browser -> HTML imported ->
+ * text. Amber validates a story's address by resolving its host, which is why the fixture uses
+ * a real public name; it never fetches it.
+ *
  * Screenshots go to --out (default: a fresh temp dir), never into the repo.
  * It never touches port 8080 or Amber's launchd service.
  */
@@ -71,6 +80,7 @@ if (!Number.isInteger(AMBER_PORT) || AMBER_PORT < 1024 || AMBER_PORT > 65535 || 
 }
 const AMBER = `http://127.0.0.1:${AMBER_PORT}`;
 const FIXTURE_HOST = "verify-fixture.example";
+const CAPTURE_HOST = "example.org";
 
 // ---------------------------------------------------------------------------
 // Process bookkeeping: everything we spawn dies with us
@@ -295,7 +305,9 @@ async function main() {
       "--enable-unsafe-extension-debugging",
       // Feed addresses on loopback are refused by design, so the fixture feeds are served under a
       // public-looking name that only this Chrome resolves (to the fixture server on 127.0.0.1).
-      `--host-resolver-rules=MAP ${FIXTURE_HOST} 127.0.0.1`,
+      // example.org is where the "Capture with my browser" fixture stories live: Amber must see a public
+      // name it can resolve (it validates the address of an import), while this Chrome loads it from here.
+      `--host-resolver-rules=MAP ${FIXTURE_HOST} 127.0.0.1, MAP ${CAPTURE_HOST} 127.0.0.1`,
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${profileDir}`,
       "about:blank",
@@ -419,12 +431,43 @@ async function main() {
     if (p.request?.method === "POST" && /\/api\/save/.test(p.request?.url ?? "")) savePosts++;
   });
 
+  // POSTs to Amber's import API: what "Capture with my browser" sends. Bodies are kept to check what left the browser.
+  let importPosts = 0;
+  const importBodies: Array<{ url: string; html: string; title?: string; contentType: string }> = [];
+  page.on("Network.requestWillBeSent", (p) => {
+    if (p.request?.method !== "POST" || !/\/api\/import/.test(p.request?.url ?? "")) return;
+    importPosts++;
+    try {
+      const body = JSON.parse(p.request.postData ?? "{}");
+      const headers: Record<string, string> = p.request.headers ?? {};
+      const ct = Object.entries(headers).find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "";
+      importBodies.push({ url: body.url, html: String(body.html ?? ""), title: body.title, contentType: ct });
+    } catch {
+      importBodies.push({ url: "", html: "", contentType: "unreadable" });
+    }
+  });
+
   // While `capturingStub` is set, Amber's look-up for one story and the job it names are answered
   // from here: "found, still capturing". Everything else goes through untouched.
   let capturingStub = false;
   let futureLookupFragment = "";
+  // While set, Amber's import is answered from here with this status: an Amber without the import
+  // API (404) or one with too many imports running (429). The page was still opened and read first.
+  let importStubStatus = 0;
   page.on("Fetch.requestPaused", (p) => {
     const url: string = p.request?.url ?? "";
+    if (importStubStatus && p.request?.method === "POST" && url.includes("/api/import")) {
+      void page.send("Fetch.fulfillRequest", {
+        requestId: p.requestId,
+        responseCode: importStubStatus,
+        responseHeaders: [
+          { name: "Content-Type", value: "application/json" },
+          { name: "Access-Control-Allow-Origin", value: "*" },
+        ],
+        body: Buffer.from(JSON.stringify({ detail: "stubbed by verify-newtab" })).toString("base64"),
+      });
+      return;
+    }
     const headers = [
       { name: "Content-Type", value: "application/json" },
       { name: "Access-Control-Allow-Origin", value: "*" },
@@ -569,6 +612,27 @@ async function main() {
   const FIXTURE_UNCAPTURABLE = "https://verify-newtab-unreachable.invalid/article";
   const FIXTURE_UNCAPTURABLE_TITLE = "Fixture story Amber cannot capture";
   const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  // "Capture with my browser" fixtures: two stories this browser can read as a member (one per theme
+  // pass) and one that stays locked. The port is only known once the fixture server is up.
+  const MEMBER_SENTENCE = "VERIFY-MEMBERS-ONLY-SENTENCE";
+  const captureUrl = (path: string) => () => `http://${CAPTURE_HOST}:${fixtureServer!.port}${path}`;
+  const CAPTURE_STORIES = [
+    { path: "/members/story-1", title: "Fixture subscriber story one", blurb: "Readable only with the member cookie.", url: captureUrl("/members/story-1") },
+    { path: "/members/story-2", title: "Fixture subscriber story two", blurb: "Readable only with the member cookie.", url: captureUrl("/members/story-2") },
+    { path: "/members/locked", title: "Fixture subscriber story that stays locked", blurb: "Shows a subscription prompt even to a member.", url: captureUrl("/members/locked") },
+  ];
+  const stubPage = (title: string) =>
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Subscribe to read | Verify Times</title><meta property="og:site_name" content="Verify Times"></head><body><header><a href="/">Verify Times</a></header><main><h1>Subscribe to unlock this article</h1><p>${esc(title)} is for Verify Times subscribers. Already a subscriber? Sign in to keep reading. Get unlimited access to every story for one low price, cancel anytime.</p><button>Subscribe</button></main></body></html>`;
+  const articlePage = (title: string) => {
+    const paragraphs = Array.from({ length: 8 }, (_, i) =>
+      i === 0
+        ? `${MEMBER_SENTENCE} The harbour authority confirmed on Tuesday that the new ferry timetable would take effect from the first of the month, after three years of consultation with island residents, freight operators and the council.`
+        : `Paragraph ${i + 1} of the fixture article explains how the timetable was drawn up, who was consulted, what the operators asked for, and why the committee settled on fewer but longer crossings that connect with the mainland rail service.`,
+    );
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(title)} - Verify Times</title><meta property="og:title" content="${esc(title)}"><meta property="og:site_name" content="Verify Times"><meta name="author" content="Ada Fixture"><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":${JSON.stringify(title)},"author":{"@type":"Person","name":"Ada Fixture"}}</script></head><body><nav><a href="/">Verify Times</a></nav><article><h1>${esc(title)}</h1><p class="byline">By Ada Fixture</p>${paragraphs.map((p) => `<p>${p}</p>`).join("")}</article><script>window.__verifyArticle = true;</script></body></html>`;
+  };
+  /** How often each fixture story was requested by this browser (by the example.org host), with and without the cookie. */
+  const memberHits = new Map<string, { withCookie: number; without: number }>();
   const fixtureXml = () => {
     const at = new Date().toUTCString();
     const items = [
@@ -577,6 +641,7 @@ async function main() {
       { title: "Fixture story that is not in the archive yet", link: FIXTURE_NOT_SAVED, d: "From the fixture feed: Amber has never seen this address." },
       { title: FIXTURE_UNCAPTURABLE_TITLE, link: FIXTURE_UNCAPTURABLE, d: "From the fixture feed: Amber cannot capture this address (its host does not resolve)." },
       { title: FIXTURE_FUTURE_TITLE, link: "https://example.com/verify-newtab-future", d: "Dated two days ahead: a feed bug.", at: new Date(Date.now() + 2 * 86_400_000).toUTCString() },
+      ...CAPTURE_STORIES.map((c) => ({ title: c.title, link: c.url(), d: c.blurb })),
     ].filter(Boolean) as Array<{ title: string; link: string; d: string; at?: string }>;
     return `<?xml version="1.0"?><rss version="2.0"><channel><title>Verify fixture</title>${items
       .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${i.at ?? at}</pubDate><description>${esc(i.d)}</description></item>`)
@@ -620,6 +685,19 @@ async function main() {
       const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
       hits.set(`${host}${url.pathname}`, (hits.get(`${host}${url.pathname}`) ?? 0) + 1);
       const xml = { headers: { "content-type": "application/rss+xml" } };
+      if (url.pathname.startsWith("/members/")) {
+        const story = CAPTURE_STORIES.find((c) => c.path === url.pathname);
+        const member = /(?:^|;\s*)member=1(?:;|$)/.test(req.headers.get("cookie") ?? "");
+        if (host === CAPTURE_HOST) {
+          const h = memberHits.get(url.pathname) ?? { withCookie: 0, without: 0 };
+          if (member) h.withCookie++;
+          else h.without++;
+          memberHits.set(url.pathname, h);
+        }
+        const html = (member && url.pathname !== "/members/locked" ? articlePage : stubPage)(story?.title ?? "This story");
+        // A beat, so the "fetching" state can be looked at before the page comes back.
+        return sleep(800).then(() => new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } }));
+      }
       if (url.pathname === "/news-sitemap.xml") {
         return new Response(sitemapXml(), { headers: { "content-type": "application/xml; charset=utf-8" } });
       }
@@ -643,6 +721,40 @@ async function main() {
   const SITEMAP_SOURCE = { id: "verify-sitemap", name: "Verify sitemap", feedUrls: [SITEMAP_FEED], enabled: true };
   const FIXTURE_SOURCE = { id: "verify-fixture", name: "Verify fixture", feedUrls: [FIXTURE_FEED], enabled: true };
   const PRIVATE_SOURCE = { id: "verify-private", name: "Verify private", feedUrls: [PRIVATE_FEED], enabled: true };
+  // ---- "Capture with my browser" setup --------------------------------------------
+  // This profile is "signed in" to the fixture publisher: the cookie rides every load of example.org.
+  await page.send("Network.setCookie", { name: "member", value: "1", domain: CAPTURE_HOST, path: "/" });
+  // Does this Amber have POST /api/import? An empty body is a 400 when it does and a 404/405 when not.
+  const importStatus = await (async () => {
+    try {
+      const r = await fetch(`${AMBER}/api/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(5000),
+      });
+      return r.status;
+    } catch {
+      return null;
+    }
+  })();
+  const hasImportApi = importStatus === 400;
+  // Amber's own anonymous capture of these stories would be the stub: seed that result the way a
+  // crawler's would land (Amber cannot reach this fixture host, by its private-address guard).
+  let seededStubs = 0;
+  if (hasImportApi) {
+    for (const c of CAPTURE_STORIES) {
+      const stub = await (await fetch(`http://127.0.0.1:${fixtureServer.port}${c.path}`)).text();
+      const r = await fetch(`${AMBER}/api/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: c.url(), html: stub, title: c.title }),
+      });
+      const j = (await r.json().catch(() => null)) as any;
+      if (r.status === 201 && j?.usable === false) seededStubs++;
+      else console.log(`  [info] seeding the stub for ${c.path}: HTTP ${r.status} ${JSON.stringify(j)?.slice(0, 160)}`);
+    }
+  }
   const chipNames = () =>
     page.evaluate<string[]>(
       `[...document.querySelectorAll(".view-latest .chips .chip")].map((c) => c.firstChild.textContent.trim())`,
@@ -1224,6 +1336,237 @@ async function main() {
       }
     }
 
+    // 19-21 "Capture with my browser": Amber has only a subscription stub; this browser can read the page.
+    if (!hasImportApi) {
+      if (theme === "dark") {
+        check(
+          "Amber has the import API (POST /api/import) for 'Capture with my browser'",
+          false,
+          `answered ${importStatus}; run with --amber-dir <checkout with the import API>; the browser-capture flow was skipped`,
+          true,
+        );
+      }
+    } else if (seededStubs !== CAPTURE_STORIES.length) {
+      check("Amber took the seeded subscription stubs", false, `${seededStubs} of ${CAPTURE_STORIES.length}`);
+    } else {
+      phase = `${theme}:browser-capture`;
+      const story = CAPTURE_STORIES[theme === "dark" ? 0 : 1];
+      const locked = CAPTURE_STORIES[2];
+      const captureBtn = `[...document.querySelectorAll(".reader .ghost-btn")].some((b) => b.textContent.trim() === "Capture with my browser")`;
+      const actions = () =>
+        page.evaluate<string[]>(`[...document.querySelectorAll(".reader-notice .notice-actions .ghost-btn")].map((b) => b.textContent.trim())`);
+      const windowCount = () => page.evaluate<number>(`chrome.windows.getAll().then((w) => w.length)`);
+      const rowOf = (title: string) =>
+        rowId(`(r) => r.querySelector(".row-title").textContent === ${JSON.stringify(title)}`);
+      const closeReader = async () => {
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      };
+      await filterToFixture();
+      const imp0 = importPosts;
+      const saves0 = savePosts;
+      const windows0 = await windowCount();
+
+      // The button is for failure states only: a readable article and the "Fetch full article" idle state have none.
+      if (archivedFixture) {
+        await click(".view-latest .row");
+        await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "an archived story to read");
+        const readableHasNone = !(await page.evaluate<boolean>(captureBtn));
+        const rows = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .row-title")].map((e) => e.textContent)`);
+        const target = rows.indexOf(story.title);
+        let idleSeen = false;
+        let idleHasNone = true;
+        // j walks the list: nothing it passes may start a capture, and it lands on the stub's notice.
+        for (let n = 0; n < target; n++) {
+          await key("j");
+          await sleep(350);
+          if (await page.evaluate<boolean>(`!!document.querySelector(".reader-fetch.idle")`)) {
+            idleSeen = true;
+            idleHasNone = idleHasNone && !(await page.evaluate<boolean>(captureBtn));
+          }
+        }
+        await waitFor(`document.querySelector(".reader-notice")`, "the stub's notice after walking with j", 15_000);
+        check(
+          'No "Capture with my browser" button on a readable article or on "Fetch full article"',
+          readableHasNone && idleHasNone,
+          `readable: ${readableHasNone ? "none" : "PRESENT"}; idle state ${idleSeen ? (idleHasNone ? "none" : "PRESENT") : "not met on this walk"}`,
+        );
+        check(
+          "Walking to a stub with j shows the button but captures nothing",
+          (await page.evaluate<boolean>(captureBtn)) && importPosts === imp0 && savePosts === saves0,
+          `${importPosts - imp0} import request(s), ${savePosts - saves0} save request(s)`,
+        );
+        await closeReader();
+      }
+
+      // A click on the row: Amber has the page but only the subscription prompt. Three ways out.
+      const storyRow = await rowOf(story.title);
+      check("The subscriber story is in Latest", !!storyRow);
+      if (storyRow) {
+        await click(`#${storyRow}`);
+        await waitFor(`document.querySelector(".reader-notice")`, "the stub notice", 15_000);
+        const first = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+          fetching: !!document.querySelector(".reader-fetch:not(.idle)"),
+        })`);
+        const acts = await actions();
+        check(
+          "A stub shows three ways out: Try capturing again, Capture with my browser, Open original",
+          /No article text/.test(first.title) &&
+            acts.join("|") === "Try capturing again|Capture with my browser|Open original",
+          `"${first.title}" [${acts.join(", ")}]`,
+        );
+        check("Nothing was imported before the click", importPosts === imp0, `${importPosts - imp0} import request(s)`);
+        await shot(`19-capture-stub-notice-${theme}`);
+
+        // The click.
+        await click(".reader-notice .ghost-btn", "Capture with my browser");
+        const fetching = await waitFor(
+          `/Capturing with your browser/.test(document.querySelector(".reader-fetch-title")?.textContent || "")`,
+          "the browser-capture fetching state",
+          10_000,
+        );
+        const stage = await text(".reader-fetch-stage");
+        const windowsDuring = await windowCount();
+        check(
+          "The fetching state says the page is opening in the browser",
+          fetching && /Opening the page in your browser|Sending it to Amber/.test(stage),
+          stage.replace(/\s+/g, " ").trim(),
+        );
+        await shot(`19-capture-fetching-${theme}`);
+        const done = await waitFor(
+          `document.querySelectorAll(".reader-body p").length > 3 || document.querySelector(".reader-notice")`,
+          "the article or a failure after the browser capture",
+          60_000,
+        );
+        const outcome = await page.evaluate<any>(`({
+          paragraphs: document.querySelectorAll(".reader-body p").length,
+          notice: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+          body: document.querySelector(".reader-body")?.textContent || "",
+          buttons: [...document.querySelectorAll(".reader .ghost-btn, .reader .solid-btn")].length,
+        })`);
+        check(
+          "The full text appears after Capture with my browser",
+          done && outcome.paragraphs > 3 && outcome.body.includes(MEMBER_SENTENCE),
+          outcome.notice || `${outcome.paragraphs} paragraphs`,
+        );
+        check("Exactly one import request after the click", importPosts === imp0 + 1, `${importPosts - imp0}`);
+        const sent = importBodies[importBodies.length - 1];
+        check(
+          "The import carried the story address, raw HTML (scripts included) and JSON content type",
+          !!sent &&
+            sent.url === story.url() &&
+            sent.html.includes("<article") &&
+            sent.html.includes("<script") &&
+            sent.html.includes(MEMBER_SENTENCE) &&
+            /application\/json/i.test(sent.contentType),
+          sent ? `${sent.html.length} chars, ${sent.contentType}, title "${(sent.title ?? "").slice(0, 40)}"` : "no body",
+        );
+        const hit = memberHits.get(story.path);
+        check(
+          "The page was loaded by this browser with its cookie, not anonymously",
+          !!hit && hit.withCookie >= 1 && hit.without === 0,
+          hit ? `${hit.withCookie} with the cookie, ${hit.without} without` : "no request seen",
+        );
+        check("A background window was used while capturing", windowsDuring > windows0, `${windows0} -> ${windowsDuring} windows`);
+        await sleep(400);
+        check("The background window is closed afterwards", (await windowCount()) === windows0, `${await windowCount()} windows`);
+        check("The capture saved nothing through /api/save", savePosts === saves0, `${savePosts - saves0}`);
+        await shot(`20-capture-success-${theme}`);
+
+        await closeReader();
+        const marked = await page.evaluate<boolean>(`!!document.getElementById(${JSON.stringify(storyRow)})?.querySelector(".row-amber")`);
+        check('The captured story shows "In Amber" without a reload', marked);
+
+        // Second visit, after a reload: it reads from Amber and imports nothing.
+        await load();
+        await latestReady();
+        await filterToFixture();
+        const again = await rowOf(story.title);
+        if (again && (await click(`#${again}`))) {
+          const ok = await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "the captured story from Amber", 20_000);
+          await sleep(500);
+          check(
+            "A second visit reads from Amber and imports nothing",
+            ok && importPosts === imp0 + 1 && savePosts === saves0,
+            `${importPosts - imp0} import request(s) in total`,
+          );
+          await closeReader();
+        } else {
+          check("A second visit reads from Amber and imports nothing", false, "row not found");
+        }
+      }
+
+      // Closing the Reader mid-capture ends it: the window goes, nothing is sent.
+      const lockedRow = await rowOf(locked.title);
+      if (lockedRow && (await click(`#${lockedRow}`))) {
+        await waitFor(`document.querySelector(".reader-notice")`, "the locked story's stub notice", 15_000);
+        const before = importPosts;
+        await click(".reader-notice .ghost-btn", "Capture with my browser");
+        await waitFor(`/Capturing with your browser/.test(document.querySelector(".reader-fetch-title")?.textContent || "")`, "fetching", 10_000);
+        await sleep(1200); // the window is up and the page is loading (the fixture answers after a beat)
+        await closeReader();
+        await sleep(6000);
+        check(
+          "Closing the Reader mid-capture closes the background window and sends nothing",
+          importPosts === before && (await windowCount()) === windows0,
+          `${importPosts - before} import request(s), ${await windowCount()} window(s)`,
+        );
+
+        // A story the browser cannot read either: still a subscription prompt, with a way to check the sign-in.
+        await click(`#${lockedRow}`);
+        await waitFor(`document.querySelector(".reader-notice")`, "the locked story's stub notice again", 15_000);
+        const imp1 = importPosts;
+        await click(".reader-notice .ghost-btn", "Capture with my browser");
+        await waitFor(`document.querySelector(".reader-fetch")`, "fetching", 10_000);
+        const stillStub = await waitFor(
+          `/subscription prompt/.test(document.querySelector(".reader-notice .notice-title")?.textContent || "")`,
+          "the still-paywalled notice",
+          60_000,
+        );
+        const notice = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+          body: document.querySelector(".reader-notice .notice-body")?.textContent || "",
+        })`);
+        const acts2 = await actions();
+        check(
+          "Still a paywall in the browser: asks if you are signed in, offers Open original",
+          stillStub && /Are you signed in to example\.org/.test(notice.body) && acts2.includes("Open original"),
+          `"${notice.title}" / "${notice.body.slice(0, 70)}" [${acts2.join(", ")}]`,
+        );
+        check("The locked attempt imported once", importPosts === imp1 + 1, `${importPosts - imp1}`);
+        check("The window is closed after a failed attempt", (await windowCount()) === windows0, `${await windowCount()} windows`);
+        await shot(`21-capture-still-paywalled-${theme}`);
+
+        // Amber failures after a good page read: an Amber without the import API, then a busy one.
+        if (theme === "dark") {
+          await page.send("Fetch.enable", { patterns: [{ urlPattern: `${AMBER}/api/import*` }] });
+          for (const [status, title, label] of [
+            [404, /Update Amber/, "an Amber without the import API says to update it"],
+            [429, /Amber is busy/, "a busy Amber says so"],
+          ] as const) {
+            importStubStatus = status;
+            await click(".reader-notice .ghost-btn", "Capture with my browser");
+            const shown = await waitFor(
+              `${title}.test(document.querySelector(".reader-notice .notice-title")?.textContent || "") && !document.querySelector(".reader-fetch")`,
+              label,
+              60_000,
+            );
+            const t = await text(".reader-notice .notice-title");
+            check(`After Capture with my browser, ${label}`, shown, t);
+            if (status === 404) await shot(`22-capture-amber-needs-update-${theme}`);
+          }
+          importStubStatus = 0;
+          await page.send("Fetch.disable");
+        }
+        await closeReader();
+      } else {
+        check("The locked story is in Latest", false, "row not found");
+      }
+      await click(".view-latest .chips .chip", "All");
+      await sleep(150);
+    }
+
     // 12 Failure path: Amber stopped, open a story it has not got ---------------
     phase = `${theme}:latest-amber-down`;
     await setStorage({ archiveUrl: DEAD });
@@ -1650,6 +1993,7 @@ export default function App() {
   const expected = (e: { phase: string; text: string }) =>
     (/status of 503/.test(e.text) && /latest/.test(e.phase)) || // the fixture "flaky" feed, on purpose
     (/status of 400/.test(e.text) && /save-invariant/.test(e.phase)) || // Amber refusing the uncapturable address
+    (/status of (404|429)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
     (noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi));
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(

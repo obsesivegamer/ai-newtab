@@ -4,8 +4,9 @@ import { createArchiveBridge } from "./archive";
 /**
  * Saving an article to Amber on demand and reading its full text back: the
  * client for Amber's `/api/lookup`, `/api/save`, `/api/jobs/{id}` and
- * `/api/snapshots/{id}/text`. Used by the Reader when you open a story that is
- * not in the archive yet.
+ * `/api/snapshots/{id}/text`, plus `POST /api/import` (`importPage`) for a page
+ * this browser already loaded (lib/browser-capture.ts). Used by the Reader when
+ * you open a story that is not in the archive yet.
  *
  * Client rules from Amber: only a snapshot that is `complete` and `usable` is
  * readable; a found-but-unusable one counts as not archived; the article link
@@ -22,10 +23,27 @@ export type FetchFailure =
   | "paywall-stub"
   | "not-saved"
   | "timeout"
+  /** Amber refused an import as cross-site (403). */
+  | "forbidden"
+  /** The page is over Amber's import size limit (413, or over 12 MB before sending). */
+  | "too-big"
+  /** The address is on the blocked list or is not a public web address: the browser was not asked to open it. */
+  | "blocked"
+  /** The browser opened the page but handed back nothing to send. */
+  | "no-content"
   | "aborted";
 
 /** Where a fetch is up to, for a progress line. */
-export type FetchStage = "checking" | "saving" | "queued" | "capturing" | "reading";
+export type FetchStage =
+  | "checking"
+  | "saving"
+  | "queued"
+  | "capturing"
+  | "reading"
+  /** Browser capture: the page is open in a background window of the person's own browser. */
+  | "browser-opening"
+  /** Browser capture: the page's HTML is on its way to Amber. */
+  | "browser-sending";
 
 export class ArticleFetchError extends Error {
   constructor(
@@ -63,6 +81,10 @@ export const MAX_URL_LENGTH = 2048;
 export const POLL_INTERVAL_MS = 2_000;
 export const POLL_CAP_MS = 90_000;
 const REQUEST_TIMEOUT_MS = 12_000;
+/** An import carries a whole page (up to 12 MB) and Amber extracts it before answering. */
+const IMPORT_TIMEOUT_MS = 60_000;
+/** The most HTML Amber's import accepts. */
+export const MAX_IMPORT_BYTES = 12 * 1024 * 1024;
 /** Poll errors in a row before the capture is reported as unreachable. */
 const POLL_ERROR_LIMIT = 3;
 
@@ -91,10 +113,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /** One request to Amber, with its failure modes folded into `ArticleFetchError`. */
 async function call(
   url: string,
-  init: { method?: string; body?: unknown; signal?: AbortSignal },
+  init: { method?: string; body?: unknown; signal?: AbortSignal; timeoutMs?: number },
 ): Promise<{ status: number; body: any }> {
   if (init.signal?.aborted) throw new ArticleFetchError("aborted");
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const timeout = AbortSignal.timeout(init.timeoutMs ?? REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(url, {
@@ -105,6 +127,8 @@ async function call(
     });
   } catch (err) {
     if (init.signal?.aborted) throw new ArticleFetchError("aborted");
+    // Only an import is given long enough that running out of time means "still working", not "down".
+    if (init.timeoutMs !== undefined && timeout.aborted) throw new ArticleFetchError("timeout");
     throw new ArticleFetchError("amber-down", err instanceof Error ? err.message : String(err));
   }
   let body: any = null;
@@ -205,8 +229,55 @@ export async function waitForArticle(
   }
 }
 
+export interface ImportResult {
+  id: string;
+  /** Whether Amber could read an article out of the page (a paywall stub is saved but not usable). */
+  usable: boolean;
+  wordCount: number;
+  title?: string;
+}
+
+/**
+ * Hand Amber a page's HTML that this browser already loaded (signed in), so the
+ * capture does not depend on Amber's own anonymous fetch. `POST /api/import`; the
+ * new snapshot becomes the newest for `url`. Throws `ArticleFetchError`.
+ */
+export async function importPage(
+  base: string,
+  page: { url: string; html: string; title?: string },
+  signal?: AbortSignal,
+): Promise<ImportResult> {
+  if (page.url.length > MAX_URL_LENGTH) throw new ArticleFetchError("invalid-url", "The link is too long.");
+  const root = baseOf(base);
+  const body: { url: string; html: string; title?: string } = { url: page.url, html: page.html };
+  if (page.title) body.title = page.title;
+  const { status, body: reply } = await call(`${root}/api/import`, {
+    method: "POST",
+    body,
+    signal,
+    timeoutMs: IMPORT_TIMEOUT_MS,
+  });
+  if (status === 201 && typeof reply?.id === "string") {
+    return {
+      id: reply.id,
+      usable: reply.usable === true,
+      wordCount: typeof reply.word_count === "number" ? reply.word_count : 0,
+      title: typeof reply.title === "string" ? reply.title : undefined,
+    };
+  }
+  const detail = detailOf(reply);
+  // 422: Amber took the page but could not turn it into a snapshot.
+  if (status === 400 || status === 422) throw new ArticleFetchError("invalid-url", detail);
+  if (status === 403) throw new ArticleFetchError("forbidden", detail);
+  // An Amber without the import API answers its catch-all for unknown /api paths with 404 or 405.
+  if (status === 404 || status === 405) throw new ArticleFetchError("no-api", detail);
+  if (status === 413) throw new ArticleFetchError("too-big", detail);
+  if (status === 429) throw new ArticleFetchError("busy", detail);
+  throw new ArticleFetchError("amber-down", `Amber answered ${status}`);
+}
+
 /** The text of a snapshot. A 404 means Amber has no readable article behind it (a paywall stub). */
-async function readArticle(base: string, id: string, signal?: AbortSignal): Promise<ArchiveArticle> {
+export async function readArticle(base: string, id: string, signal?: AbortSignal): Promise<ArchiveArticle> {
   let result: Awaited<ReturnType<ReturnType<typeof createArchiveBridge>["getArticles"]>>;
   try {
     result = await createArchiveBridge(base).getArticles({ ids: [id], signal });
