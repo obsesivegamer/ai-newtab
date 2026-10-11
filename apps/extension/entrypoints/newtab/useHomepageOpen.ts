@@ -8,6 +8,8 @@ export const ARTICLE_ID = /^[A-Za-z0-9]{3,16}$/;
 /** The same, for a story that is not in the archive: only an address. */
 export const OPEN_URL = "homepage:open-url";
 export const MAX_OPEN_URL_LENGTH = 2048;
+/** The headline an open-url request may carry, shown as plain text until the article is fetched. */
+export const MAX_OPEN_TITLE_LENGTH = 300;
 /** At most this many open requests are looked at per second; a page cannot spam the reader. */
 export const MESSAGES_PER_SECOND = 3;
 
@@ -50,7 +52,7 @@ export function useHomepageOpen({
     let recent: number[] = [];
 
     const onMessage = (e: MessageEvent) => {
-      const data = e.data as { type?: unknown; id?: unknown; url?: unknown } | null;
+      const data = e.data as { type?: unknown; id?: unknown; url?: unknown; title?: unknown } | null;
       if (!data || typeof data !== "object" || Array.isArray(data)) return;
       if (data.type !== OPEN_ARTICLE && data.type !== OPEN_URL) return;
 
@@ -86,7 +88,9 @@ export function useHomepageOpen({
       const last = lastOpen.current;
       if (last.key === `u:${href}` && now - last.at < 2000) return;
       lastOpen.current = { key: `u:${href}`, at: now };
-      latest.current.onOpen(entryFromUrl(href));
+      const headline =
+        typeof data.title === "string" ? data.title.replace(/\s+/g, " ").trim().slice(0, MAX_OPEN_TITLE_LENGTH) : "";
+      latest.current.onOpen(entryFromUrl(href, headline || undefined));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);

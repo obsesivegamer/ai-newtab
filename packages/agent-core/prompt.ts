@@ -172,11 +172,23 @@ If the same archiveId also appears in the older strip, show the story once.
 permalink:
 
 1. Its headline, and a small "Read" control, are buttons whose click handler is:
-   \`window.parent.postMessage({ type: "homepage:open-url", url: item.link }, "*")\`
-   with item.link exactly as getFeeds returned it. The user's reader fetches
-   the full text and saves it.
+   \`window.parent.postMessage({ type: "homepage:open-url", url: item.link, title: item.title }, "*")\`
+   with item.link and item.title exactly as getFeeds returned them (the title
+   is shown in the reader while the full text is fetched). The user's reader
+   fetches the full text and saves it.
 2. A small "original" anchor: \`<a href={item.link} target="_blank"
    rel="noopener noreferrer">\`.
+
+**Every headline is a link.** The largest text on a card is what a reader
+reaches for first, so it must open something. If you write your own headline
+and summary for a cluster of stories, that text is not a link and must not be
+the only thing a card shows: put the cluster's pieces directly under it, as
+rows whose headlines are the controls above, and make the first row's headline
+as large as the cluster's own. Better still, let a card's headline BE its lead
+piece's own headline (the control), with your summary as the line under it. A
+card that shows only a headline and a paragraph, with no control beneath it, is
+a failure. Never show a summary of a piece without its headline control and
+its Read control next to it.
 
 Do not explain on the page where permalinks lead, how the archive is hosted,
 or that they might not open elsewhere. Items taken from live pages link to that

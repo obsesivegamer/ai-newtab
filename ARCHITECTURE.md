@@ -84,8 +84,9 @@ tab's Sandpack frame. Anything else is ignored. The prompt in
 
 **`homepage:open-url` contract.** For a story from `getFeeds` that is not in the
 archive there is no snapshot id, so the model-written page sends
-`window.parent.postMessage({ type: "homepage:open-url", url: item.link }, "*")`
-(the item's `link`, verbatim). Both `homepage:open-article` and `homepage:open-url`
+`window.parent.postMessage({ type: "homepage:open-url", url: item.link, title: item.title }, "*")`
+(the item's `link`, verbatim; `title` is optional, trimmed to 300 characters and shown as
+plain text in the Reader until the article is fetched, else the host stands in). Both `homepage:open-article` and `homepage:open-url`
 pass one gate in `App.tsx`: the message is a plain object with exactly that `type`;
 its `source` is the `contentWindow` of an iframe inside `.today-frame`; the Today
 tab is showing and no Reader is open (a hidden or covered frame cannot have been
