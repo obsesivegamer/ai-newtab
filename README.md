@@ -224,16 +224,64 @@ sandbox, where shell access is off: scraped pages are untrusted input.
 See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the event flow, the layout, and
 the gotchas worth knowing.
 
+## On your phone (web version)
+
+The same Latest, Library, Today and Reader, in the same dark reading design, as a
+web page for your iPhone. Amber serves it at `/app/` and you reach it over
+Tailscale. It is the extension's own UI code built as a static site
+(`apps/web`), not a copy.
+
+```bash
+pnpm install
+pnpm web:build            # -> apps/web/dist (base path /app/)
+
+# In Amber's checkout: serve it and answer to your tailnet name, then expose it.
+AMBER_WEBAPP_DIR=/path/to/ai-newtab/apps/web/dist \
+AMBER_ALLOWED_HOSTS=<mac>.<tailnet>.ts.net ./run.sh
+tailscale serve --bg --https=443 http://127.0.0.1:8080
+```
+
+Open `https://<mac>.<tailnet>.ts.net/app/` in Safari and use **Share → Add to Home
+Screen** for a full-screen app. This needs an Amber that has the web-app routes
+(`/app/`, `/api/feedproxy`, `/api/homepage`, `/api/sources`).
+
+- **Latest and Library work on their own.** The page reads your sources' feeds
+  through Amber (`/api/feedproxy`), so it needs nothing else.
+- **Today is built on your Mac.** After each successful build the extension
+  hands the page to Amber (`PUT /api/homepage`), and the phone shows it with the
+  time it was built. Until you have built one, the phone says "No Today page
+  yet." There is no API key, build or model on the phone.
+- **Sources are shared.** Saving **Settings → Sources** in the extension also
+  sends the list to Amber (`PUT /api/sources`); the phone adopts it on load, and
+  edits made on the phone are sent back. Without a stored list the phone seeds
+  from your archive like the extension does.
+- **Tapping a story saves it** exactly as on the Mac (a tap, never a swipe or
+  prev/next), through Amber's `POST /api/save`.
+- **Not on the phone:** *Capture with my browser* (it needs your Mac's signed-in
+  browser), building Today, browsing history, and editing the blocked-sites list
+  (the phone uses the default list).
+
+**Security model.** There is no login. Whoever can reach the address can read your
+archive and save to it, so keep it on your tailnet: use `tailscale serve`, never
+`tailscale funnel` (which publishes to the open internet), and use Tailscale ACLs
+if other people are on your tailnet. Amber still listens only on `127.0.0.1`;
+`tailscale serve` is what makes it reachable, over HTTPS, to your own devices.
+The Today page you publish (`homepage.json`) and your sources (`sources.json`)
+are stored in Amber's data directory and contain your reading, so treat them like
+the archive.
+
 ## Development
 
 ```
 packages/agent-core   the agent loop: host-agnostic, no chrome.* or node:*
 apps/extension        the MV3 extension (WXT + React)
+apps/web              the phone/web version (Vite + React): imports the extension's new-tab UI, served by Amber at /app/
 harness               Bun scripts that run agent-core outside Chrome, and test the built extension
 ```
 
 ```bash
 pnpm dev                 # WXT with hot reload
+pnpm web:build           # the phone/web version -> apps/web/dist
 pnpm typecheck           # all packages
 pnpm test                # unit tests (no API calls; needs Bun)
 pnpm extension:test      # loads the built extension into headless Chrome (no API calls)

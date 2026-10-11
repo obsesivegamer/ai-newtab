@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en" class="web" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Latest</title>
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#161412" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#faf7f0" media="(prefers-color-scheme: light)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Newspage" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icon/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="./icon/192.png" />
+    <style>
+      /* Painted before any script runs, so a slow start is not a white flash. */
+      html { background: #161412; }
+      html[data-theme="light"] { background: #faf7f0; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+  </body>
+</html>

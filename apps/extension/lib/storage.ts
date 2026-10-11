@@ -104,7 +104,8 @@ export async function loadHomepage(): Promise<Homepage | undefined> {
   return extensionStore.get<Homepage>(KEYS.homepage);
 }
 
-export async function saveHomepage(code: string): Promise<void> {
+export async function saveHomepage(code: string): Promise<Homepage> {
   const homepage: Homepage = { code, timestamp: new Date().toISOString() };
   await extensionStore.set(KEYS.homepage, homepage);
+  return homepage;
 }

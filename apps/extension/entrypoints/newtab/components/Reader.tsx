@@ -3,6 +3,7 @@ import { hostOf, isAllowedUrl, type ArchiveArticle, type ArchiveArticleMeta } fr
 import { createArchiveBridge } from "@/lib/archive";
 import { fetchFullArticle, type FetchFailure, type FetchStage } from "@/lib/archive-save";
 import { importFromBrowser } from "@/lib/browser-capture";
+import { IS_WEB } from "@/lib/platform";
 import { toReadable, wordCount } from "../articleText";
 import { formatDate, readingMinutes } from "../format";
 import type { ReaderEntry } from "../readerEntry";
@@ -534,6 +535,7 @@ export function Reader({
   const viaBrowser = load.status === "fetching" && load.stage.startsWith("browser-");
   // The third way out of a page Amber could not read: load it in this signed-in browser instead.
   const canCaptureWithBrowser =
+    !IS_WEB &&
     load.status === "error" &&
     !!originalUrl &&
     isAllowedUrl(originalUrl, blockedSites) &&
@@ -559,23 +561,23 @@ export function Reader({
         </button>
         <span className="bar-spacer" />
         {position >= 0 && (
-          <span className="meta bar-pos">
+          <span className="meta bar-pos bar-nav">
             {position + 1} of {list.length}
           </span>
         )}
         {position >= 0 && (
           <>
-            <button type="button" className="icon-btn" disabled={!previous} onClick={() => previous && onNavigate(previous)} title="Previous article (k)" aria-label="Previous article">
+            <button type="button" className="icon-btn bar-nav" disabled={!previous} onClick={() => previous && onNavigate(previous)} title="Previous article (k)" aria-label="Previous article">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="m6 15 6-6 6 6" />
               </svg>
             </button>
-            <button type="button" className="icon-btn" disabled={!next} onClick={() => next && onNavigate(next)} title="Next article (j)" aria-label="Next article">
+            <button type="button" className="icon-btn bar-nav" disabled={!next} onClick={() => next && onNavigate(next)} title="Next article (j)" aria-label="Next article">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="m6 9 6 6 6-6" />
               </svg>
             </button>
-            <span className="bar-rule" />
+            <span className="bar-rule bar-nav" />
           </>
         )}
         <button type="button" className="icon-btn text-btn" disabled={!canShrink} onClick={shrink} title="Smaller text" aria-label="Smaller text">
@@ -738,6 +740,27 @@ export function Reader({
           )}
         </article>
       </div>
+
+      {IS_WEB && position >= 0 && (
+        // The phone has no keyboard: prev/next live in a thumb-height bar at the bottom.
+        <nav className="reader-dock" aria-label="Articles in this list">
+          <button type="button" className="dock-btn" disabled={!previous} onClick={() => previous && onNavigate(previous)}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+            Previous
+          </button>
+          <span className="meta dock-pos">
+            {position + 1} of {list.length}
+          </span>
+          <button type="button" className="dock-btn" disabled={!next} onClick={() => next && onNavigate(next)}>
+            Next
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m9 5 7 7-7 7" />
+            </svg>
+          </button>
+        </nav>
+      )}
     </div>
   );
 }

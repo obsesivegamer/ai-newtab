@@ -263,6 +263,58 @@ Settings: saving the Sources list or the archive address never starts a build. T
 footer offers "Save & rebuild" only when the instructions or the blocked-sites list
 changed; otherwise it is just "Save".
 
+## Phone / web version
+
+`apps/web` is the new-tab reader as a static site for a phone: Latest, Library, a
+read-only Today and the Reader. Amber serves its build at `/app/`
+(`AMBER_WEBAPP_DIR`) and the page is **same-origin with Amber's API**, so the
+archive address is `location.origin` (there is no address setting) and nothing
+needs CORS. The agent loop, the API key and the service worker do not exist in it.
+
+It reuses the extension's code by import, not by copy: `apps/web/vite.config.ts`
+aliases `@/` to `apps/extension` and imports `entrypoints/newtab/{components,
+useLatest, useArchiveList, uiPrefs, readerEntry, format, articleText, styles.css}`
+as they are. Only three seams differ:
+
+| Seam | Extension | Web |
+|---|---|---|
+| `browser.*` | the real WebExtension API | `src/shims/browser.ts`: `storage.local` over `localStorage` (+ `onChanged`), an empty `history`, inert `runtime` |
+| `@/lib/platform` (`IS_WEB`) | `false` | `true`: no "Capture with my browser", the Reader gets a bottom prev/next dock, a phone-size default text size |
+| `@/lib/browser-capture` | tabs/scripting capture | a stub, so that code never reaches the bundle |
+
+`apps/extension/lib/phone-sync.ts` is the shared client for the two things the
+extension and the phone exchange through Amber (Amber only stores them; all of it
+is best-effort and never blocks a build or a settings save):
+
+| Endpoint | Written by | Read by | Shape |
+|---|---|---|---|
+| `PUT /api/homepage` | the worker, after each successful build, when an archive address is configured (`pushHomepage`) | web Today (`GET`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`) |
+| `PUT /api/sources` | Settings → Sources → Save in the extension; the web Settings on every edit, debounced 800 ms (`pushSources`) | web on load (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }] }`, answered with `updated_at` |
+
+Other web-specific behaviour:
+
+- **Feeds go through `GET /api/feedproxy?url=`.** `src/feedProxy.ts` wraps
+  `window.fetch` once: a GET to another origin is rerouted to the proxy, same-origin
+  calls pass through, and the response is given the publisher's address as its `url`
+  so agent-core's private-redirect check still reads the right host. agent-core's feed
+  code is unchanged and keeps calling `fetch`; the Settings feed probe goes through the
+  same wrapper.
+- **Today (`TodayStatic`)** fetches `/api/homepage`, transpiles it with `toRenderable`
+  and renders it in the same sandboxed Sandpack frame (`HomepagePreview`), with
+  "Built <time> on your Mac". Open requests from that frame use the *same gate* as the
+  extension: both apps call `entrypoints/newtab/useHomepageOpen.ts` (exact message
+  `type`, `source` is an iframe inside `.today-frame`, Today showing, no Reader or
+  Settings open, 3 per second, 2 s repeat window, URL validation + `isAllowedUrl`;
+  it only ever opens the Reader and never navigates or saves).
+- **Saving rules are unchanged**: a tap on a Latest row is the gesture (`POST
+  /api/save`, same-origin JSON); prev/next, the dock, and anything from Today only
+  look up. Reader's "Open original" is `target=_blank`.
+- **Amber's CSP for `/app/`** allows `script-src 'self'`, `connect-src 'self'` and
+  `frame-src https://*.codesandbox.io` (Sandpack's bundler frame), so Today needs the
+  phone to reach codesandbox.io.
+- **Security model:** no login; the tailnet is the boundary. Expose with
+  `tailscale serve`, never Funnel. See the README's "On your phone" section.
+
 ## Layout
 
 ```
@@ -302,7 +354,17 @@ apps/extension/           MV3 extension (WXT + React)
     protocol.ts           page ↔ worker messages and the five UI build steps
     auto-rebuild.ts       when to rebuild on a schedule
     storage.ts            chrome.storage keys, settings (incl. archiveUrl), saved homepage
+    phone-sync.ts         PUT/GET /api/homepage and /api/sources: what the extension and the phone share through Amber
+    platform.ts           IS_WEB = false (apps/web aliases it to true)
     transpile.ts          TSX → JS for the preview
+
+apps/web/                 the phone/web version: Vite + React, imports the extension's new-tab UI (see "Phone / web version")
+  src/shims/browser.ts    `browser.storage.local` over localStorage, empty history
+  src/feedProxy.ts        cross-origin GETs -> /api/feedproxy
+  src/WebApp.tsx          Latest / Library / Today / Reader shell, bottom tab bar
+  src/TodayStatic.tsx     GET /api/homepage -> Sandpack
+  src/WebSettings.tsx     theme + sources only
+  src/web.css             phone layout, scoped to html.web
 
 harness/                  Bun scripts: drive agent-core with a fixture/fetch bridge (an Amber
                           ArchiveBridge reading AMBER_URL, a FeedBridge reading FEEDS or the known
@@ -417,6 +479,7 @@ existing ones: `getArchive` reports `history`, `getArchiveArticles` reports
 | `pnpm agent:resume-test` | A build killed with a tool call pending can be reattached and finished |
 | `pnpm agent:retention <sessionId>` | The session and every uploaded page body are actually deleted |
 | `pnpm extension:test` | In headless Chrome: worker registers, new tab renders, port protocol answers, `chrome.history` reads |
+| `.claude/skills/verify-newtab/scripts/verify-web.py` | The phone version in an iPhone-14 emulation against a throwaway Amber on a data copy: feeds only via the proxy, tap-to-save, Reader prev/next, Settings sync, Today from a published page, the open-article gate, no overflow at 375/390/430 |
 
 The `agent:*` commands need `ANTHROPIC_API_KEY` in `.env` and spend API credits. The
 harness's bridge uses fixture history and a plain `fetch`, so it can't see
@@ -488,6 +551,15 @@ browser rendered it, so it may contain personal account details (your name, emai
 subscriber id, tokens in inline scripts or hidden fields). It is stored as a
 snapshot in your local archive and stays there; treat the archive, and screenshots
 of it, as private.
+
+**The phone version** (`apps/web`) has no login: it is protected only by being
+reachable on your tailnet. It can read your archive and save to it, and what the
+extension publishes to Amber (`homepage.json`, with titles and blurbs from your
+reading, and `sources.json`) is stored in Amber's data directory and served to
+anyone who can reach it. Nothing in it reaches Anthropic: there is no key, build or
+model there. Never expose it with `tailscale funnel`. The published Today page is
+model-written code and runs only in the sandboxed Sandpack frame, under the same
+open-request gate as in the extension.
 
 The session event log persists every domain, title and scraped page body server-side
 until deleted, and uploaded files persist independently. `runHomepageBuild` deletes

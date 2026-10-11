@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { IS_WEB } from "@/lib/platform";
 
 /**
  * View preferences for the new tab (theme, reader text size). They live under
@@ -65,6 +66,13 @@ export function useTheme() {
 /** Reader body sizes in px. The default sits at 20, the brief's 19-20px. */
 export const TEXT_SIZES = [16, 18, 20, 22, 24, 27] as const;
 const DEFAULT_SIZE_INDEX = 2;
+/** The web app starts one step larger on a phone-width screen, where 20px reads small at arm's length. */
+const PHONE_SIZE_INDEX = 3;
+
+function defaultSizeIndex(): number {
+  if (!IS_WEB || typeof window.matchMedia !== "function") return DEFAULT_SIZE_INDEX;
+  return window.matchMedia("(max-width: 640px)").matches ? PHONE_SIZE_INDEX : DEFAULT_SIZE_INDEX;
+}
 
 function validSizeIndex(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < TEXT_SIZES.length;
@@ -90,7 +98,7 @@ function writeSizeMirror(index: number) {
 
 export function useTextSize() {
   // Read synchronously from the localStorage mirror so the Reader opens at the right size.
-  const [index, setIndex] = useState(() => readSizeMirror() ?? DEFAULT_SIZE_INDEX);
+  const [index, setIndex] = useState(() => readSizeMirror() ?? defaultSizeIndex());
   const touched = useRef(false);
 
   useEffect(() => {

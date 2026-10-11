@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DEFAULT_MODEL,
   DEFAULT_BLOCKED_SITES,
-  isAllowedUrl,
   type ArchiveArticleMeta,
   type HomepageModel,
 } from "@homepage/agent-core";
@@ -19,25 +18,11 @@ import { Library } from "./components/Library";
 import { Reader } from "./components/Reader";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ViewTabs, type View } from "./components/ViewTabs";
-import {
-  entryFromArchive,
-  entryFromId,
-  entryFromUrl,
-  articleKey,
-  type ReaderEntry,
-} from "./readerEntry";
+import { entryFromArchive, articleKey, type ReaderEntry } from "./readerEntry";
 import { useTheme } from "./uiPrefs";
 import { useArchiveList } from "./useArchiveList";
 import { useHomepageBuild } from "./useHomepageBuild";
-
-/** What the model-built homepage may ask the page to open. Anything else is ignored. */
-const OPEN_ARTICLE = "homepage:open-article";
-const ARTICLE_ID = /^[A-Za-z0-9]{3,16}$/;
-/** The same, for a story that is not in the archive: only an address. */
-const OPEN_URL = "homepage:open-url";
-const MAX_OPEN_URL_LENGTH = 2048;
-/** At most this many open requests are looked at per second; a page cannot spam the reader. */
-const MESSAGES_PER_SECOND = 3;
+import { useHomepageOpen } from "./useHomepageOpen";
 
 /** Where the reader was opened from, which decides its back label and where focus returns. */
 type ReaderOrigin = "latest" | "library" | "today";
@@ -136,73 +121,12 @@ export default function App() {
     });
   }, [showSettings]);
 
-  // The message handler below is installed once, so it reads what it needs through refs.
-  const viewRef = useRef(view);
-  viewRef.current = view;
-  const readerOpenRef = useRef(false);
-  const settingsOpenRef = useRef(false);
-  settingsOpenRef.current = showSettings;
-  const blockedRef = useRef(blockedSites);
-  blockedRef.current = blockedSites;
-  /** The last open request let through, so an immediate repeat is dropped; cleared when the Reader closes. */
-  const lastOpen = useRef({ key: "", at: 0 });
-
-  // The model-built homepage asks to open a story in the native reader: an archived one by
-  // id, or one that is not in the archive by address. It can only ever open the in-page
-  // reader; it never navigates this page, opens a window, or saves anything by itself.
-  useEffect(() => {
-    const fromHomepage = (source: MessageEventSource | null) => {
-      // Only the homepage's own Sandpack frame may ask; the model's code runs in there.
-      const frames = document.querySelectorAll<HTMLIFrameElement>(".today-frame iframe");
-      return Array.from(frames).some((frame) => frame.contentWindow !== null && frame.contentWindow === source);
-    };
-    let recent: number[] = [];
-
-    const onMessage = (e: MessageEvent) => {
-      const data = e.data as { type?: unknown; id?: unknown; url?: unknown } | null;
-      if (!data || typeof data !== "object" || Array.isArray(data)) return;
-      if (data.type !== OPEN_ARTICLE && data.type !== OPEN_URL) return;
-
-      // The same gate for both: only the homepage's own frame, only while the Today tab is
-      // showing (a hidden or covered frame can't have been clicked), and not on top of an
-      // open Reader or Settings. Bursts are dropped and an immediate repeat is ignored.
-      if (!fromHomepage(e.source)) return;
-      if (viewRef.current !== "today" || readerOpenRef.current || settingsOpenRef.current) return;
-      const now = Date.now();
-      recent = recent.filter((t) => now - t < 1000);
-      if (recent.length >= MESSAGES_PER_SECOND) return;
-      recent.push(now);
-
-      if (data.type === OPEN_ARTICLE) {
-        if (typeof data.id !== "string" || !ARTICLE_ID.test(data.id)) return;
-        const id = data.id;
-        const last = lastOpen.current;
-        if (last.key === `a:${id}` && now - last.at < 2000) return;
-        lastOpen.current = { key: `a:${id}`, at: now };
-        setReader({ entry: entryFromId(id), list: [], origin: "today" });
-        return;
-      }
-
-      if (typeof data.url !== "string" || data.url.length === 0 || data.url.length > MAX_OPEN_URL_LENGTH) return;
-      let parsed: URL;
-      try {
-        parsed = new URL(data.url);
-      } catch {
-        return;
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
-      if (parsed.username || parsed.password) return;
-      if (!isAllowedUrl(parsed.href, blockedRef.current)) return;
-      // The model's links arrive with `'` percent-encoded; the publisher's address has the apostrophe.
-      const href = parsed.href.replace(/%27/gi, "'");
-      const last = lastOpen.current;
-      if (last.key === `u:${href}` && now - last.at < 2000) return;
-      lastOpen.current = { key: `u:${href}`, at: now };
-      setReader({ entry: entryFromUrl(href), list: [], origin: "today" });
-    };
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
+  // The model-built homepage may ask to open a story in the Reader: one gate, shared with the web app.
+  const { reset: resetOpenRequests } = useHomepageOpen({
+    canOpen: view === "today" && reader === null && !showSettings,
+    blockedSites,
+    onOpen: (entry) => setReader({ entry, list: [], origin: "today" }),
+  });
 
   const openLibraryArticle = useCallback((id: string, list: ArchiveArticleMeta[]) => {
     const entries = list.map(entryFromArchive);
@@ -227,9 +151,9 @@ export default function App() {
   }, []);
   const closeReader = useCallback(() => {
     // Closing is the person's answer to the last request: asking again right away is a new click.
-    lastOpen.current = { key: "", at: 0 };
+    resetOpenRequests();
     setReader(null);
-  }, []);
+  }, [resetOpenRequests]);
   const readerSaved = useCallback(
     (entry: ReaderEntry, meta: ArchiveArticleMeta, created: boolean) => {
       if (entry.url) {
@@ -243,7 +167,6 @@ export default function App() {
 
   // Put keyboard focus back on the row the reader was opened from.
   const readerOpen = reader !== null;
-  readerOpenRef.current = readerOpen;
   const openedFrom = useRef<ReaderOrigin>("library");
   if (reader) openedFrom.current = reader.origin;
   const wasReaderOpen = useRef(false);

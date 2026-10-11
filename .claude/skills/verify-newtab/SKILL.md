@@ -1,11 +1,29 @@
 ---
 name: verify-newtab
-description: Visually verify the AI new-tab extension (Latest, Library, Reader, Settings, Today, Amber-down) in headless Chrome against a throwaway Amber running on a COPY of the data, in dark and light. Use after any change to apps/extension/entrypoints/newtab (components, styles.css, App.tsx), apps/extension/lib/archive.ts, or anything else that changes what the new-tab page looks like or how it talks to Amber.
+description: Visually verify the AI new-tab extension (Latest, Library, Reader, Settings, Today, Amber-down) in headless Chrome against a throwaway Amber running on a COPY of the data, in dark and light. Also verifies the phone/web version (apps/web) in an iPhone emulation via scripts/verify-web.py. Use after any change to apps/extension/entrypoints/newtab (components, styles.css, App.tsx), apps/extension/lib/archive.ts, apps/web, or anything else that changes what the new-tab page looks like or how it talks to Amber.
 ---
 
 # verify-newtab
 
 One command builds nothing by default, copies Amber's data to a temp dir, starts a throwaway Amber on the copy, loads the built extension into headless Chrome, drives the real UI, saves screenshots, and prints DOM assertions. Nothing is written into the repo.
+
+## Web version (phone): `scripts/verify-web.py`
+
+The phone/web build (`apps/web`, served by Amber at `/app/`) has its own sibling script. It is Python/Playwright, so run it with Amber's venv:
+
+```bash
+npx -y pnpm@10.11.1 web:build          # or pass --build
+~/Documents/amber-archive/.venv/bin/python .claude/skills/verify-newtab/scripts/verify-web.py \
+  --amber-dir ~/Documents/amber-archive-webapp-api --out /tmp/shots-web
+```
+
+`--amber-dir` must be an Amber checkout that has the web-app routes (`/app/`, `/api/feedproxy`, `/api/homepage`, `/api/sources`) and a venv-less worktree is fine: the interpreter running the script is used. Other flags: `--data-from` (data dir to COPY, default `~/Documents/amber-archive/data`), `--port` (default 8116; 8080 is refused), `--homepage` (TSX published for the Today checks, default `harness/out/homepage.tsx`), `--no-save` (skip the live capture of a Latest story), `--build`.
+
+It copies the data, starts Amber on the copy with `AMBER_WEBAPP_DIR=apps/web/dist`, drives Chromium as an iPhone 14 (390x844 @3x, touch, mobile UA; also 375x667, 375x812, 430x932 for overflow), and stops Amber by PID on exit. About 3 minutes (a live capture of a Guardian/Reuters story is part of it).
+
+Hard assertions: all feed traffic goes through `/api/feedproxy` and nothing else leaves the origin (except Sandpack's frame), no console errors, no horizontal overflow, 44px tap targets, pinned top and tab bars, Reader prev/next works by tap, loading and walking save nothing, a tap on a Latest story is exactly one `POST /api/save`, the saved story becomes "In Amber", settings edits `PUT /api/sources` (debounced) and Amber holds them, a feed added in Settings is probed through the proxy, theme follows `prefers-color-scheme` and survives a reload, Today's empty state, a published homepage renders in Sandpack with "Built ... on your Mac", `homepage:open-article` from the frame opens the Reader and the gate refuses the page itself, a hidden Today, an open Reader, bad URLs, and no save for `homepage:open-url`, and the manifest/icons/meta tags that "Add to Home Screen" needs.
+
+Screenshots (`01-latest-dark.png` ... `17-today-375x667.png`, dark and light for the main views) are the real check: open each one with the Read tool. Chromium is not Safari, so safe-area insets (`env(safe-area-inset-*)`, notch, home indicator) and standalone mode can only be verified on a real iPhone.
 
 ## Run it
 

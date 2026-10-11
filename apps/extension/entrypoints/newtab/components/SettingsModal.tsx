@@ -9,6 +9,7 @@ import {
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
+import { pushSources } from "@/lib/phone-sync";
 import { addFeedUrl, loadSources, mergeSeeded, saveSources, seedFromArchive } from "@/lib/sources";
 import { loadSettings, saveSetting } from "@/lib/storage";
 
@@ -188,7 +189,11 @@ export function SettingsModal({
     archiveRequest.current++;
     // Written before the rebuild starts, so the build reads the new address.
     if (archiveLoaded) await saveSetting("archiveUrl", value);
-    if (sources && sourcesDirty) await saveSources(sources);
+    if (sources && sourcesDirty) {
+      await saveSources(sources);
+      // The phone/web version reads the same list from Amber. Best-effort and never awaited.
+      if (value) void pushSources(value, sources);
+    }
     onSave(draft, normalizeBlockList(blockedDraft.split("\n")), rebuild && rebuildMeaningful);
   };
 

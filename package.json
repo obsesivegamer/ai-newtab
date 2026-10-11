@@ -5,6 +5,7 @@
   "scripts": {
     "build": "pnpm --filter @homepage/extension build",
     "dev": "pnpm --filter @homepage/extension dev",
+    "web:build": "pnpm --filter @homepage/web build",
     "typecheck": "pnpm -r typecheck",
     "test": "bun test harness/",
     "agent:run": "bun harness/run-agent.ts",

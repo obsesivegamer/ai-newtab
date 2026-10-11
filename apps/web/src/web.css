@@ -1,0 +1,463 @@
+/* =========================================================================
+   Phone layout for the web version. Loaded after the extension's styles.css and
+   scoped to `html.web`, so nothing here can reach the extension. Written for a
+   375-430px portrait iPhone, still fine on a desktop browser.
+   ========================================================================= */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --tabbar-h: 52px;
+  --gutter: 18px;
+}
+
+html.web {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+/* `clip`, not `hidden`: hidden would make the body a scroll container and break the sticky bars. */
+html.web,
+html.web body {
+  overflow-x: clip;
+}
+html.web body {
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+/* Rows, titles and article text stay selectable; chrome does not get a magnifier on a long press. */
+html.web .topbar,
+html.web .web-tabbar,
+html.web .reader-bar,
+html.web .reader-dock,
+html.web .chip,
+html.web .tab {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ---- top bar: brand + settings + theme, below the status bar ---- */
+.web .topbar {
+  box-sizing: border-box;
+  height: calc(var(--bar-h) + var(--safe-top));
+  padding: var(--safe-top) max(8px, var(--safe-right)) 0 max(var(--gutter), var(--safe-left));
+}
+.web-brand {
+  letter-spacing: 0.1em;
+}
+
+/* ---- bottom tab bar: the three views, under the thumb ---- */
+.web-tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  box-sizing: border-box;
+  padding: 0 var(--safe-right) var(--safe-bottom) var(--safe-left);
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.web-tabbar .tabs {
+  gap: 0;
+  height: var(--tabbar-h);
+}
+.web-tabbar .tab {
+  flex: 1;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0;
+  font-size: 15px;
+}
+.web-tabbar .tab.active::after {
+  left: 28%;
+  right: 28%;
+  top: -1px;
+  bottom: auto;
+}
+.web .main {
+  min-height: 0;
+  padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom));
+}
+
+/* ---- Latest and Library ---- */
+.web .lib {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 18px max(var(--gutter), var(--safe-right)) 36px max(var(--gutter), var(--safe-left));
+}
+.web .lib-head {
+  margin-bottom: 14px;
+  min-height: 44px;
+  align-items: center;
+}
+.web .lib-title {
+  font-size: 32px;
+}
+.web .latest-tools {
+  margin-right: -10px;
+}
+.web .search {
+  gap: 10px;
+  padding: 0 2px;
+}
+.web .search input {
+  padding: 14px 0;
+  font-size: 16px; /* under 16px, iOS zooms the page when the field is focused */
+}
+.web .chips {
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin: 12px calc(var(--gutter) * -1) 4px;
+  padding: 0 var(--gutter);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  scroll-padding: 0 var(--gutter);
+}
+.web .chips::-webkit-scrollbar {
+  display: none;
+}
+.web .chip {
+  flex: none;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
+  font-size: 14px;
+}
+.web .day {
+  top: calc(var(--bar-h) + var(--safe-top));
+}
+.web .row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  width: calc(100% + 16px);
+  margin: 0 -8px;
+  padding: 14px 8px 15px;
+  min-height: 44px;
+  scroll-margin-top: calc(var(--bar-h) + var(--safe-top) + 56px);
+}
+.web .row-title {
+  font-size: 18px;
+}
+.web .latest-blurb {
+  font-size: 15px;
+}
+/* A wrapped author line would start with a stray separator dot; the site name already sets it apart. */
+.web .row-meta > span + span:not(.tag)::before {
+  content: none;
+}
+.web .row-meta {
+  gap: 2px 12px;
+}
+.web .row-time {
+  padding-top: 3px;
+  font-size: 11.5px;
+}
+.web .ghost-btn {
+  min-height: 44px;
+  padding: 0 18px;
+  font-size: 15px;
+  justify-content: center;
+}
+.web .ghost-btn.small {
+  min-height: 44px;
+  padding: 0 12px;
+  font-size: 14px;
+}
+.web .solid-btn {
+  min-height: 44px;
+  padding: 0 20px;
+  font-size: 15px;
+}
+.web .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+.web .latest-problem {
+  gap: 8px;
+  padding: 0;
+  font-size: 14px;
+}
+.web .latest-problem .ghost-btn.small {
+  margin-left: auto;
+  padding: 0 12px;
+  color: var(--accent);
+  border-color: transparent;
+}
+.web .notice {
+  margin-top: 28px;
+  padding-top: 20px;
+}
+
+/* No keyboard on a phone: the j / k / "/" hints would only be noise. */
+@media (hover: none) and (pointer: coarse) {
+  .web .search kbd,
+  .web .lib-foot .keys {
+    display: none;
+  }
+  .web .lib-foot {
+    margin-top: 24px;
+  }
+  /* Hover has no meaning under a finger and would stick after a tap. */
+  .web .row:hover:not(.cursor),
+  .web .chip:hover,
+  .web .ghost-btn:hover,
+  .web .icon-btn:hover:not(:disabled),
+  .web .next-card:hover,
+  .web .back-btn:hover,
+  .web .tab:hover {
+    background: none;
+  }
+  .web .chip:hover {
+    color: var(--muted);
+    border-color: var(--border);
+  }
+  .web .chip.on:hover {
+    color: var(--accent);
+    border-color: var(--accent-line);
+    background: var(--accent-wash);
+  }
+  .web .ghost-btn:hover {
+    border-color: var(--border);
+  }
+  .web .ghost-btn.small:hover {
+    border-color: transparent;
+  }
+  .web .row.cursor {
+    background: none;
+  }
+}
+
+/* ---- Today ---- */
+.web .today-pane {
+  height: calc(100dvh - var(--bar-h) - var(--safe-top) - var(--tabbar-h) - var(--safe-bottom));
+  overflow: hidden;
+}
+.today-strip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 max(var(--gutter), var(--safe-right)) 0 max(var(--gutter), var(--safe-left));
+  min-height: 44px;
+  border-bottom: 1px solid var(--border);
+}
+.today-built {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 12.5px;
+}
+.web .today-frame {
+  position: relative;
+  overflow: hidden;
+}
+.web .today-frame iframe {
+  max-width: 100%;
+}
+.web .gate.web-gate {
+  box-sizing: border-box;
+  align-self: stretch;
+  width: 100%;
+  max-width: none;
+
+  padding: 40px max(var(--gutter), var(--safe-right)) 40px max(var(--gutter), var(--safe-left));
+}
+.web .gate-title {
+  font-size: 30px;
+}
+.web .pane-msg {
+  padding: 48px 18px;
+}
+
+/* ---- Reader ---- */
+.web .reader-bar {
+  box-sizing: border-box;
+  height: calc(var(--bar-h) + var(--safe-top));
+  padding: var(--safe-top) max(6px, var(--safe-right)) 0 max(4px, var(--safe-left));
+}
+.web .reader-bar .bar-nav {
+  display: none;
+}
+.web .back-btn {
+  min-height: 44px;
+  padding: 0 12px 0 6px;
+  font-size: 16px;
+}
+.web .reader-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+.web .reader-article {
+  box-sizing: border-box;
+  max-width: 36em;
+  padding: 28px max(20px, var(--safe-right)) 48px max(20px, var(--safe-left));
+}
+.web .reader-site {
+  margin-bottom: 12px;
+}
+.web .reader-title {
+  font-size: 1.42em;
+  line-height: 1.2;
+}
+.web .reader-deck {
+  margin-top: 14px;
+  font-size: 0.92em;
+}
+.web .reader-meta {
+  margin-top: 18px;
+}
+.web .reader-links {
+  gap: 0 8px;
+  margin-top: 8px;
+  padding-bottom: 24px;
+}
+.web .reader-links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  border-bottom: none;
+  text-decoration: underline;
+  text-decoration-color: var(--accent-line);
+  text-underline-offset: 5px;
+}
+.web .reader-body {
+  margin-top: 28px;
+  line-height: 1.6;
+}
+.web .reader-foot {
+  margin-top: 40px;
+}
+.web .next-card {
+  padding: 18px;
+}
+.web .reader-fetch.idle .solid-btn {
+  font-size: 15px;
+}
+.web .notice-actions {
+  gap: 8px;
+}
+.reader-dock {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px max(10px, var(--safe-right)) calc(4px + var(--safe-bottom)) max(10px, var(--safe-left));
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.dock-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 112px;
+  min-height: 48px;
+  padding: 0 12px;
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.dock-btn:active:not(:disabled) {
+  background: var(--hover);
+}
+.dock-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.dock-btn:last-child {
+  color: var(--accent);
+}
+.dock-pos {
+  flex: 1;
+  text-align: center;
+}
+
+/* ---- Settings: a full-height sheet ---- */
+@media (max-width: 640px) {
+  .web .modal {
+    height: 100dvh;
+    max-height: 100dvh;
+  }
+  .web .modal-head {
+    padding-top: calc(10px + var(--safe-top));
+    padding-left: max(20px, var(--safe-left));
+  }
+  .web .modal-body {
+    padding: 20px max(20px, var(--safe-right)) 28px max(20px, var(--safe-left));
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .web .modal-foot {
+    padding-bottom: calc(12px + var(--safe-bottom));
+  }
+  .web .modal-foot .solid-btn {
+    width: 100%;
+  }
+}
+.web .field,
+.web .field.mono {
+  min-height: 44px;
+  font-size: 16px;
+}
+.web .set-row {
+  min-height: 48px;
+  margin-top: 4px;
+  font-size: 16px;
+}
+.web .switch {
+  box-sizing: content-box;
+  width: 51px;
+  height: 31px;
+  padding: 7px 4px;
+  background-color: var(--border);
+  background-clip: content-box;
+  border-radius: 999px;
+}
+.web .switch:checked {
+  background-color: var(--accent);
+}
+.web .switch::before {
+  top: 9px;
+  left: 6px;
+  width: 27px;
+  height: 27px;
+}
+.web .switch:checked::before {
+  transform: translateX(20px);
+  background: #faf7f0;
+}
+.web .src-row,
+.web .src-row.off {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 4px 4px;
+  padding: 6px 4px 6px 14px;
+}
+.web .src-row .ghost-btn {
+  grid-column: auto;
+  justify-self: auto;
+}
+.web .src-name {
+  font-size: 16px;
+}
+.web .src-add .ghost-btn {
+  flex: none;
+}
+.mono-inline {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
