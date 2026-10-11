@@ -144,6 +144,90 @@ of a person's gesture on a story.
 - A found snapshot that is not `usable` is treated as not archived. Failures come
   back typed: `amber-down`, `no-api` (an Amber without the save API), `busy`,
   `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`.
+- **Capture with my browser** is a third button next to "Try capturing again" /
+  "Try again" and "Open original" in the Reader's `paywall-stub` ("No article text
+  came back"), `capture-failed` and archived-but-no-text failure states, and it is
+  the retry after a failed browser attempt. It is a gesture like the others and
+  one-shot: the click's attempt (`attemptRef.browser`) is spent the moment it
+  starts, so a re-render, walking away and back, or j/k never runs it again, and
+  it is never offered or run on navigation, prefetch or a message from the
+  model-built page. It does not use the save API at all (see below).
+
+**Capture with my browser** (`lib/browser-capture.ts`, `importFromBrowser`).
+Amber's own capture is anonymous, so a subscriber's paywall hands it a stub. The
+extension runs in the signed-in browser, so it loads the article there and gives
+Amber the HTML:
+
+1. A cheap read-only `GET /api/lookup` on the story first: if Amber is down or has
+   no JSON API the Reader says so before any window opens.
+2. `captureWithBrowser(url, { signal, onStatus })` refuses without opening anything
+   unless `url` is http(s), has no credentials, is not on a loopback, private or
+   local-network host and `isAllowedUrl` passes against the blocked-sites list
+   (read from storage at that moment, not from a prop). It then opens a background
+   window straight on the URL (`createScraperWindow(url)`, the same unfocused window
+   `getPageHtml` uses) and mutes its tab. It waits for load (30 s; a page that is
+   still "loading" at 30 s is used if `document.readyState` is `interactive` or
+   `complete`), then 2 s of settle. **Before the page is scrolled or read** its
+   address is checked again: it must pass `isAllowedUrl` and be the *same site* as
+   the story asked for (`sameSite`, which mirrors Amber's rule exactly; Amber is the authority, see its
+   README "Same-site rule for final_url": the same host or the same registrable
+   domain, and the same port or both on a default port; scheme not compared; the
+   registrable domain is the longest matching suffix from a fixed list of
+   two-label public suffixes and shared-hosting suffixes plus one label, else the
+   last two labels; IP literals match exactly). A redirect to a sign-in host or a shortener therefore ends
+   the capture with "The page sent your browser to <host>. Sign in there first,
+   then try again." and nothing is read or sent. The check runs again on the
+   address the script read the page from. The page is scrolled with the same
+   content script as the scraper (cut off after about 8 s in this mode, and never
+   started twice after a timeout) and `document.documentElement.outerHTML` is read.
+   That is the one place the scraper script is told (`__rawDocument`, set in its
+   isolated world just before injection) not to sanitize: Amber's extractor needs
+   the real markup, which `getPageHtml`'s cleaned copy for the model has lost. A
+   page over 12 MB is refused, never truncated.
+3. The window is closed in a `finally`, on abort (leaving the Reader mid-capture,
+   including while the window is still being created) and when the new-tab page
+   goes away. Closing the window or tab yourself ends the capture at once ("The
+   page was closed.", via `tabs.onRemoved`). Neither URLs nor HTML are logged.
+4. `importPage` (`lib/archive-save.ts`) sends `POST /api/import` as
+   `application/json` `{ url, html, title?, final_url }` to the configured archive
+   address, with a 60 s limit. `url` is the story's own address (so `/api/lookup`
+   finds the new snapshot, which is now the newest for it); `final_url` is where the
+   page actually ended up, which Amber resolves and validates like `url` (a public
+   name can resolve to a private address, which a hostname check cannot see); a
+   private one is a 400 and nothing is stored ("The page ended up on a private or
+   local address"). `title` is the feed's headline when there is one. Lone UTF-16
+   surrogates in the page are replaced with U+FFFD first (Amber rejects them), and
+   the finished JSON body is measured: above 11.5 MiB it is refused before sending
+   (Amber's own limit is 12 MiB). Failures are typed: `amber-down`, `no-api`
+   (404/405), `too-big` (413 or the size check), `busy` (429), `invalid-url` (400,
+   422), `forbidden` (403), `import-timeout` (the 60 s ran out: Amber may still
+   finish, and a retry may save a second copy, which the notice says) and
+   `amber-error` ("Amber answered 500", for any status not listed). A 400 `final_url is a different site` becomes the off-site message (naming the page's host), `final_url is a private or local address` becomes `private-address`, and a 408 is `upload-timeout` ("The upload to Amber took too long. Try again."). A 409 `{detail: "already archived", id}` (a usable copy of the story or of its final address exists; an import never replaces one, and `force` is never sent) is a success: that snapshot's text is read and shown and the story is marked, with no error. The same holds before any window opens: if the click-time lookup already finds a usable copy it is read instead of capturing.
+5. A response with `usable: false` means Amber found no article in the page either:
+   the reader says "Your browser also got a subscription prompt. Are you signed in
+   to <host>?" with Open original (and the same button as a retry). Otherwise the
+   text is read from `/api/snapshots/{id}/text` and the story becomes "In Amber"
+   in Latest and Library through the same `onSaved` path a save uses. If that
+   read-back fails the page *is* saved: the story is marked "In Amber", the notice
+   says "Saved to Amber, but couldn't read it back", and its Try again only re-reads
+   that snapshot (nothing is imported twice). Reopening a captured story later
+   (even after a reload) reads that snapshot and imports nothing. There is no
+   retry button for `no-api`, `too-big`, `blocked`, `private-address` or
+   `saved-unreadable` (the last has its own Try again), since a second identical
+   click cannot work.
+6. A story that came from the model-built Today page (origin "today") shows the
+   whole address (cut in the middle only above 120 characters) above the buttons
+   in the failure notice, so you can see what "Capture with my browser" will open.
+
+Residuals, known and accepted: if the extension is reloaded or the browser quits
+while a capture is running, the background window it opened is left open (nothing
+of ours is running to close it); it holds one article page and can simply be closed.
+The imported HTML is the whole document, so it keeps page chrome that is not
+article text (hidden form fields, meta tags, inline scripts); Amber is being changed
+to strip hidden-input values and token metas, and only the *extracted article text*
+(`/api/snapshots/{id}/text`) ever reaches the model or the Reader. The permission
+set is unchanged: nothing is added for this (no `webRequest`); Amber's resolution of
+`final_url` is the check on where the page really ended up.
 
 **Sources that are not plain RSS.** Two publishers need care, both in the table in
 `feed-catalog.ts`:
@@ -199,7 +283,7 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
 apps/extension/           MV3 extension (WXT + React)
   entrypoints/
     background.ts         service worker: hosts BuildManager, alarm heartbeat
-    scraper.content.ts    injected into scraped tabs: scroll, return HTML
+    scraper.content.ts    injected into scraped tabs: scroll, return HTML (raw outerHTML when browser-capture asks)
     newtab/               the new-tab UI (thin client onto the worker)
       components/Latest.tsx   the live stream: chips, search, per-source retry, "In Amber" marker
       useLatest.ts            progressive fetch, the shared stored fetch, blocked-site filter, archive index
@@ -209,11 +293,12 @@ apps/extension/           MV3 extension (WXT + React)
     build-manager.ts      single-flight build host, broadcast, keepalive, reattach
     browser-bridge.ts     BrowserBridge over chrome.history / chrome.tabs
     archive.ts            ArchiveBridge over fetch to Amber's JSON API; shared by the worker and the new-tab page
-    archive-save.ts       lookup / save / poll / read against Amber's save API (GET and POST): the Reader's "fetch the full article"
+    archive-save.ts       lookup / save / poll / read / import against Amber's save and import APIs: the Reader's "fetch the full article" and its import half of "Capture with my browser"
     feeds.ts              re-exports agent-core's feed code for the extension
     sources.ts            the stored catalog of sources (chrome.storage), seeding from the archive and history
     history.ts            getHistory: group and rank chrome.history by domain
     scraper.ts            getPageHtml: load URLs in a background window, sanitize HTML
+    browser-capture.ts    "Capture with my browser": load one URL in the signed-in browser, import the raw HTML into Amber
     protocol.ts           page ↔ worker messages and the five UI build steps
     auto-rebuild.ts       when to rebuild on a schedule
     storage.ts            chrome.storage keys, settings (incl. archiveUrl), saved homepage
@@ -387,6 +472,22 @@ Each scraped page's final URL is checked again before upload, so a redirect onto
 a blocked host is dropped: the browser still loads it, but nothing it read is
 sent. Loopback, private-IP and local-network hosts are always blocked, whatever
 the list says. Subresource loads are not intercepted.
+
+**Capture with my browser** moves a page differently: it goes from your browser to
+the Amber address you configured (`POST /api/import`; any http(s) address you set,
+and it is plain http unless you put https, which for the default `127.0.0.1` never
+leaves the machine) and nowhere else. Nothing reaches Anthropic unless you later
+build Today and the model chooses to read that article from the archive (then it
+is an ordinary archived article: its extracted text, capped and deleted with the
+session like any other). It only ever starts from a click in the Reader, never from
+navigation, prefetch or the model-built page. The blocked-sites list and the
+loopback/private-host rule apply before the browser opens anything, again to the
+page's address before it is read (which must also be the same site), and Amber
+validates the final address too. The HTML is the full document as your signed-in
+browser rendered it, so it may contain personal account details (your name, email,
+subscriber id, tokens in inline scripts or hidden fields). It is stored as a
+snapshot in your local archive and stays there; treat the archive, and screenshots
+of it, as private.
 
 The session event log persists every domain, title and scraped page body server-side
 until deleted, and uploaded files persist independently. `runHomepageBuild` deletes

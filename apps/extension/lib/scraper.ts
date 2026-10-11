@@ -80,9 +80,13 @@ function cleanHtmlForLLM(html: string) {
   });
 }
 
-/** Scrape in a separate unfocused window so tabs don't flash in front of the user. */
-async function createScraperWindow(): Promise<number> {
+/**
+ * Scrape in a separate unfocused window so tabs don't flash in front of the user.
+ * With `url` the window opens straight on it (otherwise it opens on a new-tab page).
+ */
+export async function createScraperWindow(url?: string): Promise<number> {
   const win = await browser.windows.create({
+    ...(url ? { url } : {}),
     focused: false,
     state: "normal",
     width: 1200,
@@ -220,27 +224,31 @@ export async function scrapeUrls(
   return { pages, failed };
 }
 
-async function waitForTabLoad(
+/** Resolves true when the tab finishes loading, false on timeout (or when `signal` aborts). */
+export async function waitForTabLoad(
   tabId: number,
-  timeout: number
+  timeout: number,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let timeoutId: ReturnType<typeof setTimeout>;
 
-    const listener = (changedTabId: number, changeInfo: { status?: string }) => {
-      if (changedTabId === tabId && changeInfo.status === "complete") {
-        browser.tabs.onUpdated.removeListener(listener);
-        clearTimeout(timeoutId);
-        resolve(true);
-      }
+    const finish = (loaded: boolean) => {
+      browser.tabs.onUpdated.removeListener(listener);
+      signal?.removeEventListener("abort", onAbort);
+      clearTimeout(timeoutId);
+      resolve(loaded);
     };
+    const listener = (changedTabId: number, changeInfo: { status?: string }) => {
+      if (changedTabId === tabId && changeInfo.status === "complete") finish(true);
+    };
+    const onAbort = () => finish(false);
 
     // Set timeout
-    timeoutId = setTimeout(() => {
-      browser.tabs.onUpdated.removeListener(listener);
-      resolve(false);
-    }, timeout);
+    timeoutId = setTimeout(() => finish(false), timeout);
 
     browser.tabs.onUpdated.addListener(listener);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
