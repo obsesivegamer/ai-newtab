@@ -102,33 +102,75 @@ const pause = (ms: number, signal?: AbortSignal) =>
 
 const isWeb = (url: string | undefined) => /^https?:/i.test(url ?? "");
 
-/** Public suffixes with two labels that are common enough for news sites; the rest count as one label. */
-const TWO_LEVEL_SUFFIXES = new Set([
-  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+/**
+ * Suffixes under which one more label is the registrable domain: common two-label public
+ * suffixes, then shared-hosting suffixes (where `a.github.io` and `b.github.io` are different
+ * owners). This list and `sameSite` mirror Amber's rule exactly; Amber is the authority (see its
+ * README, "Same-site rule for final_url"), so change both together or not at all.
+ */
+const REGISTRABLE_SUFFIXES = [
+  // two-label public suffixes
+  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk",
   "com.au", "net.au", "org.au", "edu.au", "gov.au",
+  "co.nz", "org.nz", "govt.nz",
   "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
-  "co.nz", "org.nz", "govt.nz", "co.za", "org.za",
-  "com.br", "com.cn", "com.hk", "com.sg", "com.tw", "com.mx", "com.ar", "com.tr",
-  "co.in", "co.kr", "co.il", "co.id",
-]);
+  "com.br", "net.br", "org.br",
+  "com.cn", "net.cn", "org.cn",
+  "com.hk", "com.sg", "com.tw", "com.mx", "com.ar", "com.tr", "com.ua",
+  "co.in", "net.in", "org.in",
+  "co.za", "co.kr", "or.kr", "co.il", "co.id",
+  "com.my", "com.ph", "com.pk", "com.eg", "com.sa", "com.ng",
+  // shared hosting
+  "github.io", "gitlab.io", "blogspot.com", "herokuapp.com", "vercel.app", "netlify.app", "pages.dev",
+  "workers.dev", "web.app", "firebaseapp.com", "azurewebsites.net", "cloudfront.net", "s3.amazonaws.com",
+  "appspot.com", "wordpress.com", "substack.com", "medium.com", "wixsite.com", "myshopify.com",
+  "tumblr.com", "squarespace.com", "ghost.io", "notion.site",
+].sort((a, b) => b.split(".").length - a.split(".").length);
 
-/** The site part of a host: its last two labels, or three under a known two-level public suffix. */
+/** The URL's host as the browser parses it (punycoded, lowercase), without a trailing dot; "" if unparsable. */
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/** The explicit port, with the defaults of both schemes (80 and 443) counting as one "default". */
+function portOf(url: string): string {
+  try {
+    const port = new URL(url).port;
+    return port === "" || port === "80" || port === "443" ? "default" : port;
+  } catch {
+    return "";
+  }
+}
+
+/** The owner-level part of a host. IP literals and regional S3 endpoints are their own domain. */
 function registrableDomain(host: string): string {
   if (!host || host.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return host;
-  const labels = host.split(".").filter(Boolean);
-  if (labels.length <= 2) return labels.join(".");
-  const lastTwo = labels.slice(-2).join(".");
-  return TWO_LEVEL_SUFFIXES.has(lastTwo) ? labels.slice(-3).join(".") : lastTwo;
+  const labels = host.split(".");
+  if (host.endsWith(".amazonaws.com") && labels.some((l) => l === "s3" || l.startsWith("s3-"))) return host;
+  for (const suffix of REGISTRABLE_SUFFIXES) {
+    if (host === suffix) return host;
+    if (host.endsWith(`.${suffix}`)) {
+      const count = suffix.split(".").length + 1;
+      return labels.slice(-count).join(".");
+    }
+  }
+  return labels.slice(-2).join(".");
 }
 
 /**
- * Conservative same-site test between two addresses: equal hosts, or hosts that share a
- * registrable domain (`www.ft.com` and `on.ft.com`). A shortener or an SSO host is a
- * different site, on purpose: what a different site shows is not the story asked for.
+ * Amber's same-site rule for a page's final address: the same host or the same registrable
+ * domain, and the same port (or both on a default port, 80 or 443; the scheme is not compared).
+ * IP literals only match exactly. A shortener or an SSO host is a different site, on purpose.
  */
 export function sameSite(a: string, b: string): boolean {
-  const [x, y] = [registrableDomain(hostOf(a)), registrableDomain(hostOf(b))];
-  return x !== "" && x === y;
+  const [hostA, hostB] = [hostnameOf(a), hostnameOf(b)];
+  if (!hostA || !hostB) return false;
+  if (portOf(a) !== portOf(b)) return false;
+  return hostA === hostB || registrableDomain(hostA) === registrableDomain(hostB);
 }
 
 /** True once the tab has finished loading a web page. Also true when it finished before we looked. */

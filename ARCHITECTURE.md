@@ -169,9 +169,12 @@ Amber the HTML:
    still "loading" at 30 s is used if `document.readyState` is `interactive` or
    `complete`), then 2 s of settle. **Before the page is scrolled or read** its
    address is checked again: it must pass `isAllowedUrl` and be the *same site* as
-   the story asked for (`sameSite`: equal hosts or the same registrable domain, the
-   last two labels, three under a known two-level suffix such as `co.uk`,
-   `com.au`, `co.jp`). A redirect to a sign-in host or a shortener therefore ends
+   the story asked for (`sameSite`, which mirrors Amber's rule exactly; Amber is the authority, see its
+   README "Same-site rule for final_url": the same host or the same registrable
+   domain, and the same port or both on a default port; scheme not compared; the
+   registrable domain is the longest matching suffix from a fixed list of
+   two-label public suffixes and shared-hosting suffixes plus one label, else the
+   last two labels; IP literals match exactly). A redirect to a sign-in host or a shortener therefore ends
    the capture with "The page sent your browser to <host>. Sign in there first,
    then try again." and nothing is read or sent. The check runs again on the
    address the script read the page from. The page is scrolled with the same
