@@ -16,7 +16,10 @@ export interface KnownSource {
   feeds: string[];
 }
 
-/** Publications we know feeds for. Verified to answer with items on 2026-10-10. */
+/**
+ * Publications we know feeds for. Verified to answer with items on 2026-10-10
+ * (WSJ and Reuters on 2026-10-11).
+ */
 export const DEFAULT_FEEDS: readonly KnownSource[] = [
   {
     id: "ft",
@@ -75,8 +78,24 @@ export const DEFAULT_FEEDS: readonly KnownSource[] = [
     id: "wsj",
     name: "The Wall Street Journal",
     aliases: ["WSJ", "Wall Street Journal", "wsj.com"],
+    // Dow Jones moved its feeds from feeds.a.dj.com (frozen in 2025) to feeds.content.dowjones.io.
+    // That host also serves MarketWatch and Barron's feeds, so it is not listed as WSJ's: blocking
+    // dowjones.io still blocks the source by its feed addresses.
     hosts: ["wsj.com"],
-    feeds: ["https://feeds.a.dj.com/rss/RSSWorldNews.xml"],
+    feeds: [
+      "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
+      "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+      "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+      "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
+    ],
+  },
+  {
+    id: "reuters",
+    name: "Reuters",
+    aliases: ["Reuters"],
+    hosts: ["reuters.com"],
+    // Reuters has no public RSS; its news sitemap (the 50 newest stories) is read as a feed.
+    feeds: ["https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml"],
   },
   {
     id: "guardian",
@@ -264,6 +283,54 @@ export function seedSources(
   return seedCatalog(archiveSources, historyDomains).sources;
 }
 
+
+/**
+ * Feed lists an earlier version shipped for a known source and has since replaced.
+ * A stored source whose feeds are still exactly one of these gets the current
+ * defaults; one the person edited is left alone.
+ */
+const RETIRED_FEEDS: Record<string, string[][]> = {
+  wsj: [["https://feeds.a.dj.com/rss/RSSWorldNews.xml"]],
+};
+
+/** `current` with any source still on a retired default moved to the current default feeds. */
+export function migrateRetiredFeeds(current: FeedSource[]): { sources: FeedSource[]; changed: boolean } {
+  let changed = false;
+  const sources = current.map((s) => {
+    const known = DEFAULT_FEEDS.find((k) => k.id === s.id);
+    const retired = RETIRED_FEEDS[s.id];
+    if (!known || !retired) return s;
+    const mine = [...new Set(s.feedUrls)].sort();
+    const stale = retired.some((list) => list.length === mine.length && [...list].sort().every((u, i) => u === mine[i]));
+    if (!stale) return s;
+    changed = true;
+    return { ...s, feedUrls: [...known.feeds] };
+  });
+  return { sources: changed ? sources : current, changed };
+}
+
+/**
+ * `current` plus the known source `id`, enabled, unless the catalog already covers
+ * that publisher: a source with its id, or one with a feed on one of its hosts.
+ */
+export function addKnownIfMissing(
+  current: FeedSource[],
+  id: string,
+): { sources: FeedSource[]; added?: FeedSource } {
+  const known = DEFAULT_FEEDS.find((k) => k.id === id);
+  if (!known) return { sources: current };
+  const covered = current.some(
+    (s) =>
+      s.id === known.id ||
+      s.feedUrls.some((url) => {
+        const host = hostOf(url);
+        return !!host && known.hosts.some((h) => isSameOrSubdomain(host, h));
+      }),
+  );
+  if (covered) return { sources: current };
+  const added = fromKnown(known);
+  return { sources: [...current, added], added };
+}
 
 /** Adds sources from `seeded` that `current` doesn't already have; keeps everything else as the person left it. */
 export function mergeSeeded(

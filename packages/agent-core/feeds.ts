@@ -1,9 +1,10 @@
 import type { FeedBridge, FeedItem, FeedSource, FeedSourceStatus } from "./types";
 import { canonicalLink, isTrackingParam, linkId } from "./link";
-import { hostOf, isPrivateHost } from "./site-filter";
+import { hostOf, isPrivateHost, isSameOrSubdomain } from "./site-filter";
 
 /**
- * RSS / Atom / RDF feeds for the user's sources.
+ * RSS / Atom / RDF feeds for the user's sources, and Google News sitemaps (the
+ * only public listing some publishers, Reuters among them, offer).
  *
  * Plain string work plus `fetch` and `AbortSignal`: no DOMParser, no `chrome.*`,
  * no `node:*`, so it runs in the MV3 service worker, the new-tab page and Bun.
@@ -22,6 +23,8 @@ export const FEED_TIMEOUT_MS = 15_000;
 /** Bigger bodies are refused (read as a stream and cancelled, not buffered). */
 export const MAX_FEED_BYTES = 5 * 1024 * 1024;
 const MAX_ITEMS_PER_FEED = 500;
+/** A sitemap lists every page of a site; only entries with `<news:news>` count towards the item cap, up to this many scanned. */
+const MAX_SITEMAP_URLS = 5_000;
 /** The text of one element is cut to this before it is looked at. */
 const MAX_ELEMENT_CHARS = 20_000;
 const MAX_ATTRS_CHARS = 2_000;
@@ -192,8 +195,8 @@ function cleanLink(raw: string | undefined): string | undefined {
     return undefined;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
-  for (const key of [...url.searchParams.keys()]) {
-    if (isTrackingParam(key)) url.searchParams.delete(key);
+  for (const [key, value] of [...url.searchParams.entries()]) {
+    if (isTrackingParam(key, value)) url.searchParams.delete(key);
   }
   url.hash = "";
   return url.toString();
@@ -235,9 +238,17 @@ export function effectiveTime(publishedAt: string | undefined, now: number): num
 // parseFeed
 // ---------------------------------------------------------------------------
 
-/** True when `text` is plausibly an RSS, Atom or RDF document (as opposed to an HTML error page). */
+/**
+ * True when `text` is plausibly an RSS, Atom or RDF document, or a news sitemap
+ * (a `<urlset>` with `<news:news>` entries), as opposed to an HTML error page.
+ */
 export function looksLikeFeed(text: string): boolean {
-  return /<(?:rss|feed|rdf:RDF)[\s>]/i.test(text.slice(0, 4096)) || /<channel[\s>]/i.test(text.slice(0, 20_000));
+  const head = text.slice(0, 4096);
+  return (
+    /<(?:rss|feed|rdf:RDF)[\s>]/i.test(head) ||
+    /<channel[\s>]/i.test(text.slice(0, 20_000)) ||
+    (/<urlset[\s>]/i.test(head) && /<news:news[\s>]/i.test(text.slice(0, 20_000)))
+  );
 }
 
 /** CDATA bodies lifted out of `xml` (so markup inside can't pass for structure), in one linear pass. */
@@ -262,6 +273,8 @@ interface RawItem {
   link: string;
   key: string;
   publishedAt?: string;
+  /** Set for sitemap entries, which have no `<category>` to read it from. */
+  section?: string;
   block: string;
   /** Text of an element: for summaries, escaped HTML is decoded and its markup removed. */
   html: (inner: string | undefined) => string;
@@ -293,6 +306,38 @@ function parseRaw(xml: string): RawItem[] {
   ].slice(0, MAX_ITEMS_PER_FEED);
   const out: RawItem[] = [];
   const seen = new Set<string>();
+
+  if (blocks.length === 0 && /<urlset[\s>]/i.test(doc.slice(0, 4096))) {
+    let news = 0;
+    for (const { inner: block } of scan(doc, "url", { maxInner: Infinity, limit: MAX_SITEMAP_URLS })) {
+      const entry = first(block, "news:news");
+      if (!entry) continue;
+      if (++news > MAX_ITEMS_PER_FEED) break;
+      const title = cap(plain(first(entry.inner, "news:title")?.inner), TITLE_MAX);
+      if (!title) continue;
+      const loc = first(block, "loc");
+      const link = cleanLink(loc ? plain(loc.inner) : undefined);
+      if (!link) continue;
+      const language = plain(first(entry.inner, "news:language")?.inner).toLowerCase().split(/[-_]/)[0];
+      const info = sitemapEntry(link, plain(first(entry.inner, "news:keywords")?.inner), language);
+      if (!info) continue;
+      const key = canonicalLink(link);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const date = first(entry.inner, "news:publication_date") ?? first(block, "lastmod");
+      out.push({
+        title,
+        link,
+        key,
+        publishedAt: date ? toIso(plain(date.inner)) : undefined,
+        section: info.section || undefined,
+        block: "",
+        html,
+        plain,
+      });
+    }
+    return out;
+  }
 
   for (const { inner: block } of blocks) {
     const title = cap(plain(first(block, "title")?.inner), TITLE_MAX);
@@ -334,7 +379,7 @@ function finish(raw: RawItem, source: string): FeedItem {
   if (summaryRaw && summaryRaw.toLowerCase() !== raw.title.toLowerCase()) item.summary = cap(summaryRaw, SUMMARY_MAX);
   const author = authorOf(raw.block, raw.plain);
   if (author) item.author = author;
-  const section = sectionOf(raw.block, raw.plain);
+  const section = raw.section ?? sectionOf(raw.block, raw.plain);
   if (section) item.section = section;
   return item;
 }
@@ -346,6 +391,68 @@ function finish(raw: RawItem, source: string): FeedItem {
  */
 export function parseFeed(xml: string, source: string): FeedItem[] {
   return parseRaw(xml).map((raw) => finish(raw, source));
+}
+
+/**
+ * Language editions that publishers keep under one host, by the path segment that
+ * marks them ("/fr/", "/latam/", "/fact-check/portugues/") and the language they are in.
+ */
+const EDITION_LANGUAGE = new Map<string, string>(
+  Object.entries({
+    fr: "fr", pt: "pt", latam: "es", es: "es", de: "de", it: "it", nl: "nl", pl: "pl", sv: "sv", tr: "tr",
+    ru: "ru", ar: "ar", he: "he", hi: "hi", id: "id", ja: "ja", jp: "ja", ko: "ko", zh: "zh", cn: "zh",
+    portugues: "pt", espanol: "es", francais: "fr", deutsch: "de", italiano: "it",
+  }),
+);
+/** The spelled-out names are also used as a second path segment ("/fact-check/portugues/…"). */
+const EDITION_NAMES = new Set(["portugues", "espanol", "francais", "deutsch", "italiano"]);
+const LANGUAGE_SEGMENT = /^[a-z]{2}(?:-[a-z]{2,4})?$/;
+
+/**
+ * What a sitemap entry contributes, or null when it is left out.
+ *
+ * Left out: an entry in a language edition (see `EDITION_LANGUAGE`) of a Reuters
+ * sitemap, whose `news:language` says "en" for every edition, or one whose declared
+ * `news:language` is not the edition's language. A sitemap that declares the edition's
+ * own language ("/de/" with `news:language` "de") is read in full.
+ *
+ * Section: the first non-empty keyword, else the first path segment that is not a
+ * language or region code and has an article segment after it ("/world/india/…" and
+ * "/en/world/…" are "World"; a code is never a section); "" when neither says.
+ */
+function sitemapEntry(link: string, keywords: string, declaredLanguage: string): { section: string } | null {
+  let host = "";
+  let segments: string[] = [];
+  try {
+    const url = new URL(link);
+    host = url.hostname.toLowerCase();
+    segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+  } catch {
+    /* no path */
+  }
+  const edition =
+    EDITION_LANGUAGE.get(segments[0] ?? "") ??
+    (EDITION_NAMES.has(segments[1] ?? "") ? EDITION_LANGUAGE.get(segments[1]!) : undefined);
+  if (edition) {
+    const reuters = isSameOrSubdomain(host.replace(/^www\./, ""), "reuters.com");
+    if (reuters || (declaredLanguage !== "" && declaredLanguage !== edition)) return null;
+  }
+  const keyword = keywords
+    .split(",")
+    .map((k) => k.trim())
+    .find(Boolean);
+  if (keyword) return { section: cap(keyword, 80) };
+  while (segments.length > 1 && (EDITION_LANGUAGE.has(segments[0]) || LANGUAGE_SEGMENT.test(segments[0]))) {
+    segments = segments.slice(1);
+  }
+  const segment = segments[0] ?? "";
+  if (segments.length < 2 || !/^[a-z][a-z-]{1,40}$/.test(segment)) return { section: "" };
+  return {
+    section: segment
+      .split("-")
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" "),
+  };
 }
 
 function linkOf(block: string, textOf: (s: string) => string): string | undefined {
@@ -417,7 +524,11 @@ export function describeFeedError(err: unknown): string {
   if (name === "TimeoutError" || name === "AbortError") return `timed out after ${FEED_TIMEOUT_MS / 1000} s`;
   const message = err instanceof Error ? err.message : String(err);
   const http = /^HTTP (\d+)/.exec(message);
-  if (http) return `answered with HTTP ${http[1]}`;
+  if (http) {
+    // Some publishers (Reuters, behind a bot check) turn away requests from some networks and clients.
+    if (http[1] === "401" || http[1] === "403") return `turned this request away (HTTP ${http[1]})`;
+    return `answered with HTTP ${http[1]}`;
+  }
   if (message === "not a feed") return "isn't an RSS or Atom feed";
   if (message === "too large") return `is bigger than ${MAX_FEED_BYTES / 1024 / 1024} MB`;
   if (message === "private redirect") return "redirected to a private or local address";
@@ -531,7 +642,7 @@ export async function probeFeed(
   const { doc, bodies } = liftCdata(text.slice(0, 200_000));
   const firstItem = doc.search(/<(item|entry)[\s>]/i);
   const head = doc.slice(0, firstItem > 0 ? firstItem : 20_000);
-  const rawTitle = first(head, "title")?.inner;
+  const rawTitle = first(head, "title")?.inner ?? first(head, "news:name")?.inner;
   const title =
     rawTitle === undefined
       ? undefined
