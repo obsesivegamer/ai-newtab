@@ -1,4 +1,6 @@
 import {
+  addKnownIfMissing,
+  migrateRetiredFeeds,
   seedCatalog,
   type SeedResult,
   type FeedSource,
@@ -74,21 +76,79 @@ function sanitize(raw: unknown): FeedSource[] {
   return out;
 }
 
+/** The version of the one-time migrations below. 1: Reuters, offered once to catalogs seeded before it was known. */
+const MIGRATION_VERSION = 1;
+
+async function readStored(): Promise<FeedSource[] | null> {
+  const stored = (await browser.storage.local.get(KEYS.sources))[KEYS.sources];
+  return Array.isArray(stored) ? sanitize(stored) : null;
+}
+
 /**
- * The stored catalog. With nothing stored yet, seeds from the archive (and
- * history) and stores the result. When the archive was configured but could not
- * be read, or nothing was found, the seeded list is returned without being stored,
- * so the next load tries again.
+ * Brings a stored catalog up to date, and stores it only if that changed something:
+ *
+ * - a source still on a feed list an earlier version shipped (WSJ's frozen
+ *   `feeds.a.dj.com` address) gets the current default feeds, every load, since
+ *   it costs nothing; a list the person edited is left as it is;
+ * - Reuters, which had no feed until its news sitemap was supported, is appended
+ *   once if the archive (or browsing history) says the person reads it and no
+ *   source of the catalog covers reuters.com. "Once" is `sourcesMigrated`: a
+ *   person who removes it later is not given it again. It is settled only when
+ *   the archive could be asked (or was off) or it answered yes, so an archive
+ *   that is down is asked again next time and never costs a write.
+ */
+async function migrateStored(current: FeedSource[], done: boolean): Promise<FeedSource[]> {
+  let wantsReuters = false;
+  let settled = done;
+  if (!done) {
+    const { archiveUrl } = await loadSettings();
+    const seeded = await seedFromArchive(archiveUrl);
+    wantsReuters = seeded.sources.some((s) => s.id === "reuters");
+    settled = wantsReuters || !seeded.archiveError;
+  }
+  // The archive can take a while: apply to what is stored now, not to what was read before it.
+  const fresh = (!done ? await readStored() : null) ?? current;
+  const retired = migrateRetiredFeeds(fresh);
+  let sources = retired.sources;
+  let changed = retired.changed;
+  if (wantsReuters && sources.length > 0) {
+    const withReuters = addKnownIfMissing(sources, "reuters");
+    if (withReuters.added) {
+      sources = withReuters.sources;
+      changed = true;
+    }
+  }
+  const write: Record<string, unknown> = {};
+  if (changed) write[KEYS.sources] = sanitize(sources);
+  if (settled && !done) write[KEYS.sourcesMigrated] = MIGRATION_VERSION;
+  if (Object.keys(write).length > 0) await browser.storage.local.set(write);
+  return sources;
+}
+
+/**
+ * The stored catalog, migrated (see `migrateStored`). With nothing stored yet,
+ * seeds from the archive (and history) and stores the result. When the archive was
+ * configured but could not be read, or nothing was found, the seeded list is
+ * returned without being stored, so the next load tries again.
  */
 export async function loadSources(): Promise<FeedSource[]> {
-  const stored = (await browser.storage.local.get(KEYS.sources))[KEYS.sources];
-  if (Array.isArray(stored)) return sanitize(stored);
+  const got = await browser.storage.local.get([KEYS.sources, KEYS.sourcesMigrated]);
+  if (Array.isArray(got[KEYS.sources])) {
+    const version: unknown = got[KEYS.sourcesMigrated];
+    const done = typeof version === "number" && version >= MIGRATION_VERSION;
+    return migrateStored(sanitize(got[KEYS.sources]), done);
+  }
 
   const { archiveUrl } = await loadSettings();
   const { sources, archiveError } = await seedFromArchive(archiveUrl);
   // A catalog seeded while the archive couldn't be read is only the history part of it;
   // storing that would freeze it. Show it, don't keep it, and try again next time.
-  if (sources.length > 0 && !archiveError) await saveSources(sources);
+  if (sources.length > 0 && !archiveError) {
+    await browser.storage.local.set({
+      [KEYS.sources]: sanitize(sources),
+      [KEYS.sourcesMigrated]: MIGRATION_VERSION,
+    });
+  }
   return sources;
 }
 
