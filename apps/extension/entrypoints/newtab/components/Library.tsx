@@ -111,15 +111,18 @@ export function Library({
         const next = e.key === "j" ? Math.min(visible.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
         onCursor(visible[next].id);
         focusRow(visible[next].id);
-      } else if (e.key === "Enter" && cursorId) {
-        // A focused row, or nothing in particular, opens the cursor row. Chips, links
+      } else if (e.key === "Enter") {
+        // A focused row opens itself, whatever the cursor says (Tab moves focus, not the
+        // cursor); with nothing in particular focused, the cursor row opens. Chips, links
         // and the top bar keep their own Enter.
         const t = e.target as HTMLElement;
-        const onRow = !!t.closest?.(".row");
+        const row = t.closest?.("button.row[id^='row-']");
         const idle = t === document.body || t.tagName === "MAIN" || t.classList?.contains("lib");
-        if (!onRow && !idle) return;
+        const id = row ? row.id.slice("row-".length) : idle ? cursorId : null;
+        if (!id || !visible.some((a) => a.id === id)) return;
         e.preventDefault();
-        onOpen(cursorId, visible);
+        onCursor(id);
+        onOpen(id, visible);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -275,6 +278,7 @@ export function Library({
                       key={article.id}
                       article={article}
                       cursor={article.id === cursorId}
+                      onFocus={() => onCursor(article.id)}
                       onOpen={() => {
                         onCursor(article.id);
                         onOpen(article.id, visible);
@@ -305,10 +309,12 @@ export function Library({
 function Row({
   article,
   cursor,
+  onFocus,
   onOpen,
 }: {
   article: ArchiveArticleMeta;
   cursor: boolean;
+  onFocus: () => void;
   onOpen: () => void;
 }) {
   const short = article.wordCount > 0 && article.wordCount < SHORT_WORDS;
@@ -318,6 +324,7 @@ function Row({
         id={`row-${article.id}`}
         type="button"
         className={`row${cursor ? " cursor" : ""}`}
+        onFocus={onFocus}
         onClick={onOpen}
       >
         <span className="row-main">

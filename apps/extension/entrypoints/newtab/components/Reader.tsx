@@ -14,7 +14,14 @@ type Load =
   | { status: "idle" }
   | { status: "fetching"; stage: FetchStage }
   | { status: "ready"; article: ArchiveArticle }
-  | { status: "error"; title: string; message: string; reason?: FetchFailure };
+  | {
+      status: "error";
+      title: string;
+      message: string;
+      reason?: FetchFailure;
+      /** The attempt that failed was allowed to save, so "Try again" may too (it is a new click). */
+      save?: boolean;
+    };
 
 const UNREACHABLE = "Couldn't reach Amber. Is it running? Start it (its run script, or its launchd service).";
 
@@ -129,12 +136,18 @@ export function Reader({
   keysActive: boolean;
 }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
-  /** Retries and forced recaptures belong to the article they were asked on, never the next one. */
-  const [run, setRun] = useState({ key: "", n: 0, force: false });
-  const runN = run.key === entry.key ? run.n : 0;
-  const runForce = run.key === entry.key && run.force;
-  /** The key of the address-only entry the person pressed "Fetch full article" on. */
-  const [requestedKey, setRequestedKey] = useState<string | null>(null);
+  /**
+   * What the person asked for with a click ("Fetch full article", "Try again", "Try capturing
+   * again"): it belongs to one article and one attempt. It is dropped when that attempt ends
+   * and whenever another article is shown, so walking away and back never saves anything.
+   */
+  const attemptRef = useRef<{ key: string; force: boolean; save: boolean } | null>(null);
+  /** Bumped by each click to start the attempt. */
+  const [runN, setRunN] = useState(0);
+  const startAttempt = (attempt: { force: boolean; save: boolean }) => {
+    attemptRef.current = { key: entry.key, ...attempt };
+    setRunN((n) => n + 1);
+  };
   const scrollRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const { size, canShrink, canGrow, shrink, grow } = useTextSize();
@@ -198,9 +211,8 @@ export function Reader({
     [],
   );
 
-  const mayFetch = entry.autoFetch || requestedKey === entry.key;
-
   useEffect(() => {
+    if (attemptRef.current && attemptRef.current.key !== entry.key) attemptRef.current = null;
     if (archiveUrl === null) return;
     if (archiveUrl.trim() === "") {
       setLoad({
@@ -243,13 +255,24 @@ export function Reader({
       return;
     }
     const controller = new AbortController();
+    const attempt = attemptRef.current;
+    const mayFetch = entry.autoFetch === true || attempt?.save === true;
+    const force = attempt?.force === true;
     setLoad(mayFetch ? { status: "fetching", stage: "checking" } : { status: "loading" });
     void fetchFullArticle(
       archiveUrl,
-      { url: entry.url, force: runForce, saveIfMissing: mayFetch },
-      { signal: controller.signal, onStatus: (stage) => setLoad({ status: "fetching", stage }) },
+      { url: entry.url, force, saveIfMissing: mayFetch },
+      {
+        signal: controller.signal,
+        // A look-up alone shows nothing until it finds something: a capture already under way,
+        // or text to read. Only an attempt that may save announces itself from the start.
+        onStatus: (stage) => {
+          if (mayFetch || stage !== "checking") setLoad({ status: "fetching", stage });
+        },
+      },
     ).then((result) => {
       if (controller.signal.aborted) return;
+      attemptRef.current = null;
       if (result.ok) {
         const article: ArchiveArticle = { ...result.meta, text: result.text };
         cache.current.set(entry.key, article);
@@ -258,12 +281,18 @@ export function Reader({
       } else if (result.reason === "not-saved") {
         setLoad({ status: "idle" });
       } else if (result.reason !== "aborted") {
-        setLoad({ status: "error", ...fetchProblem(result.reason, result.detail), reason: result.reason });
+        setLoad({
+          status: "error",
+          ...fetchProblem(result.reason, result.detail),
+          reason: result.reason,
+          save: mayFetch,
+        });
       }
     });
     return () => controller.abort();
     // `entry` is a new object whenever the list rebuilds; its key and address are what identify the work.
-  }, [entry.key, entry.archiveId, entry.url, archiveUrl, runN, runForce, mayFetch, watch]);
+    // `entry.autoFetch` is read once per attempt: it belongs to the entry the person clicked.
+  }, [entry.key, entry.archiveId, entry.url, archiveUrl, runN, watch]);
 
   // Each article starts at the top, and the pane takes keyboard focus so space and arrows scroll it.
   useEffect(() => {
@@ -325,7 +354,6 @@ export function Reader({
   const waiting = load.status === "fetching" || load.status === "loading";
   const elapsed = useElapsed(load.status === "fetching");
 
-  const retry = (force = false) => setRun({ key: entry.key, n: runN + 1, force });
 
   return (
     <div className="reader" role="dialog" aria-modal="true" aria-label={title || "Article"}>
@@ -416,7 +444,7 @@ export function Reader({
 
           {load.status === "idle" && (
             <div className="reader-fetch idle">
-              <button type="button" className="solid-btn" onClick={() => setRequestedKey(entry.key)}>
+              <button type="button" className="solid-btn" onClick={() => startAttempt({ force: false, save: true })}>
                 Fetch full article
               </button>
               <span className="reader-fetch-stage">
@@ -439,11 +467,15 @@ export function Reader({
               <p className="notice-body">{load.message}</p>
               <div className="notice-actions">
                 {load.reason === "paywall-stub" ? (
-                  <button type="button" className="ghost-btn" onClick={() => retry(true)}>
+                  <button type="button" className="ghost-btn" onClick={() => startAttempt({ force: true, save: true })}>
                     Try capturing again
                   </button>
                 ) : (
-                  <button type="button" className="ghost-btn" onClick={() => retry()}>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => startAttempt({ force: false, save: load.save === true })}
+                  >
                     Try again
                   </button>
                 )}

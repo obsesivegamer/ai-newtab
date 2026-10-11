@@ -31,9 +31,12 @@ readable, paywall-free copy of each article on your Mac.
   newest stories from your sources, merged newest first, with source filters and
   search. It needs no API key and no model. **Every new tab fetches your sources'
   public RSS/Atom feeds directly from your browser** (no cookies, nothing goes
-  through a server of ours), at most once every five minutes: the last fetch is
-  kept and shared by new tabs, and the refresh button fetches again. Stories from
-  a site on your blocked list are not shown.
+  through a server of ours). A new tab shows the last fetch at once, which is kept
+  and shared by every tab, and fetches again by itself only when it is more than
+  five minutes old (or the sources changed). A source that failed does not make
+  every new tab refetch: it has its own Retry. The refresh button fetches on
+  demand. Nothing is requested from a source on your blocked list, and stories
+  from a blocked site are not shown.
 - **Sources.** **Settings → Sources** lists the publications Latest and Today read.
   It is seeded from the sites in your archive (and your browsing history) for
   publications we know feeds for; you can switch sources off and add any feed

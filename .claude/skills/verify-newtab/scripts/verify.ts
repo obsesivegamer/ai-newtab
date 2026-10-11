@@ -70,6 +70,7 @@ if (!Number.isInteger(AMBER_PORT) || AMBER_PORT < 1024 || AMBER_PORT > 65535 || 
   process.exit(2);
 }
 const AMBER = `http://127.0.0.1:${AMBER_PORT}`;
+const FIXTURE_HOST = "verify-fixture.example";
 
 // ---------------------------------------------------------------------------
 // Process bookkeeping: everything we spawn dies with us
@@ -292,6 +293,9 @@ async function main() {
       "--no-first-run",
       "--no-default-browser-check",
       "--enable-unsafe-extension-debugging",
+      // Feed addresses on loopback are refused by design, so the fixture feeds are served under a
+      // public-looking name that only this Chrome resolves (to the fixture server on 127.0.0.1).
+      `--host-resolver-rules=MAP ${FIXTURE_HOST} 127.0.0.1`,
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${profileDir}`,
       "about:blank",
@@ -409,12 +413,48 @@ async function main() {
     collect.push(url);
   });
 
+  // POSTs to Amber's save API: the only thing that can write to the archive.
+  let savePosts = 0;
+  page.on("Network.requestWillBeSent", (p) => {
+    if (p.request?.method === "POST" && /\/api\/save/.test(p.request?.url ?? "")) savePosts++;
+  });
+
+  // While `capturingStub` is set, Amber's look-up for one story and the job it names are answered
+  // from here: "found, still capturing". Everything else goes through untouched.
+  let capturingStub = false;
+  let futureLookupFragment = "";
+  page.on("Fetch.requestPaused", (p) => {
+    const url: string = p.request?.url ?? "";
+    const headers = [
+      { name: "Content-Type", value: "application/json" },
+      { name: "Access-Control-Allow-Origin", value: "*" },
+    ];
+    let body: object | null = null;
+    if (capturingStub && url.includes("/api/lookup") && url.includes(futureLookupFragment)) {
+      body = { found: true, id: "verifycapture1", status: "capturing", usable: false, title: "In flight", site: "example.com" };
+    } else if (capturingStub && url.includes("/api/jobs/verifycapture1")) {
+      body = { id: "verifycapture1", status: "capturing" };
+    }
+    if (body) {
+      void page.send("Fetch.fulfillRequest", {
+        requestId: p.requestId,
+        responseCode: 200,
+        responseHeaders: headers,
+        body: Buffer.from(JSON.stringify(body)).toString("base64"),
+      });
+    } else {
+      void page.send("Fetch.continueRequest", { requestId: p.requestId });
+    }
+  });
+
   // ---- UI drivers: real mouse and key events ------------------------------
   const KEYS: Record<string, { code: string; vk: number }> = {
+    Tab: { code: "Tab", vk: 9 },
     Enter: { code: "Enter", vk: 13 },
     Escape: { code: "Escape", vk: 27 },
     "/": { code: "Slash", vk: 191 },
     j: { code: "KeyJ", vk: 74 },
+    k: { code: "KeyK", vk: 75 },
   };
   async function key(k: string) {
     const d = KEYS[k];
@@ -508,42 +548,91 @@ async function main() {
     const status = await answers(`${AMBER}/api/lookup?url=${encodeURIComponent("https://example.com/")}`);
     hasSaveApi = status === 200;
   }
-  const archivedFixture = await (async () => {
+  const archivedFixtures = await (async () => {
     try {
-      const r = await fetch(`${AMBER}/api/snapshots?since_days=365&limit=1`);
+      const r = await fetch(`${AMBER}/api/snapshots?since_days=365&limit=2`);
       const j = (await r.json()) as any;
-      const snap = j.snapshots?.[0];
-      return snap ? { title: String(snap.title), link: String(snap.final_url ?? snap.url), id: String(snap.id) } : null;
+      return ((j.snapshots ?? []) as any[]).map((snap) => ({
+        title: String(snap.title),
+        link: String(snap.final_url ?? snap.url),
+        id: String(snap.id),
+      }));
     } catch {
-      return null;
+      return [];
     }
   })();
+  const archivedFixture = archivedFixtures[0] ?? null;
+  const archivedFixture2 = archivedFixtures[1] ?? null;
   const FIXTURE_NOT_SAVED = "https://example.com/verify-newtab-fixture-not-archived";
   const FIXTURE_FUTURE_TITLE = "Fixture story dated two days ahead";
+  // Amber answers a save for this with 400 ("Could not resolve host"): a failed attempt, instantly.
+  const FIXTURE_UNCAPTURABLE = "https://verify-newtab-unreachable.invalid/article";
+  const FIXTURE_UNCAPTURABLE_TITLE = "Fixture story Amber cannot capture";
   const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   const fixtureXml = () => {
     const at = new Date().toUTCString();
     const items = [
       archivedFixture && { title: archivedFixture.title, link: archivedFixture.link, d: "From the fixture feed: already in the archive." },
+      archivedFixture2 && { title: archivedFixture2.title, link: archivedFixture2.link, d: "From the fixture feed: also already in the archive." },
       { title: "Fixture story that is not in the archive yet", link: FIXTURE_NOT_SAVED, d: "From the fixture feed: Amber has never seen this address." },
+      { title: FIXTURE_UNCAPTURABLE_TITLE, link: FIXTURE_UNCAPTURABLE, d: "From the fixture feed: Amber cannot capture this address (its host does not resolve)." },
       { title: FIXTURE_FUTURE_TITLE, link: "https://example.com/verify-newtab-future", d: "Dated two days ahead: a feed bug.", at: new Date(Date.now() + 2 * 86_400_000).toUTCString() },
     ].filter(Boolean) as Array<{ title: string; link: string; d: string; at?: string }>;
     return `<?xml version="1.0"?><rss version="2.0"><channel><title>Verify fixture</title>${items
       .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${i.at ?? at}</pubDate><description>${esc(i.d)}</description></item>`)
       .join("")}</channel></rss>`;
   };
+  // How often each path was asked for, by the Host the request came in under.
+  const hits = new Map<string, number>();
+  const hitsTo = (host: string, path = "") =>
+    [...hits].filter(([k]) => k.startsWith(`${host}${path}`)).reduce((n, [, v]) => n + v, 0);
+  /** The "flaky" feed answers 503 until this is set. */
+  let flakyUp = false;
+  const flakyXml = () => {
+    const at = new Date().toUTCString();
+    return `<?xml version="1.0"?><rss version="2.0"><channel><title>Verify flaky</title>${[1, 2]
+      .map((n) => `<item><title>Flaky feed story ${n}</title><link>https://example.com/verify-newtab-flaky-${n}</link><pubDate>${at}</pubDate><description>Served once the feed came back.</description></item>`)
+      .join("")}</channel></rss>`;
+  };
   fixtureServer = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch: () => new Response(fixtureXml(), { headers: { "content-type": "application/rss+xml" } }),
+    fetch: (req) => {
+      const url = new URL(req.url);
+      const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
+      hits.set(`${host}${url.pathname}`, (hits.get(`${host}${url.pathname}`) ?? 0) + 1);
+      const xml = { headers: { "content-type": "application/rss+xml" } };
+      if (url.pathname === "/flaky.xml") {
+        return flakyUp ? new Response(flakyXml(), xml) : new Response("down", { status: 503 });
+      }
+      return new Response(fixtureXml(), xml);
+    },
   });
-  const FIXTURE_FEED = `http://127.0.0.1:${fixtureServer.port}/feed.xml`;
+  const FIXTURE_FEED = `http://${FIXTURE_HOST}:${fixtureServer.port}/feed.xml`;
+  const FLAKY_FEED = `http://${FIXTURE_HOST}:${fixtureServer.port}/flaky.xml`;
+  const PRIVATE_FEED = `http://127.0.0.1:${fixtureServer.port}/private.xml`;
   const LIVE_SAVE_FEEDS = [
     { id: "guardian", name: "The Guardian", feedUrls: ["https://www.theguardian.com/world/rss"], enabled: true },
     { id: "ars-technica", name: "Ars Technica", feedUrls: ["https://feeds.arstechnica.com/arstechnica/index"], enabled: true },
     { id: "bbc", name: "BBC News", feedUrls: ["https://feeds.bbci.co.uk/news/world/rss.xml"], enabled: true },
   ];
   const SAVE_SOURCES = LIVE_SAVE_FEEDS.map((s) => s.name);
+  const FLAKY_SOURCE = { id: "verify-flaky", name: "Verify flaky", feedUrls: [FLAKY_FEED], enabled: true };
+  const FIXTURE_SOURCE = { id: "verify-fixture", name: "Verify fixture", feedUrls: [FIXTURE_FEED], enabled: true };
+  const PRIVATE_SOURCE = { id: "verify-private", name: "Verify private", feedUrls: [PRIVATE_FEED], enabled: true };
+  const chipNames = () =>
+    page.evaluate<string[]>(
+      `[...document.querySelectorAll(".view-latest .chips .chip")].map((c) => c.firstChild.textContent.trim())`,
+    );
+  /** Narrow Latest to the fixture source (its chip may sit behind "N more"). */
+  const filterToFixture = async () => {
+    if (!(await page.evaluate<boolean>(`!![...document.querySelectorAll(".view-latest .chips .chip")].find((c) => c.textContent.includes("Verify fixture"))`))) {
+      await click(".view-latest .chips .chip.more");
+      await sleep(150);
+    }
+    await click(".view-latest .chips .chip", "Verify fixture");
+    await sleep(250);
+  };
   const latestReady = (ms = 40_000) =>
     waitFor(
       `document.querySelector(".view-latest .row") || document.querySelector(".view-latest .notice")`,
@@ -593,8 +682,7 @@ async function main() {
     if (theme === "dark" || !latestSavedOnce) {
       const stored = await page.evaluate<any[]>(`chrome.storage.local.get("sources").then((r) => r.sources || [])`);
       check("The sources catalog was seeded and stored", stored.length > 0, `${stored.length} sources`);
-      const fixtureSource = { id: "verify-fixture", name: "Verify fixture", feedUrls: [FIXTURE_FEED], enabled: true };
-      const extra = [fixtureSource, ...LIVE_SAVE_FEEDS].filter((x) => !stored.some((s: any) => s.id === x.id));
+      const extra = [FIXTURE_SOURCE, FLAKY_SOURCE, ...LIVE_SAVE_FEEDS].filter((x) => !stored.some((s: any) => s.id === x.id));
       await setStorage({ sources: [...stored, ...extra] });
       await load();
       await latestReady();
@@ -658,23 +746,78 @@ async function main() {
       check("Every day group in Latest is unique", new Set(labels).size === labels.length, labels.join(" | "));
     }
 
-    // A new tab shows the stored fetch and does not refetch the feeds; refresh does.
+    // A new tab shows the stored fetch and does not refetch the feeds; refresh does. One feed
+    // being down must not change that, and its Retry is written back to the stored fetch.
     {
       phase = `${theme}:latest-cache`;
       await latestSettled();
       await sleep(500);
-      const stored = await page.evaluate<any>(`chrome.storage.local.get("latestFeed").then((r) => r.latestFeed || null)`);
-      const clean = !!stored && stored.results.every((r: any) => !r.error);
+      const readStored = () =>
+        page.evaluate<any>(`chrome.storage.local.get("latestFeed").then((r) => r.latestFeed || null)`);
+      const stored = await readStored();
+      const flakyResult = stored?.results.find((r: any) => r.name === "Verify flaky");
+      if (!flakyUp) {
+        check(
+          "The stored fetch records the feed that is down, and Latest lists it with Retry",
+          !!flakyResult?.error &&
+            (await page.evaluate<boolean>(
+              `[...document.querySelectorAll(".view-latest .latest-problem")].some((li) => li.textContent.includes("Verify flaky") && li.querySelector("button"))`,
+            )),
+          flakyResult?.error ?? "no error stored",
+        );
+      }
+      const bytes = stored ? JSON.stringify(stored).length : 0;
+      const widest = stored ? Math.max(...stored.results.map((r: any) => r.items.length)) : 0;
+      check(
+        "The stored fetch is bounded (at most 20 stories per source, under 1.5 MB)",
+        !!stored && widest <= 20 && bytes < 1_500_000,
+        `${bytes} bytes, widest source ${widest}`,
+      );
       collect = [];
       await load();
       const shown = await waitFor(`document.querySelectorAll(".view-latest .row").length > 0`, "stored stream", 5000);
       await sleep(2500);
       check(
-        "A new tab shows the stored fetch without refetching feeds",
+        flakyUp
+          ? "A new tab shows the stored fetch without refetching feeds"
+          : "A new tab shows the stored fetch without refetching any feed, though one feed is down",
         shown && collect.length === 0,
         `${collect.length} request(s)${collect.length ? `, e.g. ${collect[0].slice(0, 60)}` : ""}`,
-        !clean,
       );
+
+      if (!flakyUp) {
+        // Bring the feed back and press its Retry: the story list and the stored fetch both follow.
+        flakyUp = true;
+        const hitsBefore = hitsTo(FIXTURE_HOST, "/flaky.xml");
+        collect = [];
+        const retried = await click(".view-latest .latest-problem button");
+        const gone = await waitFor(
+          `![...document.querySelectorAll(".view-latest .latest-problem")].some((li) => li.textContent.includes("Verify flaky"))`,
+          "the failed feed to load after Retry",
+          20_000,
+        );
+        await sleep(600);
+        const after = await readStored();
+        const flakyAfter = after?.results.find((r: any) => r.name === "Verify flaky");
+        check(
+          "Retry loads only that feed, and the stored fetch is updated",
+          retried && gone && hitsTo(FIXTURE_HOST, "/flaky.xml") === hitsBefore + 1 && !!flakyAfter && !flakyAfter.error && flakyAfter.items.length === 2,
+          `flaky requests ${hitsBefore} -> ${hitsTo(FIXTURE_HOST, "/flaky.xml")}, other requests ${collect.filter((u) => !u.includes("/flaky.xml")).length}, stored ${flakyAfter ? flakyAfter.items.length : "none"} items`,
+        );
+        collect = [];
+        await load();
+        await waitFor(`document.querySelectorAll(".view-latest .row").length > 0`, "stored stream", 5000);
+        await sleep(2000);
+        const flakyRows = await page.evaluate<number>(
+          `[...document.querySelectorAll(".view-latest .row-site")].filter((e) => e.textContent === "Verify flaky").length`,
+        );
+        check(
+          "A new tab after Retry shows the retried feed from the stored fetch, with no requests",
+          flakyRows === 2 && collect.length === 0,
+          `${flakyRows} flaky rows, ${collect.length} request(s)`,
+        );
+      }
+
       collect = [];
       await click(".view-latest .latest-refresh");
       await sleep(3000);
@@ -701,6 +844,64 @@ async function main() {
       await page.evaluate(`chrome.storage.local.remove("blockedSites")`);
       await load();
       await latestReady();
+    }
+
+    // A blocked publisher and a private feed address are never requested at all (first pass only).
+    if (theme === "dark") {
+      phase = `${theme}:latest-not-requested`;
+      const catalog = await page.evaluate<any[]>(`chrome.storage.local.get("sources").then((r) => r.sources || [])`);
+
+      // A source whose feed address is on loopback: not fetched, no chip, no request.
+      await setStorage({ sources: [...catalog, PRIVATE_SOURCE] });
+      await page.evaluate(`chrome.storage.local.remove("latestFeed")`);
+      await load();
+      await latestReady();
+      await latestSettled();
+      await sleep(500);
+      check(
+        "A source with a private feed address is not requested and has no chip",
+        hitsTo("127.0.0.1", "/private.xml") === 0 && !(await chipNames()).some((n) => n.includes("Verify private")),
+        `${hitsTo("127.0.0.1", "/private.xml")} request(s) to the loopback feed`,
+      );
+
+      // A publisher on the blocked list: its sources are not requested either.
+      await setStorage({ sources: catalog, blockedSites: [FIXTURE_HOST] });
+      const fixtureHitsBefore = hitsTo(FIXTURE_HOST);
+      await page.evaluate(`chrome.storage.local.remove("latestFeed")`);
+      await load();
+      await latestReady();
+      await latestSettled();
+      await sleep(500);
+      const names = await chipNames();
+      check(
+        "A source on the blocked list is not requested and has no chip",
+        hitsTo(FIXTURE_HOST) === fixtureHitsBefore && !names.some((n) => /Verify (fixture|flaky)/.test(n)),
+        `${hitsTo(FIXTURE_HOST) - fixtureHitsBefore} request(s) to the blocked host; chips ${names.slice(0, 4).join(" | ")}`,
+      );
+
+      // Every source blocked: a clear notice, not "Nothing new", and the stored fetch is gone.
+      await setStorage({ sources: [FIXTURE_SOURCE, FLAKY_SOURCE], blockedSites: [FIXTURE_HOST] });
+      await load();
+      await waitFor(`document.querySelector(".view-latest .notice")`, "the all-blocked notice", 10_000);
+      await sleep(400);
+      const allBlocked = await page.evaluate<any>(`({
+        title: document.querySelector(".view-latest .notice-title")?.textContent || "",
+        body: document.querySelector(".view-latest .notice-body")?.textContent || "",
+        stored: null,
+      })`);
+      allBlocked.stored = await page.evaluate<any>(`chrome.storage.local.get("latestFeed").then((r) => r.latestFeed || null)`);
+      check(
+        "With every source blocked Latest says so (not 'Nothing new'), requests nothing and clears the stored fetch",
+        /blocked/i.test(allBlocked.title) && !/Nothing new/.test(allBlocked.title) && allBlocked.stored === null && hitsTo(FIXTURE_HOST) === fixtureHitsBefore,
+        `"${allBlocked.title}"`,
+      );
+      await shot(`16-latest-all-sources-blocked-${theme}`);
+
+      await setStorage({ sources: catalog });
+      await page.evaluate(`chrome.storage.local.remove("blockedSites")`);
+      await load();
+      await latestReady();
+      await latestSettled();
     }
 
     // Progressive: stories appear as sources settle, not when the slowest one does (first pass only).
@@ -762,6 +963,80 @@ async function main() {
       }
     }
 
+    // Enter opens the row that has focus; a look-up that finds a capture under way shows it (dark pass).
+    if (theme === "dark" && archivedFixture && archivedFixture2) {
+      phase = `${theme}:latest-enter-focus`;
+      const snaps = snapshotCount();
+      const posts0 = savePosts;
+      await filterToFixture();
+      await key("j"); // the cursor and focus are on the first row
+      await key("Tab"); // Tab moves focus to the next row; the cursor is not what Enter should use
+      const moved = await page.evaluate<string>(`document.activeElement?.id || ""`);
+      const rowTitles = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .row-title")].map((e) => e.textContent)`);
+      const secondId = await page.evaluate<string>(`document.querySelectorAll(".view-latest .row")[1]?.id || ""`);
+      if (moved !== secondId) await page.evaluate(`document.getElementById(${JSON.stringify(secondId)})?.focus()`);
+      const secondIsArchived = await page.evaluate<boolean>(`!!document.getElementById(${JSON.stringify(secondId)})?.querySelector(".row-amber")`);
+      if (secondIsArchived) {
+        await key("Enter");
+        await waitFor(`document.querySelector(".reader .reader-title")`, "the Reader from Enter on a focused row", 10_000);
+        const opened = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-title")?.textContent || "",
+          pos: document.querySelector(".reader-bar .bar-pos")?.textContent.trim() || "",
+        })`);
+        check(
+          "Enter opens the focused row (Tab moved focus), not the cursor row",
+          opened.title === rowTitles[1] && /^2 of /.test(opened.pos),
+          `${opened.pos}: "${opened.title.slice(0, 50)}" (Tab ${moved === secondId ? "moved focus" : "did not move focus; focused by script"})`,
+        );
+        check("Opening archived stories with Enter saved nothing", snapshotCount() === snaps && savePosts === posts0, `${snaps} -> ${snapshotCount()} snapshots, ${savePosts - posts0} save request(s)`);
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      } else {
+        check("Enter opens the focused row (Tab moved focus), not the cursor row", false, "second fixture row is not archived", true);
+      }
+
+      // A look-up that finds Amber already capturing the story shows the capturing state: no
+      // "Fetch full article" button as if nothing were happening, and it asks Amber to save nothing.
+      if (hasSaveApi) {
+        phase = `${theme}:latest-capturing-lookup`;
+        const posts = savePosts;
+        const futureLookup = encodeURIComponent("https://example.com/verify-newtab-future");
+        capturingStub = true;
+        await page.send("Fetch.enable", {
+          patterns: [{ urlPattern: `${AMBER}/api/lookup*` }, { urlPattern: `${AMBER}/api/jobs/*` }],
+        });
+        futureLookupFragment = futureLookup;
+        const order = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .row-title")].map((e) => e.textContent)`);
+        await click(".view-latest .row");
+        await waitFor(`document.querySelectorAll(".reader-body p").length > 0`, "the first archived story");
+        for (let n = 0; n < order.indexOf(FIXTURE_FUTURE_TITLE); n++) {
+          await key("j"); // down the fixture rows to the story Amber is "capturing"
+          await sleep(500);
+        }
+        const shownCapturing = await waitFor(
+          `/Capturing the page/.test(document.querySelector(".reader-fetch-stage")?.textContent || "")`,
+          "the capturing state for a look-up",
+          10_000,
+        );
+        const state = await page.evaluate<any>(`({
+          button: !!document.querySelector(".reader-fetch .solid-btn"),
+          title: document.querySelector(".reader-fetch-title")?.textContent || "",
+          stage: document.querySelector(".reader-fetch-stage")?.textContent || "",
+        })`);
+        check(
+          "A look-up that finds a capture under way shows the capturing state, with no Fetch button and no save",
+          shownCapturing && !state.button && savePosts === posts,
+          `"${state.title}" / "${state.stage.trim()}", ${savePosts - posts} save request(s)`,
+        );
+        await shot(`18-latest-reader-capture-in-progress-${theme}`);
+        await page.send("Fetch.disable");
+        capturingStub = false;
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      }
+      await click(".view-latest .chips .chip", "All");
+    }
+
     // 10/11 A live story that is not in Amber: save -> capture -> full text -----
     if (hasSaveApi && !flag("no-save")) {
       phase = `${theme}:latest-save`;
@@ -814,6 +1089,64 @@ async function main() {
       }
     } else if (!hasSaveApi) {
       check("Amber has the save API (/api/lookup)", false, "update Amber to a build with PR #17; the save flow was skipped", true);
+    }
+
+    // Save permission belongs to one attempt: after "Fetch full article" fails, walking j then k
+    // must not send another POST /api/save (dark pass; one real capture of a story that has no article).
+    if (hasSaveApi && !flag("no-save") && theme === "dark" && archivedFixture) {
+      phase = `${theme}:latest-save-invariant`;
+      await filterToFixture();
+      await click(".view-latest .row");
+      await waitFor(`document.querySelectorAll(".reader-body p").length > 0`, "the first archived story");
+      const rows = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-latest .row-title")].map((e) => e.textContent)`);
+      const target = rows.indexOf(FIXTURE_UNCAPTURABLE_TITLE);
+      for (let n = 0; n < target; n++) {
+        await key("j");
+        await sleep(400);
+      }
+      const idle = await waitFor(`document.querySelector(".reader-fetch.idle .solid-btn")`, "Fetch full article on the story Amber lacks", 15_000);
+      const before = savePosts;
+      if (idle && (await click(".reader-fetch.idle .solid-btn"))) {
+        const ended = await waitFor(
+          `document.querySelector(".reader-notice") || document.querySelectorAll(".reader-body p").length > 0`,
+          "the attempt to finish",
+          150_000,
+        );
+        const afterAttempt = savePosts;
+        const failed = await page.evaluate<boolean>(`!!document.querySelector(".reader-notice")`);
+        check('"Fetch full article" sent exactly one save request', ended && afterAttempt === before + 1, `${before} -> ${afterAttempt}`);
+        if (failed) {
+          const snapsAfter = snapshotCount();
+          await key("j");
+          await waitFor(`document.querySelector(".reader-fetch.idle .solid-btn")`, "the next story", 15_000);
+          await key("k");
+          await sleep(400);
+          await waitFor(`!document.querySelector(".reader-fetch:not(.idle)")`, "the failed story to settle", 15_000);
+          await sleep(2500);
+          const back = await page.evaluate<any>(`({
+            fetching: !!document.querySelector(".reader-fetch:not(.idle)"),
+            notice: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+            idle: !!document.querySelector(".reader-fetch.idle .solid-btn"),
+            title: document.querySelector(".reader-title")?.textContent || "",
+          })`);
+          check(
+            "After a failed attempt, walking away (j) and back (k) sends no new save request",
+            savePosts === afterAttempt && !back.fetching && snapshotCount() === snapsAfter,
+            `${savePosts - afterAttempt} new request(s); shows ${back.idle ? '"Fetch full article"' : `"${back.notice}"`}`,
+          );
+        } else {
+          check(
+            "After a failed attempt, walking away (j) and back (k) sends no new save request",
+            false,
+            "the attempt did not fail, so there was no failed attempt to walk away from",
+            true,
+          );
+        }
+      } else {
+        check('"Fetch full article" sent exactly one save request', false, "the fixture story did not show the button");
+      }
+      await key("Escape");
+      await waitFor(`!document.querySelector(".reader")`, "reader to close");
     }
 
     // Optional: a paywalled publisher, to see what Amber's capture comes back with -----
@@ -1006,6 +1339,29 @@ async function main() {
       await waitFor(`!document.querySelector(".reader")`, "reader to close");
       const focusBack = await page.evaluate<boolean>(`!!document.activeElement?.closest?.(".row")`);
       check("Closing the Reader returns focus to its row", focusBack, undefined, true);
+
+      // Enter opens the row that has focus (Tab moved it), not the cursor's row.
+      {
+        phase = `${theme}:library-enter`;
+        const titles = await page.evaluate<string[]>(`[...document.querySelectorAll(".view-library .row-title")].map((e) => e.textContent)`);
+        await page.evaluate(`document.querySelector(".view-library .row")?.focus()`);
+        await key("Tab");
+        const second = await page.evaluate<boolean>(`document.activeElement === document.querySelectorAll(".view-library .row")[1]`);
+        if (!second) await page.evaluate(`document.querySelectorAll(".view-library .row")[1]?.focus()`);
+        await key("Enter");
+        await waitFor(`document.querySelector(".reader .reader-title")`, "the Reader from Enter on a focused library row", 10_000);
+        const got = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-title")?.textContent || "",
+          pos: document.querySelector(".reader-bar .bar-pos")?.textContent.trim() || "",
+        })`);
+        check(
+          "Library: Enter opens the focused row, not the cursor row",
+          titles.length > 1 && got.title === titles[1] && /^2 of /.test(got.pos),
+          `${got.pos}: "${got.title.slice(0, 50)}"`,
+        );
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+      }
     }
 
     // 05 Settings -----------------------------------------------------------
@@ -1026,6 +1382,24 @@ async function main() {
     );
     check("Settings shows the check instance address", modal.url === AMBER, modal.url);
     await shot(`05-settings-${theme}`);
+    if (theme === "dark") {
+      // Adding a feed on this computer or the local network is refused with a plain explanation,
+      // before anything is requested.
+      phase = `${theme}:settings-private-feed`;
+      const hitsBefore = hitsTo("127.0.0.1");
+      await click('input[aria-label="Feed address to add"]');
+      await page.send("Input.insertText", { text: PRIVATE_FEED });
+      await sleep(150);
+      await click(".src-add button", "Add");
+      await waitFor(`document.querySelector(".src-add + .set-test .set-status.error")`, "the private-address refusal", 10_000);
+      const refusal = await text(".src-add + .set-test .set-status");
+      check(
+        "Settings refuses a feed on a private address, with an explanation, without requesting it",
+        /local network/i.test(refusal) && hitsTo("127.0.0.1") === hitsBefore,
+        refusal.slice(0, 110),
+      );
+      await shot(`17-settings-private-feed-refused-${theme}`);
+    }
     await key("Escape");
     await waitFor(`!document.querySelector(".modal")`, "settings to close");
 
@@ -1091,6 +1465,7 @@ export default function App() {
         const r = document.querySelector(".today-frame iframe")?.getBoundingClientRect();
         return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
       })()`);
+      const firstClickAt = Date.now();
       if (box) {
         for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
           await page.send("Input.dispatchMouseEvent", {
@@ -1104,6 +1479,32 @@ export default function App() {
       }
       const opened = await waitFor(`document.querySelector(".reader .reader-title")`, "the Reader from homepage:open-url", 15_000);
       check("homepage:open-url opens the Reader on the address", opened);
+      if (opened) {
+        // Esc, then the same click again within the 2 s repeat window: closing the Reader makes it a new request.
+        await key("Escape");
+        await waitFor(`!document.querySelector(".reader")`, "reader to close");
+        // The page allows 3 requests per second (one click sent 3), so wait that out, but stay under 2 s.
+        await sleep(Math.max(0, 1150 - (Date.now() - firstClickAt)));
+        if (box) {
+          for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+            await page.send("Input.dispatchMouseEvent", {
+              type,
+              x: box.x,
+              y: box.y,
+              button: type === "mouseMoved" ? "none" : "left",
+              clickCount: type === "mouseMoved" ? 0 : 1,
+            });
+          }
+        }
+        const secondClickAt = Date.now();
+        const again = await waitFor(`document.querySelector(".reader .reader-title")`, "the Reader after Esc and a second click", 8000);
+        check(
+          "Esc then clicking the story again reopens the Reader (no repeat suppression after closing)",
+          again,
+          `${secondClickAt - firstClickAt} ms after the first click`,
+          !again && secondClickAt - firstClickAt >= 2000,
+        );
+      }
       if (opened) {
         const state = await page.evaluate<any>(`({
           title: document.querySelector(".reader-title")?.textContent || "",
@@ -1199,7 +1600,9 @@ export default function App() {
   console.log("--- console ---");
   const noise = /Failed to load resource|ERR_CONNECTION|Failed to fetch|NetworkError|net::/i;
   const expected = (e: { phase: string; text: string }) =>
-    noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi);
+    (/status of 503/.test(e.text) && /latest/.test(e.phase)) || // the fixture "flaky" feed, on purpose
+    (/status of 400/.test(e.text) && /save-invariant/.test(e.phase)) || // Amber refusing the uncapturable address
+    (noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi));
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(
     "No console errors from the extension page",

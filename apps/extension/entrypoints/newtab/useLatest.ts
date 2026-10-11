@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   isBlocked,
+  isSourceBlocked,
   type ArchiveArticleMeta,
   type FeedItem,
   type FeedSource,
@@ -17,6 +18,10 @@ export const LATEST_HOURS = 72;
 export const LATEST_PER_SOURCE = 20;
 /** Every new tab shows the stored fetch and only refetches when it is older than this. */
 export const REFRESH_MS = 5 * 60_000;
+
+/** What is stored is bounded: links longer than this are dropped, and nothing over this size is written. */
+const MAX_STORED_LINK = 2000;
+const MAX_STORED_BYTES = 1_500_000;
 
 /** What is stored under `KEYS.latestFeed`: one fetch, valid for the sources that produced it. */
 interface StoredFeed {
@@ -58,6 +63,34 @@ function hashSources(sources: FeedSource[]): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
   return `${sources.length}:${(h >>> 0).toString(16)}`;
+}
+
+/** What gets written: each source capped the way the stream caps it, so the stored fetch stays small. */
+function boundedResults(results: Array<Omit<SourceFetch, "done">>, now: number): StoredFeed["results"] {
+  return results.map((r) => {
+    const { items } = mergeSourceFetches([{ ...r, done: true }], {
+      sinceHours: LATEST_HOURS,
+      perSource: LATEST_PER_SOURCE,
+      now,
+    });
+    const kept = items.filter((i) => i.link.length <= MAX_STORED_LINK);
+    return r.error ? { name: r.name, items: kept, error: r.error } : { name: r.name, items: kept };
+  });
+}
+
+/** Store a fetch for every new tab. Never throws: too big or unavailable storage just means the next tab fetches. */
+async function persist(sourcesHash: string, fetchedAt: number, results: Array<Omit<SourceFetch, "done">>) {
+  try {
+    const value: StoredFeed = { v: 1, sourcesHash, fetchedAt, results: boundedResults(results, fetchedAt) };
+    const size = JSON.stringify(value).length;
+    if (size > MAX_STORED_BYTES) {
+      console.warn(`[latest] not caching the fetch: ${size} bytes is over ${MAX_STORED_BYTES}`);
+      return;
+    }
+    await browser.storage.local.set({ [KEYS.latestFeed]: value });
+  } catch {
+    /* the next tab just fetches */
+  }
 }
 
 function isStored(value: unknown): value is StoredFeed {
@@ -122,12 +155,15 @@ function union(next: FeedItem[], previous: FeedItem[]): FeedItem[] {
 /**
  * The Latest view's data: the user's sources' newest stories.
  *
- * - Fetched from the page (not the worker), one source at a time, and shown as
+ * - Fetched from the page (not the worker), all sources in parallel, and shown as
  *   each source settles, so a slow feed never holds the others back.
  * - The last fetch is stored (`KEYS.latestFeed`) and shared by every new tab: a
- *   tab shows it at once and only refetches when it is older than five minutes,
- *   the sources changed, or the person pressed refresh.
- * - Stories on a blocked site (by link host) are dropped here, on the page.
+ *   tab shows it at once and refetches by itself only when it is older than five
+ *   minutes or the sources changed. A source that failed counts as fetched (it
+ *   has its own Retry); the refresh button and Retry fetch on demand.
+ * - A source whose publisher is on the blocked list, or whose feed address is on
+ *   a private host, is not requested at all; stories on a blocked site (by link
+ *   host) are dropped here, on the page.
  * - An index of what Amber already has lets rows say "In Amber".
  */
 export function useLatest({
@@ -150,6 +186,13 @@ export function useLatest({
   const archiveLoaded = useRef(false);
   const stateRef = useRef(state);
   stateRef.current = state;
+  /** The blocked list as a stable value: a new array with the same sites must not refetch. */
+  const blockedKey = JSON.stringify(blockedSites);
+  const blockedRef = useRef(blockedSites);
+  blockedRef.current = blockedSites;
+  const controllerRef = useRef<AbortController | null>(null);
+  /** What the shown fetch was made for, so a retried source can be written back to the cache. */
+  const hashRef = useRef("");
 
   const loadArchive = useCallback(
     (gen: number) => {
@@ -178,6 +221,9 @@ export function useLatest({
       if (archiveUrl === null) return;
       const gen = ++generation.current;
       const current = () => gen === generation.current;
+      controllerRef.current?.abort();
+      const controller = new AbortController();
+      controllerRef.current = controller;
       setState((s) => ({ ...s, refreshing: true }));
 
       let catalog: FeedSource[] = [];
@@ -188,8 +234,9 @@ export function useLatest({
         sourcesError = err instanceof Error ? err.message : String(err);
       }
       if (!current()) return;
-      const enabled = catalog.filter((s) => s.enabled);
+      const enabled = catalog.filter((s) => s.enabled && !isSourceBlocked(s, blockedRef.current));
       const hash = hashSources(enabled);
+      hashRef.current = hash;
 
       let stored: StoredFeed | undefined;
       try {
@@ -208,11 +255,17 @@ export function useLatest({
 
       if (enabled.length === 0) {
         setState({ ...INITIAL, phase: "ready", catalog, sourcesError });
+        try {
+          await browser.storage.local.remove(KEYS.latestFeed);
+        } catch {
+          /* nothing to clear */
+        }
         return;
       }
 
-      const fresh =
-        !!stored && Date.now() - stored.fetchedAt < REFRESH_MS && stored.results.every((r) => !r.error);
+      // A source that failed is part of a fresh fetch: it has its own Retry, and refetching every
+      // feed on every new tab because one of them is down would break "once every five minutes".
+      const fresh = !!stored && Date.now() - stored.fetchedAt < REFRESH_MS;
       const showing = byName.size > 0;
       setState((s) => ({
         ...s,
@@ -236,6 +289,7 @@ export function useLatest({
       await Promise.all(
         enabled.map((source) =>
           fetchSourceFeeds(source, { ...window, now: fetchedAt }, {
+            signal: controller.signal,
             onProgress: (partial) => {
               if (!current()) return;
               const before = byName.get(source.name)?.items ?? [];
@@ -260,14 +314,10 @@ export function useLatest({
 
       const results = ordered();
       setState((s) => ({ ...s, results, pending: [], updatedAt: fetchedAt, refreshing: false }));
-      try {
-        const value: StoredFeed = { v: 1, sourcesHash: hash, fetchedAt, results };
-        await browser.storage.local.set({ [KEYS.latestFeed]: value });
-      } catch {
-        /* too big or storage unavailable: the next tab just fetches */
-      }
+      await persist(hash, fetchedAt, results);
     },
-    [archiveUrl, loadArchive],
+    // `blockedKey` (not the array) so the same list read again does not look like a change.
+    [archiveUrl, loadArchive, blockedKey],
   );
 
   /** Re-fetch one publication and splice it in, leaving the others as they were. */
@@ -276,17 +326,20 @@ export function useLatest({
     if (!source) return;
     const gen = generation.current;
     setState((s) => ({ ...s, pending: [...new Set([...s.pending, name])] }));
-    const result = await fetchSourceFeeds(source, { sinceHours: LATEST_HOURS, perSource: LATEST_PER_SOURCE });
+    const result = await fetchSourceFeeds(
+      source,
+      { sinceHours: LATEST_HOURS, perSource: LATEST_PER_SOURCE },
+      { signal: controllerRef.current?.signal },
+    );
     if (gen !== generation.current) return;
-    setState((s) => ({
-      ...s,
-      results: s.results.map((r) =>
-        r.name === name
-          ? { name, items: result.error && result.items.length === 0 ? r.items : result.items, error: result.error }
-          : r,
-      ),
-      pending: s.pending.filter((n) => n !== name),
-    }));
+    const results = stateRef.current.results.map((r) =>
+      r.name === name
+        ? { name, items: result.error && result.items.length === 0 ? r.items : result.items, error: result.error }
+        : r,
+    );
+    setState((s) => ({ ...s, results, pending: s.pending.filter((n) => n !== name) }));
+    // The other sources keep their own fetch time, so a retry never makes the whole fetch look newer.
+    void persist(hashRef.current, stateRef.current.updatedAt ?? Date.now(), results);
   }, []);
 
   // First load, and again when the address or the sources list changed.
@@ -295,6 +348,7 @@ export function useLatest({
     void refresh();
     return () => {
       generation.current++;
+      controllerRef.current?.abort();
     };
   }, [refresh, reloadToken]);
 
@@ -315,17 +369,37 @@ export function useLatest({
     };
   }, [active, refresh]);
 
-  // The stream, with blocked sites removed by the host of each story's link.
+  // The sources being read: switched on, and not blocked by publisher or by a private feed address.
+  const { sources, blockedCount } = useMemo(() => {
+    const on = state.catalog.filter((s) => s.enabled);
+    const open = on.filter((s) => !isSourceBlocked(s, blockedSites));
+    return { sources: open, blockedCount: on.length - open.length };
+  }, [state.catalog, blockedSites]);
+
+  // The stream, with blocked sources removed and stories dropped by the host of each link.
   const { items, statuses } = useMemo<{ items: FeedItem[]; statuses: FeedSourceStatus[] }>(() => {
-    const allowed = state.results.map((r) => ({
-      ...r,
-      done: true,
-      items: r.items.filter((i) => !isBlocked(i.link, blockedSites)),
-    }));
+    const names = new Set(sources.map((s) => s.name));
+    const allowed = state.results
+      .filter((r) => names.has(r.name))
+      .map((r) => ({
+        ...r,
+        done: true,
+        items: r.items.filter((i) => !isBlocked(i.link, blockedSites)),
+      }));
     const merged = mergeSourceFetches(allowed, { sinceHours: LATEST_HOURS, perSource: LATEST_PER_SOURCE });
     return { items: merged.items, statuses: merged.sources };
-  }, [state.results, blockedSites]);
+  }, [state.results, sources, blockedSites]);
 
-  const enabledCount = useMemo(() => state.catalog.filter((s) => s.enabled).length, [state.catalog]);
-  return { state, items, statuses, archived, enabledCount, refresh, retrySource };
+  const sourceNames = useMemo(() => sources.map((s) => s.name), [sources]);
+  return {
+    state,
+    items,
+    statuses,
+    archived,
+    sourceNames,
+    enabledCount: sources.length,
+    blockedCount,
+    refresh,
+    retrySource,
+  };
 }

@@ -140,8 +140,12 @@ export default function App() {
   const viewRef = useRef(view);
   viewRef.current = view;
   const readerOpenRef = useRef(false);
+  const settingsOpenRef = useRef(false);
+  settingsOpenRef.current = showSettings;
   const blockedRef = useRef(blockedSites);
   blockedRef.current = blockedSites;
+  /** The last open request let through, so an immediate repeat is dropped; cleared when the Reader closes. */
+  const lastOpen = useRef({ key: "", at: 0 });
 
   // The model-built homepage asks to open a story in the native reader: an archived one by
   // id, or one that is not in the archive by address. It can only ever open the in-page
@@ -153,7 +157,6 @@ export default function App() {
       return Array.from(frames).some((frame) => frame.contentWindow !== null && frame.contentWindow === source);
     };
     let recent: number[] = [];
-    let last = { key: "", at: 0 };
 
     const onMessage = (e: MessageEvent) => {
       const data = e.data as { type?: unknown; id?: unknown; url?: unknown } | null;
@@ -162,9 +165,9 @@ export default function App() {
 
       // The same gate for both: only the homepage's own frame, only while the Today tab is
       // showing (a hidden or covered frame can't have been clicked), and not on top of an
-      // open Reader. Bursts are dropped and an immediate repeat is ignored.
+      // open Reader or Settings. Bursts are dropped and an immediate repeat is ignored.
       if (!fromHomepage(e.source)) return;
-      if (viewRef.current !== "today" || readerOpenRef.current) return;
+      if (viewRef.current !== "today" || readerOpenRef.current || settingsOpenRef.current) return;
       const now = Date.now();
       recent = recent.filter((t) => now - t < 1000);
       if (recent.length >= MESSAGES_PER_SECOND) return;
@@ -173,8 +176,9 @@ export default function App() {
       if (data.type === OPEN_ARTICLE) {
         if (typeof data.id !== "string" || !ARTICLE_ID.test(data.id)) return;
         const id = data.id;
+        const last = lastOpen.current;
         if (last.key === `a:${id}` && now - last.at < 2000) return;
-        last = { key: `a:${id}`, at: now };
+        lastOpen.current = { key: `a:${id}`, at: now };
         setReader({ entry: entryFromId(id), list: [], origin: "today" });
         return;
       }
@@ -191,8 +195,9 @@ export default function App() {
       if (!isAllowedUrl(parsed.href, blockedRef.current)) return;
       // The model's links arrive with `'` percent-encoded; the publisher's address has the apostrophe.
       const href = parsed.href.replace(/%27/gi, "'");
+      const last = lastOpen.current;
       if (last.key === `u:${href}` && now - last.at < 2000) return;
-      last = { key: `u:${href}`, at: now };
+      lastOpen.current = { key: `u:${href}`, at: now };
       setReader({ entry: entryFromUrl(href), list: [], origin: "today" });
     };
     window.addEventListener("message", onMessage);
@@ -220,7 +225,11 @@ export default function App() {
     if (origin === "latest") setLatestCursor(entry.key.replace(/^feed:/, ""));
     else if (origin === "library") setCursorId(entry.key);
   }, []);
-  const closeReader = useCallback(() => setReader(null), []);
+  const closeReader = useCallback(() => {
+    // Closing is the person's answer to the last request: asking again right away is a new click.
+    lastOpen.current = { key: "", at: 0 };
+    setReader(null);
+  }, []);
   const readerSaved = useCallback(
     (entry: ReaderEntry, meta: ArchiveArticleMeta, created: boolean) => {
       if (entry.url) {

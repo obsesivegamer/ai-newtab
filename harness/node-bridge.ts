@@ -15,6 +15,7 @@ import {
   archiveHostOf,
   createFeedBridge,
   fromKnown,
+  isSourceBlocked,
   normalizeArchiveUrl,
   seedCatalog,
   type ArchiveArticle,
@@ -256,8 +257,11 @@ export function harnessBlockedSites(): string[] {
  * - `FEEDS` (comma-separated feed addresses) if set; an empty value turns feeds off;
  * - otherwise the publications the archive's `sources` name, from the same table the
  *   extension seeds from;
- * - otherwise (no archive, or none of its sources have a known feed) the first few
+ * - otherwise (no archive, or none of its sources have a known feed) the first 6
  *   publications in that table.
+ *
+ * Sources whose publisher is on the blocked list, or whose feed address is on a
+ * private or local-network host, are not fetched (the extension does the same).
  */
 export async function harnessFeeds(): Promise<FeedBridge | undefined> {
   const env = process.env.FEEDS;
@@ -280,5 +284,11 @@ export async function harnessFeeds(): Promise<FeedBridge | undefined> {
     if (sources.length === 0) sources = DEFAULT_FEEDS.slice(0, 6).map(fromKnown);
     console.log(`[harness] feeds: ${sources.map((s) => s.name).join(", ")}`);
   }
-  return createFeedBridge(sources);
+  const blocked = harnessBlockedSites();
+  const allowed = sources.filter((s) => !isSourceBlocked(s, blocked));
+  if (allowed.length < sources.length) {
+    const names = sources.filter((s) => !allowed.includes(s)).map((s) => s.name);
+    console.log(`[harness] feeds: skipped ${names.join(", ")} (blocked or private address)`);
+  }
+  return allowed.length > 0 ? createFeedBridge(allowed) : undefined;
 }

@@ -228,7 +228,7 @@ export type FullArticleResult =
       id: string;
       text: string;
       meta: ArchiveArticleMeta;
-      /** True when this call started a capture (so the archive list has a new article). */
+      /** True when a capture finished during this call, started by it or already running (so the archive list has a new article). */
       created: boolean;
     }
   | { ok: false; reason: FetchFailure; detail?: string; id?: string };
@@ -237,7 +237,8 @@ export type FullArticleResult =
  * The whole job: lookup, then read it if it is readable, else save, wait and
  * read. Never throws; failures come back typed. `force` re-captures an article
  * Amber has only a stub of. `saveIfMissing: false` stops after the lookup with
- * `not-saved` instead of starting a capture.
+ * `not-saved` instead of starting a capture; a capture that is already queued or
+ * running is waited for either way (polling it changes nothing in Amber).
  */
 export async function fetchFullArticle(
   base: string,
@@ -263,6 +264,14 @@ export async function fetchFullArticle(
     if (found.found && found.id && found.status === "complete" && !found.usable && !args.force) {
       // Amber has this page but it is not an article (a paywall stub). Re-capturing is the person's call.
       throw new ArticleFetchError("paywall-stub", undefined, found.id);
+    }
+    if (found.found && found.id && (found.status === "queued" || found.status === "capturing")) {
+      // A capture is already under way (this page started it earlier, or another tab did). Watching
+      // it is read-only: it asks Amber nothing new, so it needs no permission to save.
+      stage(found.status);
+      await waitForArticle(base, found.id, { signal, onStatus: stage });
+      stage("reading");
+      return finish(await readArticle(base, found.id, signal), true);
     }
     if (args.saveIfMissing === false) throw new ArticleFetchError("not-saved", undefined, found.id);
 

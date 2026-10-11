@@ -57,7 +57,7 @@ export function Latest({
   onOpen: (entry: ReaderEntry, list: ReaderEntry[]) => void;
   onOpenSettings: () => void;
 }) {
-  const { state, items, statuses, archived, enabledCount, refresh, retrySource } = useLatest({
+  const { state, items, statuses, archived, sourceNames, enabledCount, blockedCount, refresh, retrySource } = useLatest({
     archiveUrl,
     active,
     reloadToken,
@@ -86,12 +86,12 @@ export function Latest({
 
   // Chips follow the catalog's order (most-read first), so they hold still while you search.
   const chips = useMemo(() => {
-    const all = state.catalog.filter((s) => s.enabled).map((s) => s.name);
+    const all = sourceNames;
     if (allSources) return all;
     const head = all.slice(0, COLLAPSED_SOURCES);
     if (source && !head.includes(source) && all.includes(source)) head.push(source);
     return head;
-  }, [state.catalog, allSources, source]);
+  }, [sourceNames, allSources, source]);
   const totalChips = enabledCount;
   const hiddenSources = totalChips - chips.length;
 
@@ -131,14 +131,18 @@ export function Latest({
         const next = e.key === "j" ? Math.min(visible.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
         onCursor(visible[next].id);
         focusRow(visible[next].id);
-      } else if (e.key === "Enter" && cursorId) {
+      } else if (e.key === "Enter") {
+        // A focused row opens itself, whatever the cursor says (Tab moves focus, not the
+        // cursor); with nothing in particular focused, the cursor row opens. Chips, links
+        // and the top bar keep their own Enter.
         const t = e.target as HTMLElement;
-        const onRow = !!t.closest?.(".row");
+        const row = t.closest?.("button.row[id^='lrow-']");
         const idle = t === document.body || t.tagName === "MAIN" || t.classList?.contains("lib");
-        if (!onRow && !idle) return;
-        const entry = entryById.get(cursorId);
-        if (!entry) return;
+        const id = row ? row.id.slice("lrow-".length) : idle ? cursorId : null;
+        const entry = id ? entryById.get(id) : undefined;
+        if (!id || !entry) return;
         e.preventDefault();
+        onCursor(id);
         onOpen(entry, entries);
       }
     };
@@ -281,13 +285,15 @@ export function Latest({
 
       {noSources && (
         <Notice
-          title="No sources yet."
+          title={blockedCount > 0 ? "Every source is on your blocked list." : "No sources yet."}
           body={
             state.sourcesError
               ? "Couldn’t read your sources list. Add some in Settings, under Sources."
-              : state.catalog.length > 0
-                ? "Every source is switched off. Turn some on in Settings, under Sources, and their newest stories appear here."
-                : "Add the sites you read in Settings, under Sources, and their newest stories appear here."
+              : blockedCount > 0
+                ? "Latest doesn’t ask blocked sites for anything. Take a publisher off the blocked list in Settings, and its newest stories appear here."
+                : state.catalog.length > 0
+                  ? "Every source is switched off. Turn some on in Settings, under Sources, and their newest stories appear here."
+                  : "Add the sites you read in Settings, under Sources, and their newest stories appear here."
           }
           action={{ label: "Open settings", onClick: onOpenSettings }}
         />
@@ -344,6 +350,7 @@ export function Latest({
                       now={now}
                       inAmber={archivedFor(item) !== undefined}
                       cursor={item.id === cursorId}
+                      onFocus={() => onCursor(item.id)}
                       onOpen={() => {
                         const entry = entryById.get(item.id);
                         if (!entry) return;
@@ -373,18 +380,26 @@ function Row({
   now,
   inAmber,
   cursor,
+  onFocus,
   onOpen,
 }: {
   item: FeedItem;
   now: number;
   inAmber: boolean;
   cursor: boolean;
+  onFocus: () => void;
   onOpen: () => void;
 }) {
   const when = relativeTime(item.publishedAt, now);
   return (
     <li>
-      <button id={`lrow-${item.id}`} type="button" className={`row${cursor ? " cursor" : ""}`} onClick={onOpen}>
+      <button
+        id={`lrow-${item.id}`}
+        type="button"
+        className={`row${cursor ? " cursor" : ""}`}
+        onFocus={onFocus}
+        onClick={onOpen}
+      >
         <span className="row-main">
           <span className="row-title">{item.title}</span>
           {item.summary && <span className="latest-blurb">{item.summary}</span>}

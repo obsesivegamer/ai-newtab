@@ -1,5 +1,5 @@
 import type { FeedSource } from "./types";
-import { hostOf, isSameOrSubdomain } from "./site-filter";
+import { hostOf, isBlocked, isSameOrSubdomain } from "./site-filter";
 
 /**
  * The user's catalog of news sources: which publications they read and the
@@ -192,15 +192,17 @@ function knownByHost(domain: string): KnownSource | undefined {
 }
 
 /**
- * True when a source should not be fetched because the blocked-sites list names
- * its publisher: one of its known hosts, or the host of one of its feed addresses.
- * Names are never read as hosts ("POLITICO" or "NPR" have no dot, and a dotless
- * name would look like a local-network host).
+ * True when a source should not be fetched: the blocked-sites list names its
+ * publisher (one of its known hosts), or one of its feed addresses is on a blocked
+ * host or on a private, loopback, link-local or local-network one (those are
+ * always refused, whatever the list says). Names are never read as hosts
+ * ("POLITICO" or "NPR" have no dot, and a dotless name would look like a
+ * local-network host); only addresses are.
  */
 export function isSourceBlocked(source: FeedSource, blocked: string[]): boolean {
   const known = DEFAULT_FEEDS.find((k) => k.id === source.id);
-  const hosts = [...(known?.hosts ?? []), ...source.feedUrls.map((url) => hostOf(url))].filter(Boolean);
-  return hosts.some((host) => isListed(host, blocked));
+  if (known?.hosts.some((host) => isListed(host, blocked))) return true;
+  return source.feedUrls.some((url) => isBlocked(url, blocked));
 }
 
 /** `isBlocked` minus its "private hosts are always blocked" rule: only what the list names. */

@@ -106,14 +106,21 @@ and attaches `archiveId` and `permalink`, and the prompt tells the model to use 
 open-article message for items that have them and open-url for the rest.
 
 **Latest and the Reader.** The new-tab page's default view, Latest, is deterministic
-(no model, no API key). The page itself fetches the user's sources' feeds, one source
-at a time, and shows each source's stories as it settles; one slow feed (each has a
-15 s limit) never holds the others back. The last fetch is stored in
-`chrome.storage.local` (`latestFeed`) and shared by every new tab: a tab shows it at
-once and refetches only when it is older than 5 minutes, the set of sources changed,
-or you pressed refresh. Stories whose link host is on the blocked-sites list are
-dropped on the page. Stories whose link matches an archived article's `originalUrl`
-(`articleKey`: canonical link, `%27` as `'`) are marked "In Amber".
+(no model, no API key). The page itself fetches the user's sources' feeds, all
+sources in parallel, and shows each source's stories as it settles; one slow feed
+(each has a 15 s limit) never holds the others back. The last fetch is stored in
+`chrome.storage.local` (`latestFeed`, each source capped the way the stream caps
+it, and not written at all over about 1.5 MB) and shared by every new tab: a tab
+shows it at once and refetches by itself only when it is older than 5 minutes or
+the set of sources changed. A source that failed counts as fetched: it is listed
+with its own Retry, and one feed being down never makes every new tab refetch.
+The refresh button and a source's Retry fetch on demand, and a Retry is written
+back to the stored fetch. A source is not requested at all when its publisher is
+on the blocked-sites list or its feed address is on a private, loopback or
+local-network host (`isSourceBlocked`); if that leaves no source, Latest says so
+and the stored fetch is cleared. Stories whose link host is on the blocked-sites
+list are dropped on the page. Stories whose link matches an archived article's
+`originalUrl` (`articleKey`: canonical link, `%27` as `'`) are marked "In Amber".
 
 Saving rules, in one place: nothing is ever saved to Amber except as the direct result
 of a person's gesture on a story.
@@ -125,8 +132,15 @@ of a person's gesture on a story.
   to about 90 s, then `/api/snapshots/{id}/text`.
 - Anything reached afterwards with j/k, the arrows or the next card, and anything
   opened by the model-built page, only looks itself up and otherwise shows "Fetch
-  full article"; pressing it is the gesture. A forced recapture ("Try capturing
-  again" on a paywall stub) belongs to the article it was pressed on.
+  full article"; pressing it is the gesture. That permission belongs to one
+  attempt on one article: it ends when the attempt finishes (success or failure)
+  and when another article is shown, so walking away and back never saves again.
+  "Try again" and a forced recapture ("Try capturing again" on a paywall stub) are
+  new clicks on the article they were pressed on. A look-up that finds a capture
+  already queued or running just watches it (polling `/api/jobs/{id}` changes
+  nothing in Amber) and shows the capturing state.
+- Enter on a Latest or Library row opens the row that has focus; with nothing
+  focused it opens the keyboard cursor's row.
 - A found snapshot that is not `usable` is treated as not archived. Failures come
   back typed: `amber-down`, `no-api` (an Amber without the save API), `busy`,
   `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`.
@@ -147,7 +161,7 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
   link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the feed parser
   feeds.ts                parseFeed, fetchSourceFeeds, mergeSourceFetches, createFeedBridge, probeFeed: fetch + AbortSignal only,
-                          hardened against hostile feeds (body cap, per-element caps, linear-time scanning, private-address checks)
+                          hardened against hostile feeds (body cap, element text caps, linear-time scanning, private-address checks)
   feed-catalog.ts         the table of publications we know feeds for, seeding, and the pure source-list edits
   types.ts                BrowserBridge, ArchiveBridge, FeedBridge, KVStore, RunPhase, …
 
@@ -330,8 +344,10 @@ just the prompt: blocked domains are excluded from history digests and their
 counts, and blocked or non-HTTP(S) page requests never reach the browser bridge.
 Archived articles are filtered the same way on their publisher URL, and feed items
 on the host of their `link`; feed fetches go from the browser straight to the
-publishers (no cookies), and nothing is saved to the archive except on an explicit
-click in the Reader. What the
+publishers (no cookies), a source whose publisher is blocked, or whose feed
+address is on a private or local-network host, is not requested (builds and
+Latest alike), and nothing is saved to the archive except on an explicit click in
+the Reader. What the
 model sees of the archive is the listing (titles, authors, publisher URLs, save
 dates and per-publication counts for up to 40 articles per `getArchive` call) and
 the full text of the articles it asks for; the text is sent to the API in the same

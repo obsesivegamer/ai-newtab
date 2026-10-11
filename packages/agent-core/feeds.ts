@@ -9,9 +9,12 @@ import { hostOf, isPrivateHost } from "./site-filter";
  * no `node:*`, so it runs in the MV3 service worker, the new-tab page and Bun.
  * Feeds are fetched with no cookies, so a publisher sees an anonymous reader.
  *
- * Feeds come from the open web and are treated as hostile: bodies are capped,
- * every element is capped before any text work, and nothing here is quadratic
- * in the size of the input.
+ * Feeds come from the open web and are treated as hostile: bodies are capped
+ * (5 MB) and every element's text is cut to 20,000 characters before any text
+ * work. An item is searched whole, so its link and date are found wherever the
+ * publisher put them (Blogger puts them after a long escaped body); the cap that
+ * matters is on the text, not on where an element may sit. Nothing here is
+ * quadratic in the size of the input.
  */
 
 /** One feed may take this long; a slow one never holds up another. */
@@ -19,8 +22,7 @@ export const FEED_TIMEOUT_MS = 15_000;
 /** Bigger bodies are refused (read as a stream and cancelled, not buffered). */
 export const MAX_FEED_BYTES = 5 * 1024 * 1024;
 const MAX_ITEMS_PER_FEED = 500;
-/** One item's markup, and the text of one element, are cut to this before they are looked at. */
-const MAX_ITEM_CHARS = 100_000;
+/** The text of one element is cut to this before it is looked at. */
 const MAX_ELEMENT_CHARS = 20_000;
 const MAX_ATTRS_CHARS = 2_000;
 const TITLE_MAX = 300;
@@ -286,8 +288,8 @@ function parseRaw(xml: string): RawItem[] {
       : collapse(decodeEntities(stripTags(decodeEntities(unwrapEscaped(inner.slice(0, MAX_ELEMENT_CHARS))))));
 
   const blocks = [
-    ...scan(doc, "item", { maxInner: MAX_ITEM_CHARS, limit: MAX_ITEMS_PER_FEED }),
-    ...scan(doc, "entry", { maxInner: MAX_ITEM_CHARS, limit: MAX_ITEMS_PER_FEED }),
+    ...scan(doc, "item", { maxInner: Infinity, limit: MAX_ITEMS_PER_FEED }),
+    ...scan(doc, "entry", { maxInner: Infinity, limit: MAX_ITEMS_PER_FEED }),
   ].slice(0, MAX_ITEMS_PER_FEED);
   const out: RawItem[] = [];
   const seen = new Set<string>();
@@ -502,6 +504,11 @@ export async function probeFeed(
   address: string,
 ): Promise<{ feedUrl: string; itemCount: number; newest?: string; title?: string }> {
   const url = address.trim();
+  if (isPrivateHost(hostOf(url))) {
+    throw new Error(
+      "That address is on your own computer or local network. Latest only reads feeds on the public internet.",
+    );
+  }
   let text: string;
   try {
     text = await fetchText(url);
@@ -538,14 +545,14 @@ export async function probeFeed(
 /**
  * The first `<link rel="alternate" type="application/(rss|atom)+xml">` in an HTML
  * page, as an absolute http(s) URL. One that points at a private, loopback or
- * link-local host is ignored, unless the page itself is on one.
+ * link-local host is ignored.
  */
 function findFeedLink(html: string, base: string): string | undefined {
-  const pageIsPrivate = isPrivateHost(hostOf(base));
   const head = html.slice(0, 200_000);
+  const lower = head.toLowerCase();
   let from = 0;
   for (let n = 0; n < 200; n++) {
-    const start = head.toLowerCase().indexOf("<link", from);
+    const start = lower.indexOf("<link", from);
     if (start < 0) break;
     const end = head.indexOf(">", start);
     if (end < 0) break;
@@ -558,7 +565,7 @@ function findFeedLink(html: string, base: string): string | undefined {
     try {
       const absolute = new URL(href, base);
       if (absolute.protocol !== "http:" && absolute.protocol !== "https:") continue;
-      if (!pageIsPrivate && isPrivateHost(hostOf(absolute.href))) continue;
+      if (isPrivateHost(hostOf(absolute.href))) continue;
       return absolute.toString();
     } catch {
       /* try the next one */
