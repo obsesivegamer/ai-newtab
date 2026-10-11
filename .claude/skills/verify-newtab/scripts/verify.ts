@@ -582,6 +582,24 @@ async function main() {
       .map((i) => `<item><title>${esc(i.title)}</title><link>${esc(i.link)}</link><pubDate>${i.at ?? at}</pubDate><description>${esc(i.d)}</description></item>`)
       .join("")}</channel></rss>`;
   };
+  // A Google News sitemap, the only listing Reuters publishes: parsed as a feed. Two English stories
+  // (one with a keyword, one whose section comes from its path), a /de/ story that declares German
+  // (kept: a German publisher's own sitemap) and a /fr/ story declared "en" (left out).
+  const SITEMAP_TITLE = "Fixture sitemap story from the world desk";
+  const SITEMAP_TITLE_2 = "Fixture sitemap story with a keyword";
+  const SITEMAP_TITLE_FR = "Histoire de fixture en francais";
+  const SITEMAP_TITLE_DE = "Fixture-Geschichte aus dem deutschen Dienst";
+  const sitemapXml = () => {
+    const at = new Date().toISOString();
+    const url = (loc: string, title: string, keywords = "", language = "en") =>
+      `<url><loc>${loc}</loc><lastmod>${at}</lastmod><news:news><news:publication><news:name>Verify sitemap</news:name><news:language>${language}</news:language></news:publication><news:publication_date>${at}</news:publication_date><news:title>${esc(title)}</news:title>${keywords ? `<news:keywords>${keywords}</news:keywords>` : ""}</news:news><image:image><image:loc>https://example.com/pic.jpg</image:loc></image:image></url>`;
+    return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">${[
+      url("https://example.com/world/india/verify-newtab-sitemap-1/", SITEMAP_TITLE),
+      url("https://example.com/business/verify-newtab-sitemap-2/", SITEMAP_TITLE_2, "Markets, Oil"),
+      url("https://example.com/fr/monde/verify-newtab-sitemap-fr/", SITEMAP_TITLE_FR),
+      url("https://example.com/de/politik/verify-newtab-sitemap-de/", SITEMAP_TITLE_DE, "", "de"),
+    ].join("")}</urlset>`;
+  };
   // How often each path was asked for, by the Host the request came in under.
   const hits = new Map<string, number>();
   const hitsTo = (host: string, path = "") =>
@@ -602,6 +620,9 @@ async function main() {
       const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
       hits.set(`${host}${url.pathname}`, (hits.get(`${host}${url.pathname}`) ?? 0) + 1);
       const xml = { headers: { "content-type": "application/rss+xml" } };
+      if (url.pathname === "/news-sitemap.xml") {
+        return new Response(sitemapXml(), { headers: { "content-type": "application/xml; charset=utf-8" } });
+      }
       if (url.pathname === "/flaky.xml") {
         return flakyUp ? new Response(flakyXml(), xml) : new Response("down", { status: 503 });
       }
@@ -610,6 +631,7 @@ async function main() {
   });
   const FIXTURE_FEED = `http://${FIXTURE_HOST}:${fixtureServer.port}/feed.xml`;
   const FLAKY_FEED = `http://${FIXTURE_HOST}:${fixtureServer.port}/flaky.xml`;
+  const SITEMAP_FEED = `http://${FIXTURE_HOST}:${fixtureServer.port}/news-sitemap.xml`;
   const PRIVATE_FEED = `http://127.0.0.1:${fixtureServer.port}/private.xml`;
   const LIVE_SAVE_FEEDS = [
     { id: "guardian", name: "The Guardian", feedUrls: ["https://www.theguardian.com/world/rss"], enabled: true },
@@ -618,6 +640,7 @@ async function main() {
   ];
   const SAVE_SOURCES = LIVE_SAVE_FEEDS.map((s) => s.name);
   const FLAKY_SOURCE = { id: "verify-flaky", name: "Verify flaky", feedUrls: [FLAKY_FEED], enabled: true };
+  const SITEMAP_SOURCE = { id: "verify-sitemap", name: "Verify sitemap", feedUrls: [SITEMAP_FEED], enabled: true };
   const FIXTURE_SOURCE = { id: "verify-fixture", name: "Verify fixture", feedUrls: [FIXTURE_FEED], enabled: true };
   const PRIVATE_SOURCE = { id: "verify-private", name: "Verify private", feedUrls: [PRIVATE_FEED], enabled: true };
   const chipNames = () =>
@@ -682,7 +705,7 @@ async function main() {
     if (theme === "dark" || !latestSavedOnce) {
       const stored = await page.evaluate<any[]>(`chrome.storage.local.get("sources").then((r) => r.sources || [])`);
       check("The sources catalog was seeded and stored", stored.length > 0, `${stored.length} sources`);
-      const extra = [FIXTURE_SOURCE, FLAKY_SOURCE, ...LIVE_SAVE_FEEDS].filter((x) => !stored.some((s: any) => s.id === x.id));
+      const extra = [FIXTURE_SOURCE, FLAKY_SOURCE, SITEMAP_SOURCE, ...LIVE_SAVE_FEEDS].filter((x) => !stored.some((s: any) => s.id === x.id));
       await setStorage({ sources: [...stored, ...extra] });
       await load();
       await latestReady();
@@ -719,6 +742,31 @@ async function main() {
     await shot(`09-latest-source-chip-${theme}`);
     await click(".view-latest .chips .chip", "All");
     await sleep(150);
+
+    // A news sitemap (Reuters has no RSS) is read as a feed: its stories show up, one per entry,
+    // an entry from a /fr/ edition declared "en" is left out, a /de/ one declared "de" is kept.
+    {
+      if (!(await page.evaluate<boolean>(`!![...document.querySelectorAll(".view-latest .chips .chip")].find((c) => c.textContent.includes("Verify sitemap"))`))) {
+        await click(".view-latest .chips .chip.more");
+        await sleep(150);
+      }
+      await click(".view-latest .chips .chip", "Verify sitemap");
+      await sleep(250);
+      const titles = await page.evaluate<string[]>(
+        `[...document.querySelectorAll(".view-latest .row .row-title")].map((e) => e.textContent)`,
+      );
+      check(
+        "A news sitemap's stories appear in Latest (a mislabelled /fr/ entry does not, a real /de/ one does)",
+        titles.includes(SITEMAP_TITLE) &&
+          titles.includes(SITEMAP_TITLE_2) &&
+          titles.includes(SITEMAP_TITLE_DE) &&
+          !titles.includes(SITEMAP_TITLE_FR) &&
+          titles.length === 3,
+        titles.join(" | "),
+      );
+      await click(".view-latest .chips .chip", "All");
+      await sleep(150);
+    }
 
     await key("/");
     await page.send("Input.insertText", { text: "fixture" });

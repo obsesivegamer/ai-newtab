@@ -13,9 +13,15 @@ const TRACKING_PARAMS = new Set([
   "ito", "taid", "mbid", "rss", "ex_cid", "campaign",
 ]);
 
-/** True for the query parameters that only say where a click came from. */
-export function isTrackingParam(key: string): boolean {
+/**
+ * True for the query parameters that only say where a click came from. WSJ puts
+ * `mod=rss_worldnews` or `mod=pls_whats_news_us_business_f` on every feed link, so
+ * one story in two feeds would otherwise be two stories. `mod` is a real parameter
+ * on other sites, so it only counts as tracking with one of those values.
+ */
+export function isTrackingParam(key: string, value?: string): boolean {
   const k = key.toLowerCase();
+  if (k === "mod") return value !== undefined && /^(?:rss|pls)_/i.test(value);
   return TRACKING_PARAMS.has(k) || TRACKING_PREFIX.test(k);
 }
 
@@ -27,7 +33,7 @@ export function canonicalLink(link: string): string {
   try {
     const u = new URL(link);
     const params = [...u.searchParams.entries()]
-      .filter(([k]) => !isTrackingParam(k))
+      .filter(([k, v]) => !isTrackingParam(k, v))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     const query = params.length ? `?${params.map(([k, v]) => `${k}=${v}`).join("&")}` : "";
     const path = u.pathname.replace(/\/+$/, "");

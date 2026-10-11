@@ -145,6 +145,36 @@ of a person's gesture on a story.
   back typed: `amber-down`, `no-api` (an Amber without the save API), `busy`,
   `invalid-url`, `capture-failed`, `paywall-stub`, `timeout`.
 
+**Sources that are not plain RSS.** Two publishers need care, both in the table in
+`feed-catalog.ts`:
+
+- *WSJ.* Dow Jones moved its feeds from `feeds.a.dj.com/rss/*.xml` (frozen at 2025)
+  to `https://feeds.content.dowjones.io/public/rss/<Name>`; the default WSJ source
+  reads World, US Business, Markets and WSJ.D. Its links carry `?mod=rss_*` /
+  `?mod=pls_*`, which `link.ts` treats as tracking so one story in two feeds is one row.
+- *Reuters.* There is no public RSS. Its news sitemap
+  (`https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml`, the 50
+  newest stories) is read by `parseFeed` as a feed: `<news:title>`, `<loc>` and
+  `<news:publication_date>` (else `<lastmod>`) per `<url>`, a section from the first
+  `<news:keywords>` entry or the first path segment that is not a language code, no
+  summary. Entries under a language edition (`/fr/`, `/pt/`, `/latam/`,
+  `/fact-check/portugues/`, …) are left out when the sitemap is Reuters' (it labels every
+  edition `en`) or when the entry's `news:language` is not the edition's own; a German
+  publisher's `/de/` entries declaring `de` are read in full. Only entries with
+  `<news:news>` count towards the 500-item cap.
+
+`loadSources` (`lib/sources.ts`) hands back the stored catalog at once and migrates
+it on the way: a source whose feeds are still exactly an earlier default (WSJ's
+`feeds.a.dj.com` one) gets the current defaults on every load (free, synchronous);
+Reuters is offered once, in the background, when the archive or history says the person
+reads it and no source covers `reuters.com`. "Once" is `sourcesMigrated`, which
+`saveSources` also sets (a list the person saved is theirs), and the list and flag
+are read again after the archive answers so a save made meanwhile wins. The check is
+held off for an hour (`sourcesMigrationTriedAt`) after each try, so a down or
+mistyped archive never delays Latest or is retried on every load, and nothing is
+written while the archive is unreachable and nothing else changed. Settings →
+"Re-seed from my archive" merges the same table.
+
 Settings: saving the Sources list or the archive address never starts a build. The
 footer offers "Save & rebuild" only when the instructions or the blocked-sites list
 changed; otherwise it is just "Save".
@@ -160,9 +190,10 @@ packages/agent-core/      host-agnostic agent loop — imports no chrome.*, brow
   history-digest.ts       narrows raw history to fit a tool result
   archive-url.ts          normalizeArchiveUrl / archiveHostOf: archive address cleanup shared by the extension and harness
   link.ts                 canonicalLink / safeLink / linkKey: link normalization shared by the handlers and the feed parser
-  feeds.ts                parseFeed, fetchSourceFeeds, mergeSourceFetches, createFeedBridge, probeFeed: fetch + AbortSignal only,
-                          hardened against hostile feeds (body cap, element text caps, linear-time scanning, private-address checks)
-  feed-catalog.ts         the table of publications we know feeds for, seeding, and the pure source-list edits
+  feeds.ts                parseFeed (RSS, Atom, RDF and Google News sitemaps), fetchSourceFeeds, mergeSourceFetches, createFeedBridge,
+                          probeFeed: fetch + AbortSignal only, hardened against hostile feeds (body cap, element text caps,
+                          linear-time scanning, private-address checks)
+  feed-catalog.ts         the table of publications we know feeds for, seeding, retired-feed migration, and the pure source-list edits
   types.ts                BrowserBridge, ArchiveBridge, FeedBridge, KVStore, RunPhase, …
 
 apps/extension/           MV3 extension (WXT + React)
