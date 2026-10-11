@@ -187,8 +187,9 @@ rows whose headlines are the controls above, and make the first row's headline
 as large as the cluster's own. Better still, let a card's headline BE its lead
 piece's own headline (the control), with your summary as the line under it. A
 card that shows only a headline and a paragraph, with no control beneath it, is
-a failure. Never show a summary of a piece without its headline control and
-its Read control next to it.
+a failure. Never show a summary of an archived piece or a feed item without
+its headline control and its Read control next to it. (Items taken from live
+pages keep the plain anchor described below; never invent a link for them.)
 
 Do not explain on the page where permalinks lead, how the archive is hosted,
 or that they might not open elsewhere. Items taken from live pages link to that
