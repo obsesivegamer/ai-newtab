@@ -738,6 +738,20 @@ kbd {
 .notice .ghost-btn {
   margin-top: 24px;
 }
+.notice-address {
+  display: grid;
+  gap: 4px;
+  margin: 18px 0 0;
+  max-width: 62ch;
+}
+.notice-address-url {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
 .notice-actions {
   display: flex;
   flex-wrap: wrap;

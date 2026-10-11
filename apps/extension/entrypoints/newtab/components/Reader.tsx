@@ -24,6 +24,8 @@ type Load =
       save?: boolean;
       /** The failed attempt was "Capture with my browser". */
       via?: "browser";
+      /** The page was imported (it is in Amber) but its text could not be read back: a retry only re-reads this id. */
+      savedId?: string;
       /** An archived article whose snapshot has no readable text: the page may still be had through the browser. */
       noText?: boolean;
     };
@@ -58,6 +60,31 @@ function fetchProblem(
 ): { title: string; message: string } {
   if (via === "browser") {
     switch (reason) {
+      case "off-site":
+        return {
+          title: `The page sent your browser to ${detail || "another site"}.`,
+          message: "Sign in there first, then try again.",
+        };
+      case "closed":
+        return { title: "The page was closed.", message: "The window it was loading in was closed before it finished." };
+      case "private-address":
+        return {
+          title: "The page ended up on a private or local address.",
+          message: "Nothing was stored.",
+        };
+      case "import-timeout":
+        return {
+          title: "Amber took too long to take the page.",
+          message:
+            "It may still be working on it. Trying again may save a second copy of the page. Check Amber before you do.",
+        };
+      case "amber-error":
+        return { title: detail || "Amber answered with an error.", message: "The page was not stored. Try again in a moment." };
+      case "saved-unreadable":
+        return {
+          title: "Saved to Amber, but couldn’t read it back.",
+          message: "The page is in your archive. Try again to read it; nothing is sent to Amber again.",
+        };
       case "paywall-stub":
         return {
           title: "Your browser also got a subscription prompt.",
@@ -79,7 +106,7 @@ function fetchProblem(
           message: "This site is on your blocked-sites list, or isn’t a public web address.",
         };
       case "too-big":
-        return { title: "This page is too large to send to Amber.", message: "Amber takes pages up to 12 MB." };
+        return { title: "This page is too large to send to Amber.", message: "Amber takes pages up to about 11 MB." };
       case "no-api":
         return {
           title: "Update Amber to use this.",
@@ -149,6 +176,13 @@ function failureMessage(reason: string): string {
   return UNREACHABLE;
 }
 
+/** `text` cut in the middle to at most `max` characters, so both ends of an address stay visible. */
+function middleTruncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = Math.ceil((max - 1) * 0.6);
+  return `${text.slice(0, head)}…${text.slice(text.length - (max - 1 - head))}`;
+}
+
 function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -181,6 +215,7 @@ export function Reader({
   onSaved,
   keysActive,
   blockedSites,
+  showAddress,
 }: {
   entry: ReaderEntry;
   /** The list prev/next walks. Empty when opened from the model-built homepage. */
@@ -197,6 +232,8 @@ export function Reader({
   keysActive: boolean;
   /** The blocked-sites list: "Capture with my browser" is not offered for a story on it. */
   blockedSites: string[];
+  /** Show the full address a failure's "Capture with my browser" will open (it came from the model-built page). */
+  showAddress: boolean;
 }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
   /**
@@ -204,10 +241,17 @@ export function Reader({
    * again"): it belongs to one article and one attempt. It is dropped when that attempt ends
    * and whenever another article is shown, so walking away and back never saves anything.
    */
-  const attemptRef = useRef<{ key: string; force: boolean; save: boolean; browser?: boolean } | null>(null);
+  const attemptRef = useRef<{
+    key: string;
+    force: boolean;
+    save: boolean;
+    browser?: boolean;
+    /** Read this saved snapshot again (after a browser capture that was saved but not readable). */
+    reread?: string;
+  } | null>(null);
   /** Bumped by each click to start the attempt. */
   const [runN, setRunN] = useState(0);
-  const startAttempt = (attempt: { force: boolean; save: boolean; browser?: boolean }) => {
+  const startAttempt = (attempt: { force: boolean; save: boolean; browser?: boolean; reread?: string }) => {
     attemptRef.current = { key: entry.key, ...attempt };
     setRunN((n) => n + 1);
   };
@@ -276,6 +320,11 @@ export function Reader({
 
   useEffect(() => {
     if (attemptRef.current && attemptRef.current.key !== entry.key) attemptRef.current = null;
+    // The browser attempt is one click's: it is taken (and spent) here, before any early return,
+    // so nothing below can leave it armed for a later run of this effect.
+    const browserAttempt = attemptRef.current?.browser ? attemptRef.current : null;
+    const rereadId = attemptRef.current?.reread;
+    if (browserAttempt || rereadId) attemptRef.current = null;
     if (archiveUrl === null) return;
     if (archiveUrl.trim() === "") {
       setLoad({
@@ -293,11 +342,36 @@ export function Reader({
       return;
     }
 
-    // "Capture with my browser": only ever a click's attempt, and it is spent the moment it starts,
-    // so nothing re-runs it (a re-render, the archive address changing, walking away and back).
-    const browserAttempt = attemptRef.current;
-    if (browserAttempt?.browser && browserAttempt.key === entry.key && entry.url) {
-      attemptRef.current = null;
+    // After "Saved to Amber, couldn't read it back": a retry only reads that snapshot again.
+    if (rereadId) {
+      let cancelled = false;
+      setLoad({ status: "fetching", stage: "reading" });
+      const watcher = watch(rereadId, archiveUrl);
+      void watcher.promise.then((result) => {
+        if (cancelled) return;
+        if ("article" in result) {
+          cache.current.set(entry.archiveId ?? entry.key, result.article);
+          setLoad({ status: "ready", article: result.article });
+          const { text: _text, ...meta } = result.article;
+          onSavedRef.current(entry, meta, true);
+        } else {
+          setLoad({
+            status: "error",
+            ...fetchProblem("saved-unreadable", undefined, "browser"),
+            reason: "saved-unreadable",
+            via: "browser",
+            savedId: rereadId,
+          });
+        }
+      });
+      return () => {
+        cancelled = true;
+        watcher.release();
+      };
+    }
+
+    // "Capture with my browser": only ever a click's attempt (see the top of this effect).
+    if (browserAttempt && entry.url) {
       const controller = new AbortController();
       setLoad({ status: "fetching", stage: "browser-opening" });
       // The feed's headline is the better title; a bare host (an address with no story yet) is not.
@@ -314,11 +388,14 @@ export function Reader({
           setLoad({ status: "ready", article });
           onSavedRef.current(entry, result.meta, result.created);
         } else if (result.reason !== "aborted") {
+          // Saved but not readable: it is in Amber now, so the story is marked and a retry only re-reads.
+          if (result.reason === "saved-unreadable" && result.meta) onSavedRef.current(entry, result.meta, true);
           setLoad({
             status: "error",
             ...fetchProblem(result.reason, result.detail, "browser", hostOf(entry.url ?? "")),
             reason: result.reason,
             via: "browser",
+            savedId: result.reason === "saved-unreadable" ? result.id : undefined,
           });
         }
       });
@@ -462,7 +539,9 @@ export function Reader({
       load.reason === "capture-failed" ||
       load.noText === true ||
       // After a failed browser attempt the same button is the retry.
-      (load.via === "browser" && load.reason !== "blocked"));
+      (load.via === "browser" &&
+        // Nothing a second click can fix: the address is refused, Amber lacks the API, or the page is too large.
+        !["blocked", "no-api", "too-big", "saved-unreadable", "private-address"].includes(load.reason ?? "")));
   const elapsed = useElapsed(load.status === "fetching");
 
 
@@ -578,8 +657,23 @@ export function Reader({
             <div className="notice reader-notice" role="alert">
               <p className="notice-title">{load.title}</p>
               <p className="notice-body">{load.message}</p>
+              {showAddress && canCaptureWithBrowser && originalUrl && (
+                // The model-built page chose this address, so show it whole: it is what the button opens.
+                <p className="notice-address" title={originalUrl}>
+                  <span className="meta">Capture with my browser opens</span>
+                  <span className="notice-address-url">{middleTruncate(originalUrl, 120)}</span>
+                </p>
+              )}
               <div className="notice-actions">
-                {load.via === "browser" ? null : load.reason === "paywall-stub" ? (
+                {load.savedId ? (
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => startAttempt({ force: false, save: false, reread: load.savedId })}
+                  >
+                    Try again
+                  </button>
+                ) : load.via === "browser" ? null : load.reason === "paywall-stub" ? (
                   <button type="button" className="ghost-btn" onClick={() => startAttempt({ force: true, save: true })}>
                     Try capturing again
                   </button>

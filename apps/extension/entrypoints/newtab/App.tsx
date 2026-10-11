@@ -475,6 +475,7 @@ export default function App() {
           onSaved={readerSaved}
           keysActive={!showSettings}
           blockedSites={blockedSites}
+          showAddress={reader.origin === "today"}
         />
       )}
 

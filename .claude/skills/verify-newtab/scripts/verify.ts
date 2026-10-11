@@ -433,7 +433,7 @@ async function main() {
 
   // POSTs to Amber's import API: what "Capture with my browser" sends. Bodies are kept to check what left the browser.
   let importPosts = 0;
-  const importBodies: Array<{ url: string; html: string; title?: string; contentType: string }> = [];
+  const importBodies: Array<{ url: string; html: string; title?: string; final_url?: string; contentType: string; raw: string }> = [];
   page.on("Network.requestWillBeSent", (p) => {
     if (p.request?.method !== "POST" || !/\/api\/import/.test(p.request?.url ?? "")) return;
     importPosts++;
@@ -441,9 +441,9 @@ async function main() {
       const body = JSON.parse(p.request.postData ?? "{}");
       const headers: Record<string, string> = p.request.headers ?? {};
       const ct = Object.entries(headers).find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "";
-      importBodies.push({ url: body.url, html: String(body.html ?? ""), title: body.title, contentType: ct });
+      importBodies.push({ url: body.url, html: String(body.html ?? ""), title: body.title, final_url: body.final_url, contentType: ct, raw: p.request.postData ?? "" });
     } catch {
-      importBodies.push({ url: "", html: "", contentType: "unreadable" });
+      importBodies.push({ url: "", html: "", contentType: "unreadable", raw: "" });
     }
   });
 
@@ -454,8 +454,22 @@ async function main() {
   // While set, Amber's import is answered from here with this status: an Amber without the import
   // API (404) or one with too many imports running (429). The page was still opened and read first.
   let importStubStatus = 0;
+  // The same for the text read-back of a snapshot: Amber "saved the page but cannot show it".
+  let textStubStatus = 0;
   page.on("Fetch.requestPaused", (p) => {
     const url: string = p.request?.url ?? "";
+    if (textStubStatus && /\/api\/snapshots\/[^/?]+\/text/.test(url)) {
+      void page.send("Fetch.fulfillRequest", {
+        requestId: p.requestId,
+        responseCode: textStubStatus,
+        responseHeaders: [
+          { name: "Content-Type", value: "application/json" },
+          { name: "Access-Control-Allow-Origin", value: "*" },
+        ],
+        body: Buffer.from(JSON.stringify({ detail: "stubbed by verify-newtab" })).toString("base64"),
+      });
+      return;
+    }
     if (importStubStatus && p.request?.method === "POST" && url.includes("/api/import")) {
       void page.send("Fetch.fulfillRequest", {
         requestId: p.requestId,
@@ -620,6 +634,8 @@ async function main() {
     { path: "/members/story-1", title: "Fixture subscriber story one", blurb: "Readable only with the member cookie.", url: captureUrl("/members/story-1") },
     { path: "/members/story-2", title: "Fixture subscriber story two", blurb: "Readable only with the member cookie.", url: captureUrl("/members/story-2") },
     { path: "/members/locked", title: "Fixture subscriber story that stays locked", blurb: "Shows a subscription prompt even to a member.", url: captureUrl("/members/locked") },
+    { path: "/members/sso", title: "Fixture subscriber story behind a sign-in redirect", blurb: "Sends the browser to another site's sign-in page.", url: captureUrl("/members/sso") },
+    { path: "/members/story-3", title: "Fixture subscriber story three", blurb: "Readable with the member cookie; its text read-back is made to fail once.", url: captureUrl("/members/story-3") },
   ];
   const stubPage = (title: string) =>
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Subscribe to read | Verify Times</title><meta property="og:site_name" content="Verify Times"></head><body><header><a href="/">Verify Times</a></header><main><h1>Subscribe to unlock this article</h1><p>${esc(title)} is for Verify Times subscribers. Already a subscriber? Sign in to keep reading. Get unlimited access to every story for one low price, cancel anytime.</p><button>Subscribe</button></main></body></html>`;
@@ -629,10 +645,11 @@ async function main() {
         ? `${MEMBER_SENTENCE} The harbour authority confirmed on Tuesday that the new ferry timetable would take effect from the first of the month, after three years of consultation with island residents, freight operators and the council.`
         : `Paragraph ${i + 1} of the fixture article explains how the timetable was drawn up, who was consulted, what the operators asked for, and why the committee settled on fewer but longer crossings that connect with the mainland rail service.`,
     );
-    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(title)} - Verify Times</title><meta property="og:title" content="${esc(title)}"><meta property="og:site_name" content="Verify Times"><meta name="author" content="Ada Fixture"><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":${JSON.stringify(title)},"author":{"@type":"Person","name":"Ada Fixture"}}</script></head><body><nav><a href="/">Verify Times</a></nav><article><h1>${esc(title)}</h1><p class="byline">By Ada Fixture</p>${paragraphs.map((p) => `<p>${p}</p>`).join("")}</article><script>window.__verifyArticle = true;</script></body></html>`;
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(title)} - Verify Times</title><meta property="og:title" content="${esc(title)}"><meta property="og:site_name" content="Verify Times"><meta name="author" content="Ada Fixture"><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":${JSON.stringify(title)},"author":{"@type":"Person","name":"Ada Fixture"}}</script></head><body><nav><a href="/">Verify Times</a></nav><article><h1>${esc(title)}</h1><p class="byline">By Ada Fixture</p>${paragraphs.map((p) => `<p>${p}</p>`).join("")}</article><script>window.__verifyArticle = true; document.querySelector("article").appendChild(Object.assign(document.createElement("p"), { textContent: "A lone surrogate \\uD800 sits in this paragraph, as emoji cut in half by a site's script do." }));</script></body></html>`;
   };
   /** How often each fixture story was requested by this browser (by the example.org host), with and without the cookie. */
   const memberHits = new Map<string, { withCookie: number; without: number }>();
+  const loginPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in | Verify SSO</title></head><body><main><h1>Sign in to continue</h1><p>Enter your email and password to sign in to Verify SSO. This sign-in page belongs to a different site than the story that sent you here.</p></main></body></html>`;
   const fixtureXml = () => {
     const at = new Date().toUTCString();
     const items = [
@@ -685,6 +702,18 @@ async function main() {
       const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
       hits.set(`${host}${url.pathname}`, (hits.get(`${host}${url.pathname}`) ?? 0) + 1);
       const xml = { headers: { "content-type": "application/rss+xml" } };
+      if (url.pathname === "/sso/login") {
+        return new Response(loginPage, { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (url.pathname === "/members/sso") {
+        if (host === CAPTURE_HOST) {
+          const h = memberHits.get(url.pathname) ?? { withCookie: 0, without: 0 };
+          h.withCookie++;
+          memberHits.set(url.pathname, h);
+        }
+        // A sign-in redirect to another site (a different registrable domain), as an SSO host would be.
+        return new Response(null, { status: 302, headers: { location: `http://${FIXTURE_HOST}:${fixtureServer!.port}/sso/login` } });
+      }
       if (url.pathname.startsWith("/members/")) {
         const story = CAPTURE_STORIES.find((c) => c.path === url.pathname);
         const member = /(?:^|;\s*)member=1(?:;|$)/.test(req.headers.get("cookie") ?? "");
@@ -744,7 +773,7 @@ async function main() {
   let seededStubs = 0;
   if (hasImportApi) {
     for (const c of CAPTURE_STORIES) {
-      const stub = await (await fetch(`http://127.0.0.1:${fixtureServer.port}${c.path}`)).text();
+      const stub = stubPage(c.title);
       const r = await fetch(`${AMBER}/api/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1352,6 +1381,30 @@ async function main() {
       phase = `${theme}:browser-capture`;
       const story = CAPTURE_STORIES[theme === "dark" ? 0 : 1];
       const locked = CAPTURE_STORIES[2];
+      const sso = CAPTURE_STORIES[3];
+      const unreadable = CAPTURE_STORIES[4];
+      /** Tabs this browser has open on the capture host: the background capture's page. */
+      const captureTabs = () =>
+        page.evaluate<Array<{ id: number; muted: boolean }>>(
+          `chrome.tabs.query({}).then((ts) => ts.filter((t) => (t.url || t.pendingUrl || "").startsWith("http://${CAPTURE_HOST}")).map((t) => ({ id: t.id, muted: t.mutedInfo?.muted === true })))`,
+        );
+      /** Wait (up to ~6 s) for the capture's tab to exist and be muted; returns what it saw. */
+      const awaitCaptureTab = async () => {
+        let seen: Array<{ id: number; muted: boolean }> = [];
+        for (let i = 0; i < 40; i++) {
+          seen = await captureTabs();
+          if (seen.length > 0 && seen.every((t) => t.muted)) break;
+          await sleep(150);
+        }
+        return seen;
+      };
+      /** Close the Reader if it is open, open the row for `title` and wait for its stub notice. */
+      const openStub = async (title: string) => {
+        if (await page.evaluate<boolean>(`!!document.querySelector(".reader")`)) await closeReader();
+        const id = await rowOf(title);
+        if (!id || !(await click(`#${id}`))) return false;
+        return waitFor(`document.querySelector(".reader-notice")`, "the stub notice", 15_000);
+      };
       const captureBtn = `[...document.querySelectorAll(".reader .ghost-btn")].some((b) => b.textContent.trim() === "Capture with my browser")`;
       const actions = () =>
         page.evaluate<string[]>(`[...document.querySelectorAll(".reader-notice .notice-actions .ghost-btn")].map((b) => b.textContent.trim())`);
@@ -1434,6 +1487,12 @@ async function main() {
           stage.replace(/\s+/g, " ").trim(),
         );
         await shot(`19-capture-fetching-${theme}`);
+        const duringTabs = await awaitCaptureTab();
+        check(
+          "The capture's background tab is muted",
+          duringTabs.length > 0 && duringTabs.every((t) => t.muted),
+          `${duringTabs.length} tab(s) on ${CAPTURE_HOST}, muted: ${duringTabs.map((t) => t.muted).join(",")}`,
+        );
         const done = await waitFor(
           `document.querySelectorAll(".reader-body p").length > 3 || document.querySelector(".reader-notice")`,
           "the article or a failure after the browser capture",
@@ -1461,6 +1520,19 @@ async function main() {
             sent.html.includes(MEMBER_SENTENCE) &&
             /application\/json/i.test(sent.contentType),
           sent ? `${sent.html.length} chars, ${sent.contentType}, title "${(sent.title ?? "").slice(0, 40)}"` : "no body",
+        );
+        check(
+          "The import carries the page's final address as final_url",
+          !!sent && sent.final_url === story.url(),
+          sent?.final_url ?? "missing",
+        );
+        // The fixture's own script puts a lone UTF-16 surrogate into the page; Amber rejects those as
+        // invalid Unicode, so the extension must have replaced it before sending (and the import worked).
+        const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+        check(
+          "A page with a lone surrogate imports: it is sent as U+FFFD",
+          !!sent && sent.html.includes("\uFFFD") && !lone.test(sent.html) && !/(?<!\\)\\ud[89ab][0-9a-f]{2}/i.test(sent.raw) && outcome.paragraphs > 3,
+          sent ? `U+FFFD ${sent.html.includes("\uFFFD") ? "present" : "absent"}, lone surrogates ${lone.test(sent.html) ? "present" : "none"}` : "no body",
         );
         const hit = memberHits.get(story.path);
         check(
@@ -1497,10 +1569,38 @@ async function main() {
         }
       }
 
+      // A sign-in redirect to another site: the page is not the story, so nothing is read or sent.
+      if (await openStub(sso.title)) {
+        const before = importPosts;
+        await click(".reader-notice .ghost-btn", "Capture with my browser");
+        const refused = await waitFor(
+          `/sent your browser to/.test(document.querySelector(".reader-notice .notice-title")?.textContent || "") && !document.querySelector(".reader-fetch")`,
+          "the off-site refusal",
+          60_000,
+        );
+        const t = await page.evaluate<any>(`({
+          title: document.querySelector(".reader-notice .notice-title")?.textContent || "",
+          body: document.querySelector(".reader-notice .notice-body")?.textContent || "",
+        })`);
+        const acts3 = await actions();
+        check(
+          "A redirect to another site is refused: names the host, says to sign in there, offers Open original, imports nothing",
+          refused &&
+            t.title.includes(FIXTURE_HOST) &&
+            /Sign in there first, then try again/.test(t.body) &&
+            acts3.includes("Open original") &&
+            importPosts === before,
+          `"${t.title}" / "${t.body}" [${acts3.join(", ")}], ${importPosts - before} import request(s)`,
+        );
+        check("The window is closed after an off-site refusal", (await windowCount()) === windows0, `${await windowCount()} windows`);
+        await shot(`23-capture-off-site-${theme}`);
+      } else {
+        check("The sign-in redirect story shows its stub notice", false, "row not found");
+      }
+
       // Closing the Reader mid-capture ends it: the window goes, nothing is sent.
       const lockedRow = await rowOf(locked.title);
-      if (lockedRow && (await click(`#${lockedRow}`))) {
-        await waitFor(`document.querySelector(".reader-notice")`, "the locked story's stub notice", 15_000);
+      if (lockedRow && (await openStub(locked.title))) {
         const before = importPosts;
         await click(".reader-notice .ghost-btn", "Capture with my browser");
         await waitFor(`/Capturing with your browser/.test(document.querySelector(".reader-fetch-title")?.textContent || "")`, "fetching", 10_000);
@@ -1513,9 +1613,28 @@ async function main() {
           `${importPosts - before} import request(s), ${await windowCount()} window(s)`,
         );
 
+        // The person closes the capture's own tab: it ends at once ("The page was closed"), not after a timeout.
+        if (theme === "dark") {
+          await openStub(locked.title);
+          await click(".reader-notice .ghost-btn", "Capture with my browser");
+          await waitFor(`document.querySelector(".reader-fetch")`, "fetching", 10_000);
+          const open = await awaitCaptureTab();
+          const t0 = Date.now();
+          for (const tab of open) await page.evaluate(`chrome.tabs.remove(${tab.id})`);
+          const closedShown = await waitFor(
+            `/The page was closed/.test(document.querySelector(".reader-notice .notice-title")?.textContent || "")`,
+            "the page-was-closed notice",
+            10_000,
+          );
+          check(
+            "Closing the capture's tab ends it at once with 'The page was closed' and sends nothing",
+            open.length > 0 && closedShown && Date.now() - t0 < 8_000 && importPosts === before && (await windowCount()) === windows0,
+            `${open.length} tab(s) closed, notice after ${Date.now() - t0} ms, ${importPosts - before} import request(s)`,
+          );
+        }
+
         // A story the browser cannot read either: still a subscription prompt, with a way to check the sign-in.
-        await click(`#${lockedRow}`);
-        await waitFor(`document.querySelector(".reader-notice")`, "the locked story's stub notice again", 15_000);
+        await openStub(locked.title);
         const imp1 = importPosts;
         await click(".reader-notice .ghost-btn", "Capture with my browser");
         await waitFor(`document.querySelector(".reader-fetch")`, "fetching", 10_000);
@@ -1538,13 +1657,16 @@ async function main() {
         check("The window is closed after a failed attempt", (await windowCount()) === windows0, `${await windowCount()} windows`);
         await shot(`21-capture-still-paywalled-${theme}`);
 
-        // Amber failures after a good page read: an Amber without the import API, then a busy one.
+        // Amber failures after a good page read (the import answer is stubbed; the page was still opened).
         if (theme === "dark") {
           await page.send("Fetch.enable", { patterns: [{ urlPattern: `${AMBER}/api/import*` }] });
-          for (const [status, title, label] of [
-            [404, /Update Amber/, "an Amber without the import API says to update it"],
-            [429, /Amber is busy/, "a busy Amber says so"],
+          for (const [status, title, label, retryShown] of [
+            [404, /Update Amber/, "an Amber without the import API says to update it, with no retry", false],
+            [413, /too large/, "a page that is too large says so, with no retry", false],
+            [429, /Amber is busy/, "a busy Amber says so, and the button is the retry", true],
+            [500, /Amber answered 500/, "an unexpected Amber status is named, not 'Amber isn't running'", true],
           ] as const) {
+            await openStub(locked.title);
             importStubStatus = status;
             await click(".reader-notice .ghost-btn", "Capture with my browser");
             const shown = await waitFor(
@@ -1553,7 +1675,9 @@ async function main() {
               60_000,
             );
             const t = await text(".reader-notice .notice-title");
-            check(`After Capture with my browser, ${label}`, shown, t);
+            const acts4 = await actions();
+            const hasRetry = acts4.includes("Capture with my browser");
+            check(`After Capture with my browser, ${label}`, shown && hasRetry === retryShown, `${t} [${acts4.join(", ")}]`);
             if (status === 404) await shot(`22-capture-amber-needs-update-${theme}`);
           }
           importStubStatus = 0;
@@ -1562,6 +1686,43 @@ async function main() {
         await closeReader();
       } else {
         check("The locked story is in Latest", false, "row not found");
+      }
+
+      // Saved to Amber but the text read-back fails: the story is marked, and a retry only re-reads.
+      if (theme === "dark") {
+        await page.send("Fetch.enable", { patterns: [{ urlPattern: `${AMBER}/api/snapshots/*/text*` }] });
+        const rowU = await rowOf(unreadable.title);
+        if (rowU && (await openStub(unreadable.title))) {
+          const before = importPosts;
+          textStubStatus = 503;
+          await click(".reader-notice .ghost-btn", "Capture with my browser");
+          const shown = await waitFor(
+            `/read it back/.test(document.querySelector(".reader-notice .notice-title")?.textContent || "") && !document.querySelector(".reader-fetch")`,
+            "the saved-but-unreadable notice",
+            60_000,
+          );
+          const acts5 = await actions();
+          const marked2 = await page.evaluate<boolean>(`!!document.getElementById(${JSON.stringify(rowU)})?.querySelector(".row-amber")`);
+          check(
+            "Saved but unreadable: says so, marks the story In Amber, offers only Try again and Open original",
+            shown && marked2 && acts5.join("|") === "Try again|Open original" && importPosts === before + 1,
+            `[${acts5.join(", ")}], marker ${marked2}, ${importPosts - before} import request(s)`,
+          );
+          await shot(`24-capture-saved-unreadable-${theme}`);
+          textStubStatus = 0;
+          await click(".reader-notice .ghost-btn", "Try again");
+          const read = await waitFor(`document.querySelectorAll(".reader-body p").length > 3`, "the re-read text", 20_000);
+          check(
+            "Try again after saved-but-unreadable only re-reads: the text shows and nothing is imported again",
+            read && importPosts === before + 1,
+            `${importPosts - before} import request(s) in total`,
+          );
+          await closeReader();
+        } else {
+          check("The unreadable-fixture story shows its stub notice", false, "row not found");
+        }
+        textStubStatus = 0;
+        await page.send("Fetch.disable");
       }
       await click(".view-latest .chips .chip", "All");
       await sleep(150);
@@ -1983,6 +2144,52 @@ export default function App() {
           check("homepage:open-article from the visible Today frame opens the archived story", read);
         }
       }
+
+      // An address the model-built page asked to open is shown whole above "Capture with my browser",
+      // so the person can see what the button will open.
+      if (hasImportApi && seededStubs === CAPTURE_STORIES.length) {
+        phase = "open-url-address";
+        const lockedUrl = CAPTURE_STORIES[2].url();
+        const addressCode = `import React from "react";
+export default function App() {
+  return <button style={{ position: "fixed", inset: 0, width: "100%", fontSize: 28 }} onClick={() => {
+    window.parent.postMessage({ type: "homepage:open-url", url: ${JSON.stringify(lockedUrl)} }, "*");
+  }}>open</button>;
+}`;
+        await setStorage({ homepageData: { code: addressCode, timestamp: new Date().toISOString() } });
+        await load();
+        await click(".tab", "Today");
+        const addrFrame = await waitFor(`document.querySelector(".today-frame iframe")`, "Today iframe", 20_000);
+        if (addrFrame) {
+          await sleep(8000);
+          const at = await page.evaluate<{ x: number; y: number } | null>(`(() => {
+            const r = document.querySelector(".today-frame iframe")?.getBoundingClientRect();
+            return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+          })()`);
+          if (at) {
+            for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+              await page.send("Input.dispatchMouseEvent", {
+                type,
+                x: at.x,
+                y: at.y,
+                button: type === "mouseMoved" ? "none" : "left",
+                clickCount: type === "mouseMoved" ? 0 : 1,
+              });
+            }
+          }
+          const noticeUp = await waitFor(`document.querySelector(".reader-notice")`, "the stub notice for the Today address", 15_000);
+          const addr = await text(".notice-address-url");
+          const btns = await page.evaluate<string[]>(`[...document.querySelectorAll(".reader-notice .ghost-btn")].map((b) => b.textContent.trim())`);
+          check(
+            "A story opened from the Today page shows its full address above Capture with my browser",
+            noticeUp && addr === lockedUrl && btns.includes("Capture with my browser"),
+            `"${addr.slice(0, 80)}" [${btns.join(", ")}]`,
+          );
+          await shot("25-today-open-url-address");
+          await key("Escape");
+          await waitFor(`!document.querySelector(".reader")`, "reader to close");
+        }
+      }
     }
     await page.evaluate(`chrome.storage.local.remove(["apiKey", "homepageData", "autoRebuild"])`);
   }
@@ -1993,7 +2200,7 @@ export default function App() {
   const expected = (e: { phase: string; text: string }) =>
     (/status of 503/.test(e.text) && /latest/.test(e.phase)) || // the fixture "flaky" feed, on purpose
     (/status of 400/.test(e.text) && /save-invariant/.test(e.phase)) || // Amber refusing the uncapturable address
-    (/status of (404|429)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
+    (/status of (404|413|429|500|503)/.test(e.text) && /browser-capture/.test(e.phase)) || // the stubbed import answers, on purpose
     (noise.test(e.text) && (e.phase.endsWith("amber-down") || e.phase.endsWith("latest-probe") || noApi));
   const unexpected = consoleErrors.filter((e) => !expected(e));
   check(

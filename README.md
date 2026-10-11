@@ -52,16 +52,20 @@ readable, paywall-free copy of each article on your Mac.
 - **Capture with my browser.** Some publishers (WSJ, FT, NYT) show Amber's own
   capture only a subscription prompt, so the reader says "No article text came
   back". Press **Capture with my browser** and the extension opens that page in a
-  background window of your own, signed-in Chrome, then hands the page's HTML to
-  Amber (`POST /api/import`), which makes it the newest copy of that story. This
+  muted background window of your own, signed-in Chrome, then hands the page's HTML
+  to Amber (`POST /api/import`), which makes it the newest copy of that story. This
   needs an Amber with the import API; an older one says "Update Amber to use
   this". If your browser got a subscription prompt too, it says so and asks
-  whether you are signed in. The page leaves your browser only to your own Amber
-  (no Anthropic involvement, unless you later build Today and the model reads that
-  article), only when you press the button, and never for a site on your
-  blocked-sites list or a private address. The HTML may contain your account
-  details (name, email, subscriber ids); it is stored in your local archive, so
-  treat the archive as private.
+  whether you are signed in; if the page sends your browser to another site (a
+  sign-in host), it stops there and tells you which. The page goes only to the
+  Amber address you configured (any http(s) address you set; plain http if it is
+  not local, so keep it on your own machine) and never to Anthropic, unless you
+  later build Today and the model reads that article. It only happens when you
+  press the button, and never for a site on your blocked-sites list or a private
+  address. The saved HTML may contain your account details (name, email,
+  subscriber ids, hidden form fields); it is stored in your local archive, so treat
+  the archive as private. If the extension is reloaded mid-capture, the background
+  window can be left open; just close it.
 - **Amber has to be running.** The extension talks to Amber's local JSON API at
   `http://127.0.0.1:8080` (change it in **Settings → Article archive (Amber)**;
   leave it empty to turn the archive off). If Amber is stopped, the Library says
@@ -88,7 +92,8 @@ readable articles it can see.
 > [ARCHITECTURE.md](./ARCHITECTURE.md#privacy).
 >
 > **Capture with my browser** (a button you press yourself) sends a page you are
-> signed in to from your browser to your local Amber and nowhere else.
+> signed in to from your browser to the Amber address you configured and nowhere
+> else.
 
 ---
 

@@ -1,9 +1,16 @@
-import { DEFAULT_BLOCKED_SITES, isAllowedUrl } from "@homepage/agent-core";
+import {
+  DEFAULT_BLOCKED_SITES,
+  hostOf,
+  isAllowedUrl,
+  normalizeArchiveUrl,
+  type ArchiveArticleMeta,
+} from "@homepage/agent-core";
 import {
   ArticleFetchError,
   MAX_IMPORT_BYTES,
   MAX_URL_LENGTH,
   importPage,
+  lookupArticle,
   readArticle,
   type FetchFailure,
   type FetchStage,
@@ -19,15 +26,23 @@ import { KEYS, extensionStore } from "./storage";
  *
  * Only ever started by a click in the Reader. The page leaves the browser only
  * for Amber's `POST /api/import` on the configured archive address.
+ *
+ * Known residual: if the extension is reloaded or the browser quits mid-capture,
+ * the background window it opened is not closed (nothing of ours is running to
+ * close it). It holds one article page and can simply be closed.
  */
 
 const LOAD_TIMEOUT_MS = 30_000;
 /** After load, let a single-page app render before the page is scrolled and read. */
 const SETTLE_MS = 2_000;
-/** The scroll-and-read script has this long, once the page has loaded. */
-const EXTRACT_TIMEOUT_MS = 45_000;
-const EXTRACT_ATTEMPTS = 3;
-const EXTRACT_RETRY_MS = 1_000;
+/**
+ * The scroll-and-read script has this long, once the page has loaded. The content script
+ * stops scrolling after about 8 s in raw mode, so this is slack for a busy page.
+ */
+const EXTRACT_TIMEOUT_MS = 20_000;
+/** Injection attempts (not read attempts: a script that timed out is never run again). */
+const INJECT_ATTEMPTS = 3;
+const INJECT_RETRY_MS = 1_000;
 
 /** What `entrypoints/scraper.content.ts` hands back when it was asked for the raw document. */
 interface RawDocument {
@@ -37,7 +52,10 @@ interface RawDocument {
   tooBig?: boolean;
 }
 
-export type BrowserCaptureStage = "opening" | "reading";
+type CaptureFailure = Extract<
+  FetchFailure,
+  "blocked" | "off-site" | "timeout" | "no-content" | "too-big" | "closed" | "aborted"
+>;
 
 export type BrowserCaptureResult =
   | {
@@ -45,14 +63,14 @@ export type BrowserCaptureResult =
       /** The page's untouched `document.documentElement.outerHTML`, at most 12 MB. */
       html: string;
       title: string;
-      /** Where the page ended up after redirects. */
+      /** Where the page ended up after redirects (same site as the one asked for, and allowed). */
       finalUrl: string;
     }
-  | { ok: false; reason: Extract<FetchFailure, "blocked" | "timeout" | "no-content" | "too-big" | "aborted">; detail?: string };
+  | { ok: false; reason: CaptureFailure; detail?: string };
 
 class Stop extends Error {
   constructor(
-    readonly reason: Extract<FetchFailure, "blocked" | "timeout" | "no-content" | "too-big" | "aborted">,
+    readonly reason: CaptureFailure,
     readonly detail?: string,
   ) {
     super(reason);
@@ -84,10 +102,39 @@ const pause = (ms: number, signal?: AbortSignal) =>
 
 const isWeb = (url: string | undefined) => /^https?:/i.test(url ?? "");
 
+/** Public suffixes with two labels that are common enough for news sites; the rest count as one label. */
+const TWO_LEVEL_SUFFIXES = new Set([
+  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+  "co.nz", "org.nz", "govt.nz", "co.za", "org.za",
+  "com.br", "com.cn", "com.hk", "com.sg", "com.tw", "com.mx", "com.ar", "com.tr",
+  "co.in", "co.kr", "co.il", "co.id",
+]);
+
+/** The site part of a host: its last two labels, or three under a known two-level public suffix. */
+function registrableDomain(host: string): string {
+  if (!host || host.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return host;
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  return TWO_LEVEL_SUFFIXES.has(lastTwo) ? labels.slice(-3).join(".") : lastTwo;
+}
+
+/**
+ * Conservative same-site test between two addresses: equal hosts, or hosts that share a
+ * registrable domain (`www.ft.com` and `on.ft.com`). A shortener or an SSO host is a
+ * different site, on purpose: what a different site shows is not the story asked for.
+ */
+export function sameSite(a: string, b: string): boolean {
+  const [x, y] = [registrableDomain(hostOf(a)), registrableDomain(hostOf(b))];
+  return x !== "" && x === y;
+}
+
 /** True once the tab has finished loading a web page. Also true when it finished before we looked. */
-async function pageLoaded(tabId: number, signal?: AbortSignal): Promise<boolean> {
+async function pageLoaded(tabId: number, signal: AbortSignal): Promise<boolean> {
   const stop = new AbortController();
-  const wait = waitForTabLoad(tabId, LOAD_TIMEOUT_MS, signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
+  const wait = waitForTabLoad(tabId, LOAD_TIMEOUT_MS, AbortSignal.any([signal, stop.signal]));
   try {
     // The listener above is already registered, so a load that ends from here on is not missed;
     // this look covers one that ended before it was.
@@ -100,25 +147,35 @@ async function pageLoaded(tabId: number, signal?: AbortSignal): Promise<boolean>
   }
 }
 
+/** `document.readyState` of the tab's page, or null when it cannot be read. */
+async function readyStateOf(tabId: number): Promise<string | null> {
+  try {
+    const [res] = await browser.scripting.executeScript({ target: { tabId }, func: () => document.readyState });
+    return typeof res?.result === "string" ? res.result : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Open `url` in a background window of the person's own browser (their cookies and
  * subscriptions apply), let it settle, scroll it the way the scraper does to wake
  * lazy content, and return the document's raw HTML for Amber's extractor. Never
  * throws: failures come back typed. The window is closed on every path, also when
- * `signal` aborts or the new-tab page is closed.
+ * `signal` aborts or the new-tab page is closed, and the capture ends at once if
+ * the person closes that window or tab.
  *
  * Refuses (without opening anything) a link that is not http(s), is on a
  * loopback, private or local-network host, or is on the person's blocked-sites
- * list; the page's final address after redirects is checked again before its HTML
- * is returned. Neither URLs nor HTML are logged.
+ * list. The page's address after redirects must pass the same checks and be the
+ * same site as the one asked for, before the page is scrolled or read and again
+ * before its HTML is returned. Neither URLs nor HTML are logged.
  */
 export async function captureWithBrowser(
   url: string,
   opts: {
     signal?: AbortSignal;
-    onStatus?: (stage: BrowserCaptureStage) => void;
-    /** Overrides the stored blocked-sites list (the default is read fresh from storage). */
-    blockedSites?: string[];
+    onStatus?: (stage: "opening") => void;
   } = {},
 ): Promise<BrowserCaptureResult> {
   const { signal } = opts;
@@ -133,11 +190,23 @@ export async function captureWithBrowser(
   signal?.addEventListener("abort", closeNow, { once: true });
   if (typeof window !== "undefined") window.addEventListener("pagehide", closeNow);
 
+  // The person closing the window or tab ends the capture at once rather than after a timeout.
+  const inner = new AbortController();
+  const sig = signal ? AbortSignal.any([signal, inner.signal]) : inner.signal;
+  let watchedTab: number | undefined;
+  let tabGone = false;
+  const onTabRemoved = (id: number) => {
+    if (id === watchedTab) {
+      tabGone = true;
+      inner.abort();
+    }
+  };
+  browser.tabs.onRemoved.addListener(onTabRemoved);
+
   try {
     if (signal?.aborted) throw new Stop("aborted");
     if (url.length > MAX_URL_LENGTH) throw new Stop("blocked", "The link is too long.");
-    const blockedSites =
-      opts.blockedSites ?? (await extensionStore.get<string[]>(KEYS.blockedSites)) ?? DEFAULT_BLOCKED_SITES;
+    const blockedSites = (await extensionStore.get<string[]>(KEYS.blockedSites)) ?? DEFAULT_BLOCKED_SITES;
     let parsed: URL;
     try {
       parsed = new URL(url);
@@ -147,57 +216,79 @@ export async function captureWithBrowser(
     if (parsed.username || parsed.password || !isAllowedUrl(parsed.href, blockedSites)) {
       throw new Stop("blocked");
     }
+    /** The page's current address must be allowed and on the same site; otherwise nothing of it is read. */
+    const checkLanded = (landedUrl: string | undefined) => {
+      if (!landedUrl || !isWeb(landedUrl)) throw new Stop("no-content", "The page did not load.");
+      if (!isAllowedUrl(landedUrl, blockedSites)) {
+        throw new Stop("blocked", "The page redirected to a blocked site or a private address.");
+      }
+      if (!sameSite(parsed.href, landedUrl)) throw new Stop("off-site", hostOf(landedUrl));
+    };
 
     opts.onStatus?.("opening");
-    // Not wrapped in `abortable`: an id that is dropped would be a window nobody closes.
+    // Not wrapped in `abortable`: if the Reader went away while the window was being made, the id
+    // must still be recorded so the `finally` below closes it.
     windowId = await createScraperWindow(parsed.href);
-    if (signal?.aborted) throw new Stop("aborted");
-    const tabs = await abortable(browser.tabs.query({ windowId }), signal);
+    if (sig.aborted) throw new Stop("aborted");
+    const tabs = await abortable(browser.tabs.query({ windowId }), sig);
     const tabId = tabs[0]?.id;
     if (tabId === undefined) throw new Stop("no-content", "The browser window had no tab.");
+    watchedTab = tabId;
+    // A page in a background window must not make noise.
+    await browser.tabs.update(tabId, { muted: true }).catch(() => undefined);
 
-    if (!(await abortable(pageLoaded(tabId, signal), signal))) {
-      if (signal?.aborted) throw new Stop("aborted");
-      throw new Stop("timeout");
+    if (!(await abortable(pageLoaded(tabId, sig), sig))) {
+      if (sig.aborted) throw new Stop("aborted");
+      // Slow trackers can keep a page "loading" for minutes after the article is there.
+      const slow = await browser.tabs.get(tabId).catch(() => null);
+      const state = slow && isWeb(slow.url) ? await readyStateOf(tabId) : null;
+      if (state !== "interactive" && state !== "complete") throw new Stop("timeout");
     }
     const landed = await browser.tabs.get(tabId).catch(() => null);
-    if (!landed || !isWeb(landed.url)) throw new Stop("no-content", "The page did not load.");
+    if (!landed) throw new Stop("closed");
+    checkLanded(landed.url);
 
-    await pause(SETTLE_MS, signal);
-    opts.onStatus?.("reading");
+    await pause(SETTLE_MS, sig);
 
     let raw: RawDocument | null = null;
-    for (let attempt = 0; attempt < EXTRACT_ATTEMPTS && !raw; attempt++) {
-      if (attempt > 0) await pause(EXTRACT_RETRY_MS, signal);
+    for (let attempt = 0; attempt < INJECT_ATTEMPTS && !raw; attempt++) {
+      if (attempt > 0) await pause(INJECT_RETRY_MS, sig);
       try {
-        raw = await abortable(readRawDocument(tabId), signal);
+        raw = await abortable(readRawDocument(tabId), sig);
       } catch (err) {
+        // A script that was started and ran out of time may still be scrolling: never start another.
         if (err instanceof Stop) throw err;
-        // The page may still be navigating; try again.
+        // Otherwise the injection itself failed (the page may still be navigating); try again.
       }
     }
     if (!raw) throw new Stop("no-content", "The page could not be read.");
     if (raw.tooBig) throw new Stop("too-big");
     if (!raw.html.trim()) throw new Stop("no-content", "The page was empty.");
-    // A redirect can end on a blocked host: the browser loaded it, but nothing it read goes anywhere.
-    if (!isAllowedUrl(raw.url, blockedSites)) throw new Stop("blocked", "The page redirected to a blocked site.");
+    // The page can redirect itself after it loaded: what it read goes nowhere unless it is still fine.
+    checkLanded(raw.url);
     // The character count is a cheap lower bound on bytes; only a page near the limit is measured exactly.
     if (raw.html.length * 3 > MAX_IMPORT_BYTES && new TextEncoder().encode(raw.html).length > MAX_IMPORT_BYTES) {
       throw new Stop("too-big");
     }
     return { ok: true, html: raw.html, title: raw.title, finalUrl: raw.url };
   } catch (err) {
-    if (err instanceof Stop) return { ok: false, reason: err.reason, detail: err.detail };
     if (signal?.aborted) return { ok: false, reason: "aborted" };
+    if (tabGone) return { ok: false, reason: "closed" };
+    if (err instanceof Stop) return { ok: false, reason: err.reason, detail: err.detail };
     return { ok: false, reason: "no-content", detail: err instanceof Error ? err.message.slice(0, 200) : undefined };
   } finally {
+    browser.tabs.onRemoved.removeListener(onTabRemoved);
     signal?.removeEventListener("abort", closeNow);
     if (typeof window !== "undefined") window.removeEventListener("pagehide", closeNow);
     await closeWindow();
   }
 }
 
-/** Ask the scraper content script, in raw-document mode, for the page. Scrolls first, so it takes a few seconds. */
+/**
+ * Ask the scraper content script, in raw-document mode, for the page. It scrolls first
+ * (for at most about 8 s), so this takes a few seconds. Running out of time is a `Stop`;
+ * any other error is an injection failure.
+ */
 async function readRawDocument(tabId: number): Promise<RawDocument | null> {
   const read = (async () => {
     // The flag and the script share the extension's isolated world in the tab, so it survives between the two calls.
@@ -215,7 +306,7 @@ async function readRawDocument(tabId: number): Promise<RawDocument | null> {
   })();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("reading the page took too long")), EXTRACT_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new Stop("no-content", "The page took too long to read.")), EXTRACT_TIMEOUT_MS);
   });
   try {
     return await Promise.race([read, timedOut]);
@@ -225,10 +316,12 @@ async function readRawDocument(tabId: number): Promise<RawDocument | null> {
 }
 
 /**
- * The whole job for the Reader: open the page in the browser, send what it
- * returned to Amber, read the article text back. Never throws; failures come
- * back typed like `fetchFullArticle`'s. `title` is the headline the person
- * already sees (the feed's); without it Amber derives its own.
+ * The whole job for the Reader: check Amber is there, open the page in the browser,
+ * send what it returned to Amber, read the article text back. Never throws; failures
+ * come back typed like `fetchFullArticle`'s. `title` is the headline the person
+ * already sees (the feed's); without it Amber derives its own. A page that was
+ * imported but could not be read back comes back as `saved-unreadable` with its
+ * `id` and `meta`, so the caller can mark it saved and only re-read on a retry.
  */
 export async function importFromBrowser(
   base: string,
@@ -240,19 +333,48 @@ export async function importFromBrowser(
     if (!signal?.aborted) onStatus?.(s);
   };
   try {
+    // A cheap, read-only look before a window opens: no point loading a page if Amber is not there.
+    await lookupArticle(base, args.url, signal);
+
     stage("browser-opening");
-    const page = await captureWithBrowser(args.url, { signal, onStatus: () => stage("browser-opening") });
+    const page = await captureWithBrowser(args.url, { signal });
     if (!page.ok) return { ok: false, reason: page.reason, detail: page.detail };
     if (signal?.aborted) return { ok: false, reason: "aborted" };
 
     stage("browser-sending");
-    const imported = await importPage(base, { url: args.url, html: page.html, title: args.title }, signal);
+    const imported = await importPage(
+      base,
+      { url: args.url, html: page.html, title: args.title, finalUrl: page.finalUrl },
+      signal,
+    );
     // Amber has saved the page but found no article in it: the publisher showed this browser a prompt too.
     if (!imported.usable) return { ok: false, reason: "paywall-stub", id: imported.id };
 
     stage("reading");
-    const { text, ...meta } = await readArticle(base, imported.id, signal);
-    return { ok: true, id: imported.id, text, meta, created: true };
+    try {
+      const { text, ...meta } = await readArticle(base, imported.id, signal);
+      return { ok: true, id: imported.id, text, meta, created: true };
+    } catch (err) {
+      if (signal?.aborted) return { ok: false, reason: "aborted" };
+      const host = hostOf(args.url);
+      const root = normalizeArchiveUrl(base) ?? base;
+      return {
+        ok: false,
+        reason: "saved-unreadable",
+        detail: err instanceof ArticleFetchError ? err.detail : undefined,
+        id: imported.id,
+        meta: {
+          id: imported.id,
+          title: imported.title ?? args.title ?? host,
+          site: host,
+          savedAt: new Date().toISOString(),
+          wordCount: imported.wordCount,
+          paywalled: false,
+          originalUrl: args.url,
+          permalink: `${root}/${imported.id}`,
+        } satisfies ArchiveArticleMeta,
+      };
+    }
   } catch (err) {
     if (err instanceof ArticleFetchError) return { ok: false, reason: err.reason, detail: err.detail, id: err.id };
     if (signal?.aborted) return { ok: false, reason: "aborted" };
