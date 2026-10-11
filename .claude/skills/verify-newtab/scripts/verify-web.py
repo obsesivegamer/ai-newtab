@@ -443,8 +443,8 @@ def run() -> None:
                 check("Amber holds the edit", row is not None and row["enabled"] is False, f"{code} {name}")
                 switch.tap()  # back on
                 pg.wait_for_timeout(1800)
-                check("the first PUT carries no precondition (nothing seen from Amber yet)",
-                      "if_updated_at" not in s.put_bodies[0], json.dumps(s.put_bodies[0])[:80])
+                check("the first PUT is conditional on 'no list stored yet' (Amber answered 404 at boot)",
+                      s.put_bodies[0].get("if_updated_at") == "", json.dumps(s.put_bodies[0])[:80])
                 code, body = http("GET", "/api/sources")
                 seen_stamp = json.loads(body)["updated_at"]
                 check("a later PUT sends the stamp it last saw as if_updated_at",

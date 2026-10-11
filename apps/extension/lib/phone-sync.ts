@@ -114,6 +114,12 @@ function cleanSources(raw: unknown): FeedSource[] | null {
  */
 let stampCache: string | null | undefined;
 
+/**
+ * Amber answered 404 to the last read: it holds no list yet. A first push is then conditional on
+ * "still none" (`if_updated_at: ""`), so it cannot overwrite a list another device wrote meanwhile.
+ */
+let amberHasNoSources = false;
+
 /** The `updated_at` this device last saw from Amber for the sources list, if any. */
 export async function loadSourcesStamp(): Promise<string | null> {
   const got = await browser.storage.local.get(KEYS.sourcesSyncStamp);
@@ -165,21 +171,23 @@ export async function publishSources(
   if (!base) return { status: "skipped" };
   try {
     // A keepalive push runs while the page is closing: use the cached stamp, with no await before the request.
-    const stamp =
+    let stamp =
       opts.ifUpdatedAt !== undefined
         ? opts.ifUpdatedAt
         : opts.keepalive && stampCache !== undefined
           ? stampCache
           : await loadSourcesStamp();
+    if (!stamp && opts.ifUpdatedAt === undefined && amberHasNoSources) stamp = "";
     const response = await fetch(`${base}/api/sources`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sources: sources.map(toSource), ...(stamp ? { if_updated_at: stamp } : {}) }),
+      body: JSON.stringify({ sources: sources.map(toSource), ...(typeof stamp === "string" ? { if_updated_at: stamp } : {}) }),
       keepalive: opts.keepalive || undefined,
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     const body = (await response.json().catch(() => null)) as { sources?: unknown; updated_at?: unknown } | null;
     if (response.ok) {
+      amberHasNoSources = false;
       await saveSourcesStamp(typeof body?.updated_at === "string" ? body.updated_at : null);
       return { status: "ok" };
     }
@@ -237,7 +245,9 @@ export async function fetchRemoteSources(base: string, signal?: AbortSignal): Pr
     const response = await fetch(`${base}/api/sources`, {
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
+    if (response.status === 404) amberHasNoSources = true;
     if (!response.ok) return null;
+    amberHasNoSources = false;
     const body = (await response.json()) as { sources?: unknown; updated_at?: unknown } | null;
     const sources = cleanSources(body?.sources);
     if (!sources) return null;

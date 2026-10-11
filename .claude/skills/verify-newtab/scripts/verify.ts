@@ -615,9 +615,10 @@ async function main() {
   }
   const archivedFixtures = await (async () => {
     try {
-      const r = await fetch(`${AMBER}/api/snapshots?since_days=365&limit=2`);
+      // The newest captures are often tiny test pages ("Example Domain"); the reader checks need real text.
+      const r = await fetch(`${AMBER}/api/snapshots?since_days=365&limit=30`);
       const j = (await r.json()) as any;
-      return ((j.snapshots ?? []) as any[]).map((snap) => ({
+      return ((j.snapshots ?? []) as any[]).filter((snap) => Number(snap.word_count ?? 0) >= 300).slice(0, 2).map((snap) => ({
         title: String(snap.title),
         link: String(snap.final_url ?? snap.url),
         id: String(snap.id),

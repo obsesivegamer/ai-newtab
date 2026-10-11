@@ -9,7 +9,7 @@ import {
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
-import { fetchRemoteSources, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
+import { fetchRemoteSources, isShareableArchiveHost, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
 import {
   addFeedUrl,
   isSourceBlocked,
@@ -164,7 +164,9 @@ export function SettingsModal({
   useEffect(() => {
     if (!archiveLoaded) return;
     const base = normalizeArchiveUrl(archiveUrl);
-    if (!base) return;
+    // Same rule as the push: a host this Mac never shares with also never stores a stamp, so
+    // every open would look "changed" and replace the draft with that host's list.
+    if (!base || !isShareableArchiveHost(new URL(base).hostname)) return;
     const controller = new AbortController();
     void (async () => {
       const remote = await fetchRemoteSources(base, controller.signal);

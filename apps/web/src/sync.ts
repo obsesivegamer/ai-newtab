@@ -54,16 +54,28 @@ export function holdRemoteRefresh(hold: boolean): void {
   probing = hold;
 }
 
+/** Own pushes not yet answered: a page-hide push can't know the stamp they are about to produce. */
+let unanswered = 0;
+
 function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
-  const run = async () => {
-    const result = await publishSources(origin, sources, { keepalive });
-    if (result.status === "conflict") announce(result.sources, "conflict");
+  const run = async (ifUpdatedAt?: null) => {
+    unanswered++;
+    try {
+      const result = await publishSources(origin, sources, { keepalive, ifUpdatedAt });
+      if (result.status === "conflict") announce(result.sources, "conflict");
+    } finally {
+      unanswered--;
+    }
   };
   if (keepalive) {
-    void run();
+    // Runs now (the page is going away). If an earlier push of ours is still in flight, the stamp we
+    // hold is about to be stale because of our own write, so send without a condition rather than
+    // meeting our own 409 and adopting the older list. Joins the queue so a later refresh waits for it.
+    const own = run(unanswered > 0 ? null : undefined);
+    inflight = inflight.then(() => own, () => own);
     return;
   }
-  inflight = inflight.then(run, run);
+  inflight = inflight.then(() => run(), () => run());
 }
 
 /** Save a person's edit locally, then send it to Amber once edits have paused. */
