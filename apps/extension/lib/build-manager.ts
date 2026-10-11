@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { archiveHostOf, normalizeArchiveUrl, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
 import { createArchiveBridge } from "./archive";
+import { createFeedBridge } from "./feeds";
+import { isSourceBlocked, loadSources } from "./sources";
 import { browserBridge } from "./browser-bridge";
 import {
   INITIAL_BUILD_STATE,
@@ -141,9 +143,20 @@ export class BuildManager {
       console.log("[BuildManager] startBuild ignored — a build is already running");
       return; // single-flight: a second start just attaches.
     }
+    // Claim the slot before the first await: the startup tick, the onStartup
+    // listener and an alarm can all call this in the same turn.
+    this.running = true;
 
-    const { apiKey, systemPrompt, model, archiveUrl } = await loadSettings();
+    let settings: Awaited<ReturnType<typeof loadSettings>>;
+    try {
+      settings = await loadSettings();
+    } catch (err) {
+      this.running = false;
+      throw err;
+    }
+    const { apiKey, systemPrompt, model, archiveUrl } = settings;
     if (!apiKey) {
+      this.running = false;
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
       console.warn("[BuildManager] startBuild aborted — no API key in storage");
@@ -158,7 +171,16 @@ export class BuildManager {
       console.warn("[BuildManager] archive URL is not a valid http(s) address; building without the archive");
     }
 
-    this.running = true;
+    // Read like archiveUrl: once, at build start. A catalog that can't be read just means no feeds.
+    // A source on the blocked list is never fetched at all, so its headlines can't reach the model.
+    let feeds: ReturnType<typeof createFeedBridge> | undefined;
+    try {
+      const sources = (await loadSources()).filter((s) => !isSourceBlocked(s, settings.blockedSites));
+      if (sources.some((s) => s.enabled)) feeds = createFeedBridge(sources);
+    } catch (err) {
+      console.warn("[BuildManager] couldn't read the sources list; building without live feeds", err);
+    }
+
     this.controller = new AbortController();
     this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
     this.broadcast({ kind: "snapshot", state: this.state });
@@ -179,6 +201,8 @@ export class BuildManager {
         bridge: browserBridge,
         // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
         archive: archiveBase ? createArchiveBridge(archiveBase) : undefined,
+        feeds,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         store: extensionStore,
         userSystemPrompt: systemPrompt,
         // The archive's own host is never a page the agent may scrape: its index

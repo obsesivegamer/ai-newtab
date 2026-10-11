@@ -55,6 +55,25 @@ export const GET_PAGE_HTML_SCHEMA: ToolInputSchema = {
   required: ["urls"],
 };
 
+export const GET_FEEDS_SCHEMA: ToolInputSchema = {
+  type: "object",
+  properties: {
+    sinceHours: {
+      type: "integer",
+      minimum: 1,
+      maximum: 72,
+      description: "How many hours back to list new articles. Default 24.",
+    },
+    perSource: {
+      type: "integer",
+      minimum: 1,
+      maximum: 15,
+      description: "Newest N articles per publication. Default 8.",
+    },
+  },
+  required: [],
+};
+
 export const GET_ARCHIVE_SCHEMA: ToolInputSchema = {
   type: "object",
   properties: {
@@ -92,6 +111,12 @@ export const DEFAULTS = {
   daysToAnalyze: 14,
   maxResults: 30,
   loadDelayMs: 8000,
+  feedsSinceHours: 24,
+  feedsPerSource: 8,
+  /** Most feed items in one getFeeds result, newest first, across all publications. */
+  feedsMaxItems: 60,
+  /** How far back the archive is searched for stories a feed item is a copy of. */
+  feedArchiveSinceDays: 365,
   archiveSinceDays: 30,
   archiveLimit: 40,
   /** Most article bodies mounted per getArchiveArticles call. */

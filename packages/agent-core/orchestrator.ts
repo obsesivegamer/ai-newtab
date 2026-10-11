@@ -10,14 +10,20 @@ import {
   normalizeBlockList,
 } from "./site-filter";
 import { DEFAULTS } from "./schemas";
+import { canonicalLink, linkId, linkKey, safeLink } from "./link";
 import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
 import type {
   ArchiveArticle,
+  ArchiveArticleMeta,
   ArchiveBridge,
   ArchiveRef,
   BrowserBridge,
+  FeedBridge,
+  FeedItem,
+  FeedSourceStatus,
   GetArchiveArticlesResult,
   GetArchiveResult,
+  GetFeedsResult,
   GetHistoryResult,
   GetPageHtmlResult,
   HomepageBuildResult,
@@ -47,6 +53,8 @@ export interface RunOptions {
   bridge: BrowserBridge;
   /** The user's saved-article archive. Without it the archive tools answer with an error. */
   archive?: ArchiveBridge;
+  /** The newest articles from the user's sources. Without it getFeeds answers with an error. */
+  feeds?: FeedBridge;
   store: KVStore;
   userSystemPrompt?: string;
   /**
@@ -61,10 +69,15 @@ export interface RunOptions {
   /** Reattach to an existing session instead of creating one (e.g. after the host was killed mid-run). */
   resumeSessionId?: string;
   now?: Date;
+  /**
+   * IANA zone of the person reading the page (e.g. "America/Toronto"), shown to the
+   * model with the kickoff time. The host fills it; agent-core does not look it up.
+   */
+  timeZone?: string;
 }
 
 export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildResult> {
-  const { client, bridge, archive, store, callbacks, signal } = opts;
+  const { client, bridge, archive, feeds, store, callbacks, signal } = opts;
   const emit: Emit = {
     phase: (p, d) => callbacks?.onPhase?.(p, d),
     text: (t) => callbacks?.onText?.(t),
@@ -80,6 +93,15 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
 
   let sessionId = opts.resumeSessionId;
   if (!sessionId) {
+    // A fresh start with an active session still on record means an earlier run died
+    // and its resume did not take: that session (and its event log) is stale, so delete it.
+    const stale = await store.get<string>(STORAGE_KEYS.activeSessionId);
+    if (stale) {
+      emit.log(`deleting stale session ${stale}`);
+      await deleteSessionWhenSettled(client, stale).catch((err) =>
+        emit.log(`stale session ${stale} was not deleted: ${String(err)}`),
+      );
+    }
     emit.phase("session-create");
     const session = await client.beta.sessions.create({
       agent: agentId,
@@ -87,13 +109,13 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       title: `Homepage ${(opts.now ?? new Date()).toISOString().slice(0, 10)}`,
     });
     sessionId = session.id;
-    await store.set(STORAGE_KEYS.activeSessionId, sessionId);
   }
   emit.log(`session=${sessionId}`);
 
-  // Persist upload IDs so cleanup can still find them after a reattach.
-  const uploadedFileIds: string[] =
-    (await store.get<string[]>(STORAGE_KEYS.uploadedFileIds)) ?? [];
+  // Persist upload IDs so cleanup can still find them after a reattach. They are
+  // read inside the try below, so a store failure there still deletes the session.
+  const uploadedFileIds: string[] = [];
+  let uploadsLoaded = false;
   const rememberUpload = async (id: string) => {
     uploadedFileIds.push(id);
     await store.set(STORAGE_KEYS.uploadedFileIds, uploadedFileIds);
@@ -103,18 +125,56 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
   // Rebuilt from the session's event log on a reattach (see `restoreFromHistory`).
   const mountedArchive = new Map<string, ArchiveRef>();
 
-  // Hosts the model has been shown this run (history digest, archive originalUrls).
+  // Hosts the model has been shown this run (history digest, archive originalUrls,
+  // feed item links).
   // getPageHtml may only load these: a name from a scraped page or an archived
   // article must not be able to steer the signed-in browser somewhere new.
   // Nothing is persisted: on a reattach the event log is replayed and rebuilds it.
   const seenHosts = new Set<string>();
-  // Older builds persisted this list; drop any copy a killed run left behind.
-  if (!opts.resumeSessionId) await store.remove("seenHosts");
   const rememberHosts = (values: string[]) => {
     for (const value of values) {
       const host = hostOf(value);
       if (host) seenHosts.add(host);
     }
+  };
+
+  // Feed item links are allowed as exact links only, never as hosts: a feed is open
+  // web text, and a whole host is a much larger grant than the page the user's
+  // source actually listed. The key is the normalized href without its fragment.
+  const seenFeedLinks = new Set<string>();
+  const rememberFeedLinks = (values: string[]) => {
+    for (const value of values) {
+      const key = linkKey(value);
+      if (key) seenFeedLinks.add(key);
+    }
+  };
+
+  // The user's archive as an index of canonical link -> snapshot, loaded the first
+  // time getFeeds needs it. A failed load is cached too: getFeeds works without it.
+  let archiveIndex: Promise<Map<string, { id: string; permalink: string }>> | undefined;
+  const loadArchiveIndex = () => {
+    archiveIndex ??= (async () => {
+      const index = new Map<string, { id: string; permalink: string }>();
+      if (!archive) return index;
+      try {
+        const listed = await archive.listArticles({
+          sinceDays: DEFAULTS.feedArchiveSinceDays,
+          limit: ARCHIVE_FETCH_LIMIT,
+        });
+        for (const a of listed.articles) {
+          const permalink = safeLink(a.permalink);
+          const original = safeLink(a.originalUrl);
+          if (!ARCHIVE_ID.test(a.id) || !permalink || !original) continue;
+          const key = canonicalLink(original);
+          if (!index.has(key)) index.set(key, { id: a.id, permalink });
+        }
+        emit.log(`archive index: ${index.size} article(s) for feed matching`);
+      } catch (err) {
+        emit.log(`archive index unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return index;
+    })();
+    return archiveIndex;
   };
 
   let finalMessage = "";
@@ -129,12 +189,28 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       const blockedSites = normalizeBlockList(
         (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ?? DEFAULT_BLOCKED_SITES,
       );
-      let result: GetHistoryResult | GetPageHtmlResult | GetArchiveResult | GetArchiveArticlesResult;
+      let result:
+        | GetHistoryResult
+        | GetPageHtmlResult
+        | GetArchiveResult
+        | GetArchiveArticlesResult
+        | GetFeedsResult;
+      // What the model has now been shown is recorded only once the result is sent:
+      // a result that never reached it must not widen what getPageHtml may load.
+      let remember: (() => void) | undefined;
       switch (event.name) {
-        case "getArchive":
-          result = await runGetArchive(event, archive, emit, blockedSites);
-          rememberHosts(result.articles.map((a) => a.originalUrl));
+        case "getFeeds": {
+          const feedsResult = await runGetFeeds(event, feeds, emit, blockedSites, loadArchiveIndex);
+          result = feedsResult;
+          remember = () => rememberFeedLinks(feedsResult.items.map((item) => item.link));
           break;
+        }
+        case "getArchive": {
+          const archiveResult = await runGetArchive(event, archive, emit, blockedSites);
+          result = archiveResult;
+          remember = () => rememberHosts(archiveResult.articles.map((a) => a.originalUrl));
+          break;
+        }
         case "getArchiveArticles":
           result = await runGetArchiveArticles(event, {
             client,
@@ -146,10 +222,12 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
             blockedSites,
           });
           break;
-        case "getHistory":
-          result = await runGetHistory(event, bridge, emit, blockedSites);
-          rememberHosts(result.sites.map((site) => site.domain));
+        case "getHistory": {
+          const historyResult = await runGetHistory(event, bridge, emit, blockedSites);
+          result = historyResult;
+          remember = () => rememberHosts(historyResult.sites.map((site) => site.domain));
           break;
+        }
         case "getPageHtml":
           result = await runGetPageHtml(event, {
             client,
@@ -159,6 +237,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
             emit,
             blockedSites,
             seenHosts,
+            seenFeedLinks,
           });
           break;
         default:
@@ -174,6 +253,7 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
           },
         ],
       });
+      remember?.();
     } catch (err) {
       emit.log(`tool ${event.name} failed: ${String(err)}`);
       await client.beta.sessions.events.send(sessionId!, {
@@ -213,6 +293,15 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
   };
 
   try {
+    // Store reads and writes live inside the try: the session exists by now, so a
+    // failure here must still reach the cleanup below and delete it.
+    if (!opts.resumeSessionId) await store.set(STORAGE_KEYS.activeSessionId, sessionId);
+    // Older builds persisted a host list; drop any copy a killed run left behind,
+    // resume or not: the event log is the only source on a reattach.
+    await store.remove("seenHosts");
+    uploadedFileIds.push(...((await store.get<string[]>(STORAGE_KEYS.uploadedFileIds)) ?? []));
+    uploadsLoaded = true;
+
     // ---- Open the stream BEFORE anything else. It only delivers events emitted
     // ---- after it opens; send first and the early transitions are gone.
     let stream = await client.beta.sessions.events.stream(sessionId, undefined, { signal });
@@ -238,7 +327,10 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     );
 
     for (const event of history) observe(event);
-    restoreFromHistory(history, mountedArchive, rememberHosts);
+    restoreFromHistory(history, mountedArchive, rememberHosts, rememberFeedLinks);
+    emit.log(
+      `restored: ${seenHosts.size} hosts, ${mountedArchive.size} archive refs, ${seenFeedLinks.size} feed items`,
+    );
 
     if (!alreadyDone) {
       // Re-answer any tool call that was left hanging when the stream dropped.
@@ -261,6 +353,8 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
                     now: opts.now ?? new Date(),
                     userSystemPrompt: opts.userSystemPrompt,
                     archive: Boolean(archive),
+                    feeds: Boolean(feeds),
+                    timeZone: opts.timeZone,
                   }),
                 },
               ],
@@ -305,7 +399,8 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
     // and uploads persist independently of the session. Delete both, always.
     emit.phase("cleanup");
     await Promise.allSettled(uploadedFileIds.map((id) => client.beta.files.delete(id)));
-    await store.remove(STORAGE_KEYS.uploadedFileIds);
+    // Not read yet means the key still holds a previous run's ids: leave them for the next one.
+    if (uploadsLoaded) await store.remove(STORAGE_KEYS.uploadedFileIds);
     if (sessionId) {
       await deleteSessionWhenSettled(client, sessionId).catch((err) =>
         emit.log(`session ${sessionId} was not deleted: ${String(err)}`),
@@ -325,11 +420,13 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
  * with the same id, and the archive refs it carried (so the per-build mount cap
  * and file reuse survive) and the hosts it showed the model (so getPageHtml's
  * allow-list does) are read back out of the result the model actually received.
+ * Feed item links are read back as exact links, not hosts.
  */
 function restoreFromHistory(
   history: SessionEvent[],
   mounted: Map<string, ArchiveRef>,
   rememberHosts: (values: string[]) => void,
+  rememberFeedLinks: (values: string[]) => void,
 ): void {
   const uses = new Map<string, CustomToolUse>();
   for (const event of history) {
@@ -364,6 +461,9 @@ function restoreFromHistory(
         break;
       case "getArchive":
         rememberHosts(list("articles").flatMap((a) => field(a, "originalUrl") ?? []));
+        break;
+      case "getFeeds":
+        rememberFeedLinks(list("items").flatMap((item) => field(item, "link") ?? []));
         break;
       case "getArchiveArticles":
         for (const ref of list("articles")) {
@@ -414,6 +514,7 @@ async function runGetPageHtml(
     emit: Emit;
     blockedSites: string[];
     seenHosts: Set<string>;
+    seenFeedLinks: Set<string>;
   },
 ): Promise<GetPageHtmlResult> {
   const input = event.input as { urls: string[]; loadDelayMs?: number };
@@ -428,9 +529,18 @@ async function runGetPageHtml(
       blocked.push({ url, reason: "blocked by the user's settings" });
       continue;
     }
+    // Two grants: a site from the history digest or an archive article's original URL
+    // (the whole host), or exactly a link getFeeds returned (that page only).
     const host = hostOf(url);
-    if ([...ctx.seenHosts].some((seen) => isSameOrSubdomain(host, seen))) allowed.push(url);
-    else notSeen.push({ url, reason: "not a site from your history or archive" });
+    const exact = linkKey(url);
+    if (
+      (exact !== undefined && ctx.seenFeedLinks.has(exact)) ||
+      [...ctx.seenHosts].some((seen) => isSameOrSubdomain(host, seen))
+    ) {
+      allowed.push(url);
+    } else {
+      notSeen.push({ url, reason: "not a site from your history or archive" });
+    }
   }
 
   // Skip the bridge entirely when nothing is left, so no scraper window opens.
@@ -448,13 +558,19 @@ async function runGetPageHtml(
     return false;
   });
   if (blocked.length) ctx.emit.log(`blocked: ${blocked.length} url(s)`);
+  if (notSeen.length) {
+    ctx.emit.log(
+      `not seen: ${notSeen.length} url(s) refused (${ctx.seenHosts.size} known hosts, ${ctx.seenFeedLinks.size} feed links)`,
+    );
+  }
 
   const refs: PageRef[] = [];
   const mountFailures = [...blocked, ...notSeen, ...failed];
 
   for (const page of pages) {
     try {
-      const filename = `${slugifyUrl(page.url)}_${refs.length}.html`;
+      const stem = `${slugifyUrl(page.url)}_${refs.length}`;
+      const filename = `${stem}.html`;
       const upload = await ctx.client.beta.files.upload({
         file: new File([page.html], filename, { type: "text/html" }),
       });
@@ -465,7 +581,9 @@ async function runGetPageHtml(
       const resource = await ctx.client.beta.sessions.resources.add(ctx.sessionId, {
         type: "file",
         file_id: upload.id,
-        mount_path: `${UPLOAD_ROOT}/pages/${filename}`,
+        // The upload id keeps the path unique: the slug is hostname-only, so a second
+        // call (or a re-answer after a reattach) on one host would otherwise collide.
+        mount_path: `${UPLOAD_ROOT}/pages/${stem}-${upload.id.slice(-8)}.html`,
       });
 
       refs.push({
@@ -494,6 +612,17 @@ async function runGetPageHtml(
 }
 
 const ARCHIVE_UNAVAILABLE = "The article archive is unavailable";
+const FEEDS_UNAVAILABLE = "The live feeds are unavailable";
+
+/** A feed blurb can be a whole article's lede; the model needs the gist, not 60 of them. */
+const FEED_SUMMARY_CHARS = 400;
+const FEED_TITLE_CHARS = 300;
+const FEED_NAME_CHARS = 80;
+const FEED_ERROR_CHARS = 200;
+/** A publish time this far past now is clock skew; further than that it is a bug. */
+const FEED_FUTURE_SLACK_MS = 5 * 60 * 1000;
+/** What a feed item's `id` looks like (hex of a link hash); anything else is regenerated. */
+const FEED_ID = /^[0-9a-f]{8,16}$/;
 
 const ARCHIVE_ID = /^[A-Za-z0-9]{3,16}$/;
 
@@ -544,6 +673,119 @@ function archiveFileText(article: ArchiveArticle, body: string, truncated: boole
   return `${header.join("\n")}\n\n${body}${tail}`;
 }
 
+type ArchiveIndex = Map<string, { id: string; permalink: string }>;
+
+/** Collapse to one line and cut at `max` characters; the model gets data, not prose it must obey. */
+function cap(value: string, max: number): string {
+  const text = oneLine(value);
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+async function runGetFeeds(
+  event: CustomToolUse,
+  feeds: FeedBridge | undefined,
+  emit: Emit,
+  blockedSites: string[],
+  loadArchiveIndex: () => Promise<ArchiveIndex>,
+): Promise<GetFeedsResult> {
+  if (!feeds) throw new Error(`${FEEDS_UNAVAILABLE}: none is configured for this build.`);
+  const input = event.input as { sinceHours?: number; perSource?: number };
+  const sinceHours = clampInt(input.sinceHours, DEFAULTS.feedsSinceHours, 1, 72);
+  const perSource = clampInt(input.perSource, DEFAULTS.feedsPerSource, 1, 15);
+
+  emit.phase("history", `feeds ${sinceHours}h`);
+  let fetched: Awaited<ReturnType<FeedBridge["fetchLatest"]>>;
+  try {
+    fetched = await feeds.fetchLatest({ sinceHours, perSource });
+  } catch (err) {
+    throw new Error(`${FEEDS_UNAVAILABLE}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Never fails getFeeds: a build without the archive simply matches nothing.
+  const archived = await loadArchiveIndex();
+
+  // Every field is rebuilt rather than spread, so nothing the bridge attached beyond
+  // the contract (including archiveId/permalink, which only this handler sets) survives.
+  // The user's blocked hosts apply to where the link goes; private, local-network and
+  // non-http(s) links fail the same check. Dropped items are never counted for the model.
+  const nowMs = Date.now();
+  const prepared: FeedItem[] = [];
+  const droppedBySource = new Map<string, number>();
+  for (const raw of fetched.items) {
+    const source = cap(raw.source, FEED_NAME_CHARS);
+    const link = safeLink(raw.link);
+    if (!link || !isAllowedUrl(link, blockedSites)) {
+      droppedBySource.set(source, (droppedBySource.get(source) ?? 0) + 1);
+      continue;
+    }
+    const item: FeedItem = {
+      id: typeof raw.id === "string" && FEED_ID.test(raw.id) ? raw.id : linkId(link),
+      title: cap(raw.title, FEED_TITLE_CHARS),
+      link,
+      source,
+    };
+    // A date after now is a feed bug; unknown is more honest than a pinned-to-the-top story.
+    const published = isoDateOrUndefined(raw.publishedAt);
+    const publishedMs = published ? Date.parse(published) : NaN;
+    if (published && publishedMs <= nowMs + FEED_FUTURE_SLACK_MS) item.publishedAt = published;
+    for (const [key, max] of [["summary", FEED_SUMMARY_CHARS], ["author", 120], ["section", 80]] as const) {
+      const value = raw[key] ? cap(raw[key], max) : "";
+      if (value) item[key] = value;
+    }
+    const saved = archived.get(canonicalLink(link));
+    if (saved) {
+      item.archiveId = saved.id;
+      item.permalink = saved.permalink;
+    }
+    prepared.push(item);
+  }
+
+  // Newest first, undated last (the sort is stable).
+  const time = (item: FeedItem) => {
+    const t = Date.parse(item.publishedAt ?? "");
+    return Number.isNaN(t) ? 0 : t;
+  };
+  const perSourceTaken = new Map<string, number>();
+  const items = prepared
+    .sort((a, b) => time(b) - time(a))
+    .filter((item) => {
+      const taken = perSourceTaken.get(item.source) ?? 0;
+      if (taken >= perSource) return false;
+      perSourceTaken.set(item.source, taken + 1);
+      return true;
+    })
+    .slice(0, DEFAULTS.feedsMaxItems);
+
+  // Counts describe what the model was actually given, after every cap above.
+  const given = new Map<string, number>();
+  for (const item of items) given.set(item.source, (given.get(item.source) ?? 0) + 1);
+  const looksLikeHost = (name: string) => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(name);
+  const byName = new Map<string, FeedSourceStatus>();
+  for (const status of fetched.sources) {
+    const name = cap(status.name, FEED_NAME_CHARS);
+    const error = status.error ? cap(status.error, FEED_ERROR_CHARS) : "";
+    const have = byName.get(name);
+    if (have) {
+      if (!have.error && error) have.error = error;
+      continue;
+    }
+    const entry: FeedSourceStatus = { name, count: given.get(name) ?? 0 };
+    if (error) entry.error = error;
+    byName.set(name, entry);
+  }
+  const sources = [...byName.values()].filter((s) => {
+    if (s.count > 0) return true;
+    if (!s.error) return false;
+    // Nothing from it, and it is a blocked site: don't name it, error or not.
+    return !(droppedBySource.get(s.name) || (looksLikeHost(s.name) && isBlocked(s.name, blockedSites)));
+  });
+
+  const dropped = [...droppedBySource.values()].reduce((a, b) => a + b, 0);
+  if (dropped) emit.log(`blocked: ${dropped} feed item(s)`);
+  const matched = items.filter((item) => item.archiveId).length;
+  emit.log(`feeds: ${items.length} item(s) from ${sources.length} source(s), ${matched} already archived`);
+  return { fetchedAt: new Date().toISOString(), sources, items };
+}
+
 async function runGetArchive(
   event: CustomToolUse,
   archive: ArchiveBridge | undefined,
@@ -564,8 +806,16 @@ async function runGetArchive(
   }
 
   // The user's blocked hosts apply to where the article came from, not to the archive's own address.
-  const kept = listed.articles.filter((a) => isAllowedUrl(a.originalUrl, blockedSites));
-  const dropped = listed.articles.filter((a) => !kept.includes(a));
+  // Links the model will put in an href are normalized; an article whose original URL
+  // or permalink can't be (not http(s), or longer than the cap) is dropped like a blocked one.
+  const kept: ArchiveArticleMeta[] = [];
+  const dropped: ArchiveArticleMeta[] = [];
+  for (const a of listed.articles) {
+    const originalUrl = safeLink(a.originalUrl);
+    const permalink = safeLink(a.permalink);
+    if (originalUrl && permalink && isAllowedUrl(originalUrl, blockedSites)) kept.push({ ...a, originalUrl, permalink });
+    else dropped.push(a);
+  }
   // As with history, blocked material is dropped from the counts too: the model is never told it exists.
   const droppedBySite = new Map<string, number>();
   for (const a of dropped) droppedBySite.set(a.site, (droppedBySite.get(a.site) ?? 0) + 1);
@@ -681,8 +931,12 @@ async function runGetArchiveArticles(
   }
   if (blockedCount) ctx.emit.log(`blocked: ${blockedCount} archived article(s)`);
 
-  for (const article of fetched) {
+  for (const original of fetched) {
     try {
+      const originalUrl = safeLink(original.originalUrl);
+      const permalink = safeLink(original.permalink);
+      if (!originalUrl || !permalink) throw new Error("the article's links are not usable");
+      const article: ArchiveArticle = { ...original, originalUrl, permalink };
       const safeId = article.id.replace(/[^A-Za-z0-9_-]+/g, "_") || "article";
       const { text, truncated } = truncateWords(article.text, DEFAULTS.archiveWordLimit);
       const file = new File([archiveFileText(article, text, truncated)], `${safeId}.txt`, {
@@ -715,7 +969,7 @@ async function runGetArchiveArticles(
       refs.push(ref);
       ctx.emit.log(`mounted archive ${article.id} -> ${resource.mount_path} (${file.size}b)`);
     } catch (err) {
-      failed.push({ id: article.id, reason: `mount failed: ${String(err)}` });
+      failed.push({ id: original.id, reason: `mount failed: ${String(err)}` });
     }
   }
 

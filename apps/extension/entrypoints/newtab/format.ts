@@ -1,4 +1,4 @@
-import type { ArchiveArticleMeta } from "@homepage/agent-core";
+import { effectiveTime, type ArchiveArticleMeta } from "@homepage/agent-core";
 
 export const WORDS_PER_MINUTE = 230;
 /** Articles under this read as a brief, and are marked as such. */
@@ -59,4 +59,53 @@ export function groupByDay(articles: ArchiveArticleMeta[], now = new Date()) {
     else groups.push({ key, label: dayLabel(article.savedAt, now), items: [article] });
   }
   return groups;
+}
+
+const clock = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" });
+
+/**
+ * A time as it should read right now: "just now", "12 min ago", "3 h ago", then
+ * the clock time for anything older (the day group says which day). Computed at
+ * display time, never stored.
+ */
+export function relativeTime(iso: string | undefined, now = Date.now()): string {
+  const d = validDate(iso);
+  // A date far in the future is a feed bug; say nothing rather than "just now".
+  if (!d || effectiveTime(iso, now) === -Infinity) return "";
+  const minutes = Math.floor((now - d.getTime()) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 12 * 60) return `${Math.floor(minutes / 60)} h ago`;
+  return clock.format(d);
+}
+
+/**
+ * Like `groupByDay`, for a feed stream: the last hour is its own group, then one per
+ * day, then the undated. A date more than a few minutes ahead of `now` counts as
+ * undated (a feed bug, not news from tomorrow); a slightly-ahead one counts as now.
+ * Items of one group end up together whatever their order, so keys are unique.
+ */
+export function groupFeed<T extends { publishedAt?: string }>(items: T[], now = Date.now()) {
+  const groups = new Map<string, { key: string; label: string; items: T[] }>();
+  const today = new Date(now);
+  for (const item of items) {
+    const t = effectiveTime(item.publishedAt, now);
+    let key: string;
+    let label: string;
+    if (t === -Infinity) {
+      key = "undated";
+      label = "Date unknown";
+    } else if (now - t < 60 * 60_000) {
+      key = "hour";
+      label = "Last hour";
+    } else {
+      const iso = new Date(t).toISOString();
+      key = dayKey(iso);
+      label = dayLabel(iso, today);
+    }
+    const group = groups.get(key);
+    if (group) group.items.push(item);
+    else groups.set(key, { key, label, items: [item] });
+  }
+  return [...groups.values()];
 }

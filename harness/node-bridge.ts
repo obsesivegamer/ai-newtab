@@ -10,12 +10,20 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_BLOCKED_SITES,
+  DEFAULT_FEEDS,
+  addFeedUrl,
   archiveHostOf,
+  createFeedBridge,
+  fromKnown,
+  isSourceBlocked,
   normalizeArchiveUrl,
+  seedCatalog,
   type ArchiveArticle,
   type ArchiveArticleMeta,
   type ArchiveBridge,
   type BrowserBridge,
+  type FeedBridge,
+  type FeedSource,
   type KVStore,
   type RawSiteMetadata,
 } from "@homepage/agent-core";
@@ -241,4 +249,46 @@ export function harnessArchive(): ArchiveBridge | undefined {
 export function harnessBlockedSites(): string[] {
   const host = archiveHostOf(harnessArchiveUrl());
   return [...DEFAULT_BLOCKED_SITES, ...(host ? [host] : [])];
+}
+
+/**
+ * The harness's live feeds, so `pnpm agent:run` exercises `getFeeds`:
+ *
+ * - `FEEDS` (comma-separated feed addresses) if set; an empty value turns feeds off;
+ * - otherwise the publications the archive's `sources` name, from the same table the
+ *   extension seeds from;
+ * - otherwise (no archive, or none of its sources have a known feed) the first 6
+ *   publications in that table.
+ *
+ * Sources whose publisher is on the blocked list, or whose feed address is on a
+ * private or local-network host, are not fetched (the extension does the same).
+ */
+export async function harnessFeeds(): Promise<FeedBridge | undefined> {
+  const env = process.env.FEEDS;
+  let sources: FeedSource[] = [];
+  if (env !== undefined) {
+    const addresses = env.split(",").map((a) => a.trim()).filter(Boolean);
+    for (const address of addresses) sources = addFeedUrl(sources, address);
+    if (sources.length === 0) return undefined;
+    console.log(`[harness] feeds: ${sources.length} source(s) from FEEDS`);
+  } else {
+    const archive = harnessArchive();
+    if (archive) {
+      try {
+        const list = await archive.listArticles({ sinceDays: 365, limit: 1 });
+        sources = seedCatalog(list.sources).sources;
+      } catch {
+        /* no archive: fall through to the table */
+      }
+    }
+    if (sources.length === 0) sources = DEFAULT_FEEDS.slice(0, 6).map(fromKnown);
+    console.log(`[harness] feeds: ${sources.map((s) => s.name).join(", ")}`);
+  }
+  const blocked = harnessBlockedSites();
+  const allowed = sources.filter((s) => !isSourceBlocked(s, blocked));
+  if (allowed.length < sources.length) {
+    const names = sources.filter((s) => !allowed.includes(s)).map((s) => s.name);
+    console.log(`[harness] feeds: skipped ${names.join(", ")} (blocked or private address)`);
+  }
+  return allowed.length > 0 ? createFeedBridge(allowed) : undefined;
 }

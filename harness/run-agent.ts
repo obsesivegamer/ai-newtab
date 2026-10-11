@@ -11,7 +11,16 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { runHomepageBuild } from "@homepage/agent-core";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { FileKVStore, OUT_DIR, OUT_PATH, STATE_PATH, harnessArchive, harnessBlockedSites, nodeBridge } from "./node-bridge";
+import {
+  FileKVStore,
+  OUT_DIR,
+  OUT_PATH,
+  STATE_PATH,
+  harnessArchive,
+  harnessBlockedSites,
+  harnessFeeds,
+  nodeBridge,
+} from "./node-bridge";
 
 async function main() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -29,6 +38,8 @@ async function main() {
     client,
     bridge: nodeBridge,
     archive: harnessArchive(),
+    feeds: await harnessFeeds(),
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     blockedSites: harnessBlockedSites(),
     store,
     userSystemPrompt: process.env.HOMEPAGE_PROMPT,

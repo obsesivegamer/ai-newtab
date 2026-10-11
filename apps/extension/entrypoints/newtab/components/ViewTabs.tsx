@@ -1,6 +1,7 @@
-export type View = "library" | "today";
+export type View = "latest" | "library" | "today";
 
 const TABS: Array<{ id: View; label: string }> = [
+  { id: "latest", label: "Latest" },
   { id: "library", label: "Library" },
   { id: "today", label: "Today" },
 ];
