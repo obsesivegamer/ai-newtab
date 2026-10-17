@@ -5,8 +5,10 @@ import { createArchiveBridge } from "./archive";
  * Saving an article to Amber on demand and reading its full text back: the
  * client for Amber's `/api/lookup`, `/api/save`, `/api/jobs/{id}` and
  * `/api/snapshots/{id}/text`, plus `POST /api/import` (`importPage`) for a page
- * this browser already loaded (lib/browser-capture.ts). Used by the Reader when
- * you open a story that is not in the archive yet.
+ * this browser already loaded (lib/browser-capture.ts). A gift is the same
+ * poll and read with a different first step: `POST /api/candidates/{id}/save`
+ * (`saveCandidate`). Used by the Reader when you open a story that is not in
+ * the archive yet.
  *
  * Client rules from Amber: only a snapshot that is `complete` and `usable` is
  * readable; a found-but-unusable one counts as not archived; the article link
@@ -20,6 +22,8 @@ export type FetchFailure =
   | "busy"
   | "invalid-url"
   | "capture-failed"
+  /** Amber refused the candidate save because the gift was dismissed (409). */
+  | "dismissed"
   | "paywall-stub"
   | "not-saved"
   | "timeout"
@@ -343,6 +347,11 @@ export async function readArticle(base: string, id: string, signal?: AbortSignal
   throw new ArticleFetchError("amber-down", reason.slice(0, 200), id);
 }
 
+function articleResult(article: ArchiveArticle, created: boolean): FullArticleResult {
+  const { text, ...meta } = article;
+  return { ok: true, id: article.id, text, meta, created };
+}
+
 export type FullArticleResult =
   | {
       ok: true;
@@ -377,17 +386,13 @@ export async function fetchFullArticle(
   const stage = (s: FetchStage) => {
     if (!signal?.aborted) onStatus?.(s);
   };
-  const finish = (article: ArchiveArticle, created: boolean): FullArticleResult => {
-    const { text, ...meta } = article;
-    return { ok: true, id: article.id, text, meta, created };
-  };
   try {
     stage("checking");
     const found = await lookupArticle(base, args.url, signal);
 
     if (found.found && found.id && found.status === "complete" && found.usable) {
       stage("reading");
-      return finish(await readArticle(base, found.id, signal), false);
+      return articleResult(await readArticle(base, found.id, signal), false);
     }
     if (found.found && found.id && found.status === "complete" && !found.usable && !args.force) {
       // Amber has this page but it is not an article (a paywall stub). Re-capturing is the person's call.
@@ -399,7 +404,7 @@ export async function fetchFullArticle(
       stage(found.status);
       await waitForArticle(base, found.id, { signal, onStatus: stage });
       stage("reading");
-      return finish(await readArticle(base, found.id, signal), true);
+      return articleResult(await readArticle(base, found.id, signal), true);
     }
     if (args.saveIfMissing === false) throw new ArticleFetchError("not-saved", undefined, found.id);
 
@@ -414,10 +419,88 @@ export async function fetchFullArticle(
       await waitForArticle(base, saved.id, { signal, onStatus: stage });
     }
     stage("reading");
-    return finish(await readArticle(base, saved.id, signal), created);
+    return articleResult(await readArticle(base, saved.id, signal), created);
   } catch (err) {
     if (err instanceof ArticleFetchError) return { ok: false, reason: err.reason, detail: err.detail, id: err.id };
     if (signal?.aborted) return { ok: false, reason: "aborted" };
     return { ok: false, reason: "amber-down", detail: err instanceof Error ? err.message : String(err) };
   }
+}
+
+export interface CandidateSave {
+  id: string;
+  /**
+   * The article's own address, used only when Amber says the gift link expired.
+   * This is never the unlock link: an expired gift is not captured again.
+   */
+  canonicalUrl?: string;
+}
+
+/**
+ * Save a gift the person clicked. Posts `{}` to `/api/candidates/{id}/save`
+ * (Amber captures the unlock link it stored), then polls and reads like any
+ * other save. A paywall comes back as `paywall-stub`, for the Reader's existing
+ * buttons. A 410 means the gift expired: fall back to a normal save of the
+ * canonical article address, when there is one.
+ */
+export async function saveCandidate(
+  base: string,
+  candidate: CandidateSave,
+  opts: { signal?: AbortSignal; onStatus?: (stage: FetchStage) => void } = {},
+): Promise<FullArticleResult> {
+  const { signal, onStatus } = opts;
+  const stage = (s: FetchStage) => {
+    if (!signal?.aborted) onStatus?.(s);
+  };
+  try {
+    const root = baseOf(base);
+    stage("saving");
+    const { status, body } = await call(`${root}/api/candidates/${encodeURIComponent(candidate.id)}/save`, {
+      method: "POST",
+      body: {},
+      signal,
+    });
+    if (status === 410) {
+      const reported = typeof body?.canonical_url === "string" ? body.canonical_url.trim() : "";
+      const known = candidate.canonicalUrl?.trim() ?? "";
+      const canonical = reported || known;
+      if (!canonical) return { ok: false, reason: "invalid-url", detail: "The gift link expired." };
+      return fetchFullArticle(base, { url: canonical, saveIfMissing: true }, opts);
+    }
+    if (status === 404) return { ok: false, reason: "capture-failed", detail: "This gift is no longer available." };
+    // 409 is "dismissed". The body detail is the token "dismissed", not a sentence,
+    // and this must not look like a capture failure: that offers a browser capture
+    // of the gift link, which can still redeem it.
+    if (status === 409) return { ok: false, reason: "dismissed", detail: "This gift was dismissed." };
+    if (status === 429) return { ok: false, reason: "busy", detail: detailOf(body) };
+    if ((status !== 200 && status !== 202) || typeof body?.id !== "string") {
+      const err = failFor(status, body);
+      return { ok: false, reason: err.reason, detail: err.detail };
+    }
+    if (body.status === "exists") {
+      if (body.usable !== true) return { ok: false, reason: "paywall-stub", id: body.id };
+      stage("reading");
+      return articleResult(await readArticle(base, body.id, signal), false);
+    }
+    stage(body.status === "capturing" ? "capturing" : "queued");
+    await waitForArticle(base, body.id, { signal, onStatus: stage });
+    stage("reading");
+    return articleResult(await readArticle(base, body.id, signal), true);
+  } catch (err) {
+    if (err instanceof ArticleFetchError) return { ok: false, reason: err.reason, detail: err.detail, id: err.id };
+    if (signal?.aborted) return { ok: false, reason: "aborted" };
+    return { ok: false, reason: "amber-down", detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Hide a gift from the live queue. A 404 means Amber has already dropped it. */
+export async function dismissCandidate(base: string, id: string, signal?: AbortSignal): Promise<void> {
+  const root = baseOf(base);
+  const { status, body } = await call(`${root}/api/candidates/${encodeURIComponent(id)}/dismiss`, {
+    method: "POST",
+    body: {},
+    signal,
+  });
+  if (status === 200 || status === 404) return;
+  throw failFor(status, body);
 }

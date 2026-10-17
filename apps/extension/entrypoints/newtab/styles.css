@@ -1572,6 +1572,29 @@ textarea.field {
   opacity: 0.75;
 }
 
+.gifts {
+  margin-top: 8px;
+}
+.gift-item {
+  display: flex;
+  align-items: flex-start;
+}
+.gift-item > .row {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: calc(100% + 12px);
+  margin: 0 0 0 -12px;
+}
+.gift-dismiss {
+  flex: none;
+  margin-top: 14px;
+}
+.gifts-note {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 /* Reader: the state of a full-article fetch for a story from outside the archive. */
 .reader-fetch {
   display: flex;

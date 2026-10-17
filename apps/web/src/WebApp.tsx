@@ -7,7 +7,7 @@ import { Reader } from "@newtab/components/Reader";
 import { SyncNote } from "@newtab/components/SyncNote";
 import { ThemeToggle } from "@newtab/components/ThemeToggle";
 import { ViewTabs, type View } from "@newtab/components/ViewTabs";
-import { articleKey, entryFromArchive, type ReaderEntry } from "@newtab/readerEntry";
+import { articleKey, entryFromArchive, latestRowId, type ReaderEntry } from "@newtab/readerEntry";
 import { useTheme } from "@newtab/uiPrefs";
 import { useArchiveList } from "@newtab/useArchiveList";
 import { useHomepageOpen } from "@newtab/useHomepageOpen";
@@ -91,14 +91,14 @@ export default function WebApp() {
     // Opened by a tap on its row: this is the one story that may be saved. Entries reached
     // afterwards with prev/next come from `list` and may not.
     setReader({ entry: { ...entry, autoFetch: true }, list, origin: "latest" });
-    setLatestCursor(entry.key.replace(/^feed:/, ""));
+    setLatestCursor(latestRowId(entry.key));
   }, []);
   const readerRef = useRef(reader);
   readerRef.current = reader;
   const navigateReader = useCallback((entry: ReaderEntry) => {
     const origin = readerRef.current?.origin;
     setReader((r) => (r ? { ...r, entry } : r));
-    if (origin === "latest") setLatestCursor(entry.key.replace(/^feed:/, ""));
+    if (origin === "latest") setLatestCursor(latestRowId(entry.key));
     else if (origin === "library") setCursorId(entry.key);
   }, []);
   const closeReader = useCallback(() => {
