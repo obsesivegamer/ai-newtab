@@ -5,10 +5,15 @@
     "moduleResolution": "bundler",
     "lib": ["ESNext", "DOM"],
     "types": ["bun"],
+    "jsx": "react-jsx",
     "strict": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "baseUrl": "..",
+    "paths": {
+      "@/*": ["apps/extension/*"]
+    }
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "*.tsx"]
 }

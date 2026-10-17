@@ -80,6 +80,21 @@ export function relativeTime(iso: string | undefined, now = Date.now()): string 
 }
 
 /**
+ * How old a gift is. Gifts have no day heading, so this keeps going in days
+ * after `relativeTime` would fall back to a clock time.
+ */
+export function ageLabel(iso: string | undefined, now = Date.now()): string {
+  const d = validDate(iso);
+  if (!d || effectiveTime(iso, now) === -Infinity) return "";
+  const minutes = Math.floor((now - d.getTime()) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
+/**
  * Like `groupByDay`, for a feed stream: the last hour is its own group, then one per
  * day, then the undated. A date more than a few minutes ahead of `now` counts as
  * undated (a feed bug, not news from tomorrow); a slightly-ahead one counts as now.

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { hostOf, isAllowedUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
 import { createArchiveBridge } from "@/lib/archive";
-import { fetchFullArticle, type FetchFailure, type FetchStage } from "@/lib/archive-save";
+import { fetchFullArticle, saveCandidate, type FetchFailure, type FetchStage } from "@/lib/archive-save";
 import { importFromBrowser } from "@/lib/browser-capture";
 import { IS_WEB } from "@/lib/platform";
 import { toReadable, wordCount } from "../articleText";
@@ -429,15 +429,46 @@ export function Reader({
       };
     }
 
+    // A gift the person clicked is saved through its candidate id. Prev/next and the
+    // model-built page leave autoFetch false, so they only look the address up.
+    // "Try capturing again" is force: it stays on the ordinary save, which is what
+    // that button does today. A paywall still comes back as paywall-stub.
+    const attempt = attemptRef.current;
+    const mayFetch = entry.autoFetch === true || attempt?.save === true;
+    const force = attempt?.force === true;
+    if (entry.candidateId && mayFetch && !force) {
+      const controller = new AbortController();
+      const canonicalUrl = entry.unlockUrl && entry.url && entry.url !== entry.unlockUrl ? entry.url : undefined;
+      setLoad({ status: "fetching", stage: "saving" });
+      void saveCandidate(archiveUrl, { id: entry.candidateId, canonicalUrl }, {
+        signal: controller.signal,
+        onStatus: (stage) => setLoad({ status: "fetching", stage }),
+      }).then((result) => {
+        if (controller.signal.aborted) return;
+        attemptRef.current = null;
+        if (result.ok) {
+          const article: ArchiveArticle = { ...result.meta, text: result.text };
+          cache.current.set(entry.key, article);
+          setLoad({ status: "ready", article });
+          onSavedRef.current(entry, result.meta, result.created);
+        } else if (result.reason !== "aborted") {
+          setLoad({
+            status: "error",
+            ...fetchProblem(result.reason, result.detail),
+            reason: result.reason,
+            save: true,
+          });
+        }
+      });
+      return () => controller.abort();
+    }
+
     // From outside the archive: look it up, and save it only when the person has asked.
     if (!entry.url) {
       setLoad({ status: "error", title: "This article didn’t load.", message: "There is no address to fetch." });
       return;
     }
     const controller = new AbortController();
-    const attempt = attemptRef.current;
-    const mayFetch = entry.autoFetch === true || attempt?.save === true;
-    const force = attempt?.force === true;
     setLoad(mayFetch ? { status: "fetching", stage: "checking" } : { status: "loading" });
     void fetchFullArticle(
       archiveUrl,
@@ -472,7 +503,7 @@ export function Reader({
     return () => controller.abort();
     // `entry` is a new object whenever the list rebuilds; its key and address are what identify the work.
     // `entry.autoFetch` is read once per attempt: it belongs to the entry the person clicked.
-  }, [entry.key, entry.archiveId, entry.url, archiveUrl, runN, watch]);
+  }, [entry.key, entry.archiveId, entry.url, entry.candidateId, entry.unlockUrl, archiveUrl, runN, watch]);
 
   // Each article starts at the top, and the pane takes keyboard focus so space and arrows scroll it.
   useEffect(() => {

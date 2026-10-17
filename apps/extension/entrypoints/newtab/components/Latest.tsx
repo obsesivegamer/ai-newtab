@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ArchiveArticleMeta, FeedItem } from "@homepage/agent-core";
 import { groupFeed, relativeTime } from "../format";
-import { entryFromFeed, type ReaderEntry } from "../readerEntry";
+import { entryFromFeed, latestRowId, type ReaderEntry } from "../readerEntry";
 import { findArchived, LATEST_HOURS, useLatest } from "../useLatest";
+import { Gifts } from "./Gifts";
+import { Row } from "./StoryRow";
 
 const COLLAPSED_SOURCES = 7;
 
@@ -68,6 +70,13 @@ export function Latest({
   const [source, setSource] = useState<string | null>(null);
   const [allSources, setAllSources] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+  const [giftEntries, setGiftEntries] = useState<ReaderEntry[]>([]);
+  const onGiftEntries = useCallback((next: ReaderEntry[]) => {
+    setGiftEntries((prev) => {
+      if (prev.length === next.length && prev.every((entry, i) => entry.key === next[i]?.key)) return prev;
+      return next;
+    });
+  }, []);
 
   const tokens = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
 
@@ -97,16 +106,24 @@ export function Latest({
 
   const archivedFor = (item: FeedItem) => findArchived(archived, saved, item.link);
 
-  // The reader's list: every visible story, with the archive's copy where there is one.
-  const entries = useMemo(
+  // The reader's list: gifts first (they sit above the feed), then every visible story.
+  // Gift entries keep autoFetch false; the opener sets it on the one row that was clicked.
+  const feedEntries = useMemo(
     () => visible.map((item) => entryFromFeed(item, findArchived(archived, saved, item.link))),
     [visible, archived, saved],
   );
-  const entryById = useMemo(() => new Map(visible.map((item, i) => [item.id, entries[i]])), [visible, entries]);
+  const entries = useMemo(() => [...giftEntries, ...feedEntries], [giftEntries, feedEntries]);
+  const entryById = useMemo(() => {
+    const map = new Map<string, ReaderEntry>();
+    for (const entry of giftEntries) map.set(latestRowId(entry.key), entry);
+    visible.forEach((item, i) => map.set(item.id, feedEntries[i]));
+    return map;
+  }, [giftEntries, visible, feedEntries]);
+  const navIds = useMemo(() => [...giftEntries.map((entry) => latestRowId(entry.key)), ...visible.map((item) => item.id)], [giftEntries, visible]);
 
   useEffect(() => {
-    if (cursorId && !visible.some((i) => i.id === cursorId)) onCursor(null);
-  }, [visible, cursorId, onCursor]);
+    if (cursorId && !navIds.includes(cursorId)) onCursor(null);
+  }, [navIds, cursorId, onCursor]);
 
   useEffect(() => {
     if (!cursorId) return;
@@ -125,12 +142,12 @@ export function Latest({
       }
       if (isTyping(e.target)) return;
       if (e.key === "j" || e.key === "k") {
-        if (visible.length === 0) return;
+        if (navIds.length === 0) return;
         e.preventDefault();
-        const at = visible.findIndex((i) => i.id === cursorId);
-        const next = e.key === "j" ? Math.min(visible.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
-        onCursor(visible[next].id);
-        focusRow(visible[next].id);
+        const at = navIds.indexOf(cursorId ?? "");
+        const next = e.key === "j" ? Math.min(navIds.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
+        onCursor(navIds[next]);
+        focusRow(navIds[next]);
       } else if (e.key === "Enter") {
         // A focused row opens itself, whatever the cursor says (Tab moves focus, not the
         // cursor); with nothing in particular focused, the cursor row opens. Chips, links
@@ -148,7 +165,7 @@ export function Latest({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, visible, cursorId, onCursor, onOpen, entries, entryById]);
+  }, [active, navIds, cursorId, onCursor, onOpen, entries, entryById]);
 
   const clearFilters = () => {
     setQuery("");
@@ -281,6 +298,22 @@ export function Latest({
         </ul>
       )}
 
+      <Gifts
+        archiveUrl={archiveUrl}
+        active={active}
+        reloadToken={reloadToken}
+        blockedSites={blockedSites}
+        saved={saved}
+        now={now}
+        cursorId={cursorId}
+        onCursor={onCursor}
+        onEntries={onGiftEntries}
+        onOpen={(entry, giftList) => {
+          onCursor(latestRowId(entry.key));
+          onOpen(entry, [...giftList, ...feedEntries]);
+        }}
+      />
+
       {loading && <Skeleton />}
 
       {noSources && (
@@ -334,91 +367,44 @@ export function Latest({
       )}
 
       {visible.length > 0 && (
-        <>
-          <div className="groups">
-            {groups.map((group) => (
-              <section key={group.key} className="day-group">
-                <h2 className="day">
-                  <span>{group.label}</span>
-                  <span className="day-n">{group.items.length}</span>
-                </h2>
-                <ul className="rows">
-                  {group.items.map((item) => (
-                    <Row
-                      key={item.id}
-                      item={item}
-                      now={now}
-                      inAmber={archivedFor(item) !== undefined}
-                      cursor={item.id === cursorId}
-                      onFocus={() => onCursor(item.id)}
-                      onOpen={() => {
-                        const entry = entryById.get(item.id);
-                        if (!entry) return;
-                        onCursor(item.id);
-                        onOpen(entry, entries);
-                      }}
-                    />
-                  ))}
-                </ul>
-              </section>
-            ))}
-          </div>
+        <div className="groups">
+          {groups.map((group) => (
+            <section key={group.key} className="day-group">
+              <h2 className="day">
+                <span>{group.label}</span>
+                <span className="day-n">{group.items.length}</span>
+              </h2>
+              <ul className="rows">
+                {group.items.map((item) => (
+                  <Row
+                    key={item.id}
+                    item={item}
+                    now={now}
+                    inAmber={archivedFor(item) !== undefined}
+                    cursor={item.id === cursorId}
+                    onFocus={() => onCursor(item.id)}
+                    onOpen={() => {
+                      const entry = entryById.get(item.id);
+                      if (!entry) return;
+                      onCursor(item.id);
+                      onOpen(entry, entries);
+                    }}
+                  />
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
+      )}
 
-          <footer className="lib-foot">
-            <p className="keys">
-              <kbd>j</kbd> <kbd>k</kbd> move · <kbd>Enter</kbd> read · <kbd>/</kbd> search
-            </p>
-          </footer>
-        </>
+      {(visible.length > 0 || giftEntries.length > 0) && (
+        <footer className="lib-foot">
+          <p className="keys">
+            <kbd>j</kbd> <kbd>k</kbd> move · <kbd>Enter</kbd> read · <kbd>/</kbd> search
+          </p>
+        </footer>
       )}
     </div>
-  );
-}
-
-function Row({
-  item,
-  now,
-  inAmber,
-  cursor,
-  onFocus,
-  onOpen,
-}: {
-  item: FeedItem;
-  now: number;
-  inAmber: boolean;
-  cursor: boolean;
-  onFocus: () => void;
-  onOpen: () => void;
-}) {
-  const when = relativeTime(item.publishedAt, now);
-  return (
-    <li>
-      <button
-        id={`lrow-${item.id}`}
-        type="button"
-        className={`row${cursor ? " cursor" : ""}`}
-        onFocus={onFocus}
-        onClick={onOpen}
-      >
-        <span className="row-main">
-          <span className="row-title">{item.title}</span>
-          {item.summary && <span className="latest-blurb">{item.summary}</span>}
-          <span className="row-meta">
-            <span className="row-site">{item.source}</span>
-            {item.author && <span>{item.author}</span>}
-            {inAmber && (
-              <span className="row-amber">
-                <span className="row-amber-dot" aria-hidden="true" />
-                In Amber
-              </span>
-            )}
-          </span>
-        </span>
-        <span className="row-time" title={item.publishedAt ? new Date(item.publishedAt).toLocaleString() : undefined}>
-          {when}
-        </span>
-      </button>
-    </li>
   );
 }
 
