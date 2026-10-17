@@ -68,6 +68,7 @@ export function Gifts({
 }) {
   const [gifts, setGifts] = useState<GiftCandidate[]>([]);
   const [dismissing, setDismissing] = useState<string | null>(null);
+  const [dismissNote, setDismissNote] = useState<string | null>(null);
   const hidden = useRef(new Set<string>());
   const giftsRef = useRef(gifts);
   giftsRef.current = gifts;
@@ -115,9 +116,11 @@ export function Gifts({
       setGifts(previous.filter((gift) => gift.id !== id));
       try {
         await dismissCandidate(archiveUrl, id);
+        setDismissNote(null);
       } catch {
         hidden.current.delete(id);
         setGifts(previous);
+        setDismissNote("Couldn’t dismiss that gift.");
       } finally {
         setDismissing((current) => (current === id ? null : current));
       }
@@ -133,6 +136,11 @@ export function Gifts({
         <span>Gifts</span>
         <span className="day-n">{gifts.length}</span>
       </h2>
+      {dismissNote && (
+        <p className="gifts-note" role="status">
+          {dismissNote}
+        </p>
+      )}
       <ul className="rows">
         {gifts.map((gift) => {
           const item = asItem(gift);

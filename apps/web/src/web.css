@@ -159,6 +159,9 @@ html.web .tab {
   width: calc(100% + 8px);
   margin: 0 0 0 -8px;
 }
+.web .gifts-note {
+  font-size: 14px;
+}
 .web .ghost-btn {
   min-height: 44px;
   padding: 0 18px;

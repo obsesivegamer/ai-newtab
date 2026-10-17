@@ -158,6 +158,11 @@ function fetchProblem(
           ? `${detail} The site may have blocked the capture; the original may still open for you.`
           : "The site may have blocked the capture; the original may still open for you.",
       };
+    case "dismissed":
+      return {
+        title: "This gift was dismissed.",
+        message: "Amber won’t save it.",
+      };
     case "paywall-stub":
       return {
         title: "No article text came back.",
@@ -576,7 +581,9 @@ export function Reader({
       // After a failed browser attempt the same button is the retry.
       (load.via === "browser" &&
         // Nothing a second click can fix: the address is refused, Amber lacks the API, or the page is too large.
-        !["blocked", "no-api", "too-big", "saved-unreadable", "private-address"].includes(load.reason ?? "")));
+        !["blocked", "no-api", "too-big", "saved-unreadable", "private-address", "dismissed"].includes(
+          load.reason ?? "",
+        )));
   const elapsed = useElapsed(load.status === "fetching");
 
 

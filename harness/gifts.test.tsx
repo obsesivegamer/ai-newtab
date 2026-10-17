@@ -20,7 +20,8 @@ interface Call {
 }
 
 let calls: Call[] = [];
-let restoreFetch: (() => void) | null = null;
+/** Each `installFetch` pushes the fetch it replaced, so cleanup can put every one back. */
+const fetchRestores: Array<typeof fetch> = [];
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -29,22 +30,25 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+function restoreFetches() {
+  while (fetchRestores.length > 0) {
+    const previous = fetchRestores.pop();
+    if (previous) globalThis.fetch = previous;
+  }
+}
+
 function installFetch(handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>) {
   calls = [];
-  const previous = globalThis.fetch;
+  fetchRestores.push(globalThis.fetch);
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     calls.push({ url, method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : undefined });
     return handler(url, init);
   }) as typeof fetch;
-  restoreFetch = () => {
-    globalThis.fetch = previous;
-  };
 }
 
 afterEach(() => {
-  restoreFetch?.();
-  restoreFetch = null;
+  restoreFetches();
 });
 
 function candidatePayload(extra: Record<string, unknown> = {}) {
@@ -220,6 +224,27 @@ test("an expired gift falls back to a normal save of the canonical url", async (
   expect(posted[0].body).toBe("{}");
   expect(JSON.parse(posted[1].body ?? "")).toEqual({ url: CANONICAL });
   expect(posted[1].body).not.toContain("unlocked_article_code");
+});
+
+test("a dismissed gift is not saved by its article address", async () => {
+  installFetch(() => json(409, { detail: "dismissed" }));
+  const result = await saveCandidate(BASE, { id: GIFT_ID, canonicalUrl: CANONICAL });
+  expect(result).toMatchObject({ ok: false, reason: "dismissed", detail: "This gift was dismissed." });
+  expect(calls).toHaveLength(1);
+  expect(calls[0].method).toBe("POST");
+  expect(calls[0].url).toBe(`${BASE}/api/candidates/${GIFT_ID}/save`);
+  expect(calls[0].body).toBe("{}");
+  expect(calls.some((call) => call.url.includes("/api/save"))).toBe(false);
+});
+
+test("installFetch puts back each fetch it replaced", () => {
+  const original = globalThis.fetch;
+  installFetch(() => json(200, {}));
+  const first = globalThis.fetch;
+  installFetch(() => json(503, {}));
+  expect(globalThis.fetch).not.toBe(first);
+  restoreFetches();
+  expect(globalThis.fetch).toBe(original);
 });
 
 test("an expired gift with no canonical address is not saved", async () => {
@@ -414,4 +439,33 @@ test("the gifts section renders age, the archive marker and dismiss, and hides w
   );
   expect(document.querySelector("section.gifts")).toBeNull();
   blocked.unmount();
+});
+
+test("a failed dismiss puts the gift back and says so", async () => {
+  installFetch((url, init) => {
+    if ((init?.method ?? "GET") === "POST") return json(500, { detail: "nope" });
+    return json(200, { candidates: [candidatePayload()], updated_at: "2026-10-17T12:00:00Z" });
+  });
+  const view = await renderGifts(
+    <Gifts
+      archiveUrl={BASE}
+      active
+      reloadToken={0}
+      blockedSites={[]}
+      saved={new Map()}
+      now={Date.now()}
+      cursorId={null}
+      onCursor={() => undefined}
+      onOpen={() => undefined}
+    />,
+  );
+  const dismiss = document.querySelector('button[aria-label="Dismiss Cities after the storm"]') as HTMLButtonElement;
+  await act(async () => {
+    dismiss.click();
+  });
+  await settle();
+  expect(document.body.textContent).toContain("Cities after the storm");
+  expect(document.querySelector(".gifts-note")?.textContent).toBe("Couldn’t dismiss that gift.");
+  expect(calls.some((call) => call.method === "POST" && call.url.endsWith("/dismiss"))).toBe(true);
+  view.unmount();
 });

@@ -22,6 +22,8 @@ export type FetchFailure =
   | "busy"
   | "invalid-url"
   | "capture-failed"
+  /** Amber refused the candidate save because the gift was dismissed (409). */
+  | "dismissed"
   | "paywall-stub"
   | "not-saved"
   | "timeout"
@@ -466,7 +468,10 @@ export async function saveCandidate(
       return fetchFullArticle(base, { url: canonical, saveIfMissing: true }, opts);
     }
     if (status === 404) return { ok: false, reason: "capture-failed", detail: "This gift is no longer available." };
-    if (status === 409) return { ok: false, reason: "capture-failed", detail: detailOf(body) ?? "This gift was dismissed." };
+    // 409 is "dismissed". The body detail is the token "dismissed", not a sentence,
+    // and this must not look like a capture failure: that offers a browser capture
+    // of the gift link, which can still redeem it.
+    if (status === 409) return { ok: false, reason: "dismissed", detail: "This gift was dismissed." };
     if (status === 429) return { ok: false, reason: "busy", detail: detailOf(body) };
     if ((status !== 200 && status !== 202) || typeof body?.id !== "string") {
       const err = failFor(status, body);
