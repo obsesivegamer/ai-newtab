@@ -1,4 +1,5 @@
 import type { ArchiveArticleMeta, FeedItem } from "@homepage/agent-core";
+import type { GiftCandidate } from "@/lib/archive";
 import { canonicalLink } from "@/lib/feeds";
 
 /**
@@ -25,9 +26,14 @@ export interface ReaderEntry {
   /**
    * Whether opening may ask Amber to save it. True for a click on a list row;
    * false for a request from the model-built page, which must be confirmed
-   * with a button first.
+   * with a button first. A gift keeps this false on the list: only the entry
+   * the person actually clicked (see `openLatest`) may save.
    */
   autoFetch: boolean;
+  /** Set for a gift. The save goes to `/api/candidates/{id}/save`, not `/api/save`. */
+  candidateId?: string;
+  /** The gift link Amber stored. The canonical article, when known, is `url`. */
+  unlockUrl?: string;
 }
 
 export function entryFromArchive(meta: ArchiveArticleMeta): ReaderEntry {
@@ -77,6 +83,31 @@ export function entryFromFeed(item: FeedItem, archived?: ArchiveArticleMeta): Re
  * A bare address (from the model-built page). The page's own headline for it, when it sent one,
  * is shown as plain text; otherwise the host stands in for the title until the text arrives.
  */
+/**
+ * A gift from Amber's live queue. `autoFetch` stays false: the row click's opener
+ * sets it on the one entry that was clicked, and prev/next keep the list copies.
+ * `archiveId` is left unset so that click still goes through the candidate save
+ * (Amber records it) instead of only reading a snapshot it already has.
+ */
+export function entryFromCandidate(candidate: GiftCandidate): ReaderEntry {
+  return {
+    key: `gift:${candidate.id}`,
+    title: candidate.title || candidate.site || "Gift link",
+    site: candidate.site,
+    author: candidate.sourceAuthor,
+    publishedAt: candidate.foundAt || undefined,
+    url: candidate.canonicalUrl || candidate.unlockUrl,
+    candidateId: candidate.id,
+    unlockUrl: candidate.unlockUrl,
+    autoFetch: false,
+  };
+}
+
+/** The Latest row id for an entry key. `feed:` and `gift:` are list prefixes, not part of the row. */
+export function latestRowId(key: string): string {
+  return key.replace(/^(?:feed|gift):/, "");
+}
+
 export function entryFromUrl(href: string, headline?: string): ReaderEntry {
   const host = new URL(href).hostname.replace(/^www\./, "");
   return { key: `url:${articleKey(href)}`, title: headline || host, site: host, url: href, autoFetch: false };

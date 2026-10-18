@@ -19,7 +19,7 @@ import { Reader } from "./components/Reader";
 import { SyncNote } from "./components/SyncNote";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ViewTabs, type View } from "./components/ViewTabs";
-import { entryFromArchive, articleKey, type ReaderEntry } from "./readerEntry";
+import { entryFromArchive, articleKey, latestRowId, type ReaderEntry } from "./readerEntry";
 import { useTheme } from "./uiPrefs";
 import { useArchiveList } from "./useArchiveList";
 import { useHomepageBuild } from "./useHomepageBuild";
@@ -143,14 +143,14 @@ export default function App() {
     // Opened by a click or Enter on its row: this is the one story that may be saved. Entries
     // reached afterwards with j/k, the arrows or the next card come from `list` and may not.
     setReader({ entry: { ...entry, autoFetch: true }, list, origin: "latest" });
-    setLatestCursor(entry.key.replace(/^feed:/, ""));
+    setLatestCursor(latestRowId(entry.key));
   }, []);
   const readerRef = useRef(reader);
   readerRef.current = reader;
   const navigateReader = useCallback((entry: ReaderEntry) => {
     const origin = readerRef.current?.origin;
     setReader((r) => (r ? { ...r, entry } : r));
-    if (origin === "latest") setLatestCursor(entry.key.replace(/^feed:/, ""));
+    if (origin === "latest") setLatestCursor(latestRowId(entry.key));
     else if (origin === "library") setCursorId(entry.key);
   }, []);
   const closeReader = useCallback(() => {
