@@ -41,7 +41,9 @@ readable, paywall-free copy of each article on your Mac.
   It is seeded from the sites in your archive (and your browsing history) for
   publications we know feeds for; you can switch sources off and add any feed
   address (or a page that links to one). WSJ is read from Dow Jones' current feed
-  host (the old `feeds.a.dj.com` feeds stopped updating in 2025). Reuters has no
+  host (the old `feeds.a.dj.com` feeds stopped updating in 2025). The Washington
+  Post is read from its Arc section feeds (`www.washingtonpost.com/arcio/rss/category/…`);
+  the old `feeds.washingtonpost.com` sections answer 502. Reuters has no
   RSS, so its public news sitemap (the 50 newest stories) is read as a feed.
 - **Full text on demand.** Open a story that is not in your archive and the reader
   asks Amber to save it, waits for the capture, and shows the full text. This

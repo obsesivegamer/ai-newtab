@@ -237,6 +237,11 @@ set is unchanged: nothing is added for this (no `webRequest`); Amber's resolutio
   to `https://feeds.content.dowjones.io/public/rss/<Name>`; the default WSJ source
   reads World, US Business, Markets and WSJ.D. Its links carry `?mod=rss_*` /
   `?mod=pls_*`, which `link.ts` treats as tracking so one story in two feeds is one row.
+- *Washington Post.* `feeds.washingtonpost.com/rss/<section>` answers 502 from nginx
+  (confirmed 2026-10-20). The same sections are
+  `https://www.washingtonpost.com/arcio/rss/category/<section>/` (national, world,
+  business, politics). Akamai stalls non-browser clients on `www.washingtonpost.com`;
+  Latest fetches from the browser, which is allowed through.
 - *Reuters.* There is no public RSS. Its news sitemap
   (`https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml`, the 50
   newest stories) is read by `parseFeed` as a feed: `<news:title>`, `<loc>` and
@@ -250,7 +255,8 @@ set is unchanged: nothing is added for this (no `webRequest`); Amber's resolutio
 
 `loadSources` (`lib/sources.ts`) hands back the stored catalog at once and migrates
 it on the way: a source whose feeds are still exactly an earlier default (WSJ's
-`feeds.a.dj.com` one) gets the current defaults on every load (free, synchronous);
+`feeds.a.dj.com` one, or the Washington Post's `feeds.washingtonpost.com` sections)
+gets the current defaults on every load (free, synchronous);
 Reuters is offered once, in the background, when the archive or history says the person
 reads it and no source covers `reuters.com`. "Once" is `sourcesMigrated`, which
 `saveSources` also sets (a list the person saved is theirs), and the list and flag
