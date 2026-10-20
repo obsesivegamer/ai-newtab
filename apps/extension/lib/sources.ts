@@ -152,8 +152,9 @@ async function offerReuters(): Promise<void> {
  * A stored list is brought up to date on the way out:
  *
  * - a source still on a feed list an earlier version shipped (WSJ's frozen
- *   `feeds.a.dj.com` address) gets the current default feeds, on every load, since
- *   it costs nothing; a list the person edited is left as it is;
+ *   `feeds.a.dj.com` address, or the Washington Post's `feeds.washingtonpost.com`
+ *   sections, which answer 502) gets the current default feeds, on every load,
+ *   since it costs nothing; a list the person edited is left as it is;
  * - Reuters is offered once, in the background (`offerReuters`).
  */
 export async function loadSources(): Promise<FeedSource[]> {

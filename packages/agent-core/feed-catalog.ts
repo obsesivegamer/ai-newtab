@@ -18,7 +18,7 @@ export interface KnownSource {
 
 /**
  * Publications we know feeds for. Verified to answer with items on 2026-10-10
- * (WSJ and Reuters on 2026-10-11).
+ * (WSJ and Reuters on 2026-10-11, the Washington Post's Arc feeds on 2026-10-20).
  */
 export const DEFAULT_FEEDS: readonly KnownSource[] = [
   {
@@ -46,11 +46,15 @@ export const DEFAULT_FEEDS: readonly KnownSource[] = [
     name: "The Washington Post",
     aliases: ["WaPo", "Washington Post", "washingtonpost.com"],
     hosts: ["washingtonpost.com"],
+    // feeds.washingtonpost.com answers 502 from nginx (confirmed 2026-10-20, including
+    // with a browser TLS fingerprint). The same sections are on the Post's Arc RSS.
+    // Akamai stalls non-browser clients on www.washingtonpost.com; Latest fetches
+    // these from the browser, which is allowed through.
     feeds: [
-      "https://feeds.washingtonpost.com/rss/national",
-      "https://feeds.washingtonpost.com/rss/world",
-      "https://feeds.washingtonpost.com/rss/business",
-      "https://feeds.washingtonpost.com/rss/politics",
+      "https://www.washingtonpost.com/arcio/rss/category/national/",
+      "https://www.washingtonpost.com/arcio/rss/category/world/",
+      "https://www.washingtonpost.com/arcio/rss/category/business/",
+      "https://www.washingtonpost.com/arcio/rss/category/politics/",
     ],
   },
   {
@@ -291,6 +295,12 @@ export function seedSources(
  */
 const RETIRED_FEEDS: Record<string, string[][]> = {
   wsj: [["https://feeds.a.dj.com/rss/RSSWorldNews.xml"]],
+  wapo: [[
+    "https://feeds.washingtonpost.com/rss/national",
+    "https://feeds.washingtonpost.com/rss/world",
+    "https://feeds.washingtonpost.com/rss/business",
+    "https://feeds.washingtonpost.com/rss/politics",
+  ]],
 };
 
 /** `current` with any source still on a retired default moved to the current default feeds. */
