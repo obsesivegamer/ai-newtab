@@ -175,7 +175,7 @@ export function SettingsModal({
     const controller = new AbortController();
     void (async () => {
       const remote = await fetchRemoteSources(base, controller.signal);
-      if (!remote?.updatedAt || controller.signal.aborted) return;
+      if (remote.status !== "list" || remote.readOnly || !remote.updatedAt || controller.signal.aborted) return;
       if (remote.updatedAt === (await loadSourcesStamp())) return;
       if (controller.signal.aborted || sourcesDirtyRef.current) return;
       remoteStamp.current = remote.updatedAt;

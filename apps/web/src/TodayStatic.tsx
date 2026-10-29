@@ -6,18 +6,22 @@ import { canShowHomepagePreview } from "@newtab/components/homepagePreviewGate";
 import { HomepagePreview } from "@newtab/components/HomepagePreview";
 import {
   ASKED_MAC,
+  REBUILD_EXPIRED,
+  REBUILD_WAIT_TIMED_OUT,
   TODAY_POLL_LIMIT_MS,
   TODAY_POLL_MS,
+  builtClock,
+  cooldownLabel,
+  isFreshPage,
   oldPageNote,
   shouldAskRebuild,
   timestampAdvanced,
   upToDateLabel,
-  builtClock,
 } from "./todayStatus";
 
 type State = { status: "loading" } | HomepageFetch;
 
-type Notice = "checking" | "uptodate" | "updated" | "stale" | null;
+type Notice = "uptodate" | "updated" | "stale" | "cooldown" | "timeout" | "expired" | null;
 
 /**
  * Today on the phone: the page the extension built and handed to Amber, shown as it is.
@@ -59,8 +63,14 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
       }
       showingGood.current = result.status === "ok";
       if (result.status === "ok") {
+        const previous = shownTimestamp.current;
+        const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
         shownTimestamp.current = result.homepage.timestamp;
-        setNotice((current) => (current === "stale" ? null : current));
+        setNotice((current) => {
+          if (advanced) return "updated";
+          if (current === "stale") return null;
+          return current;
+        });
         setCode((previous) => {
           const next = toRenderable(result.homepage.code);
           return previous === next ? previous : next;
@@ -75,7 +85,7 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
     if (checkingRef.current) return;
     checkingRef.current = true;
     setChecking(true);
-    setNotice("checking");
+    setNotice(null);
     setAsked(false);
     setWatch(null);
     const previous = shownTimestamp.current;
@@ -92,16 +102,30 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
       }
       const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
       applyOk(result);
-      const outcome = advanced ? "updated" : "uptodate";
-      setNotice(outcome);
-      const ask = !rebuildUnsupported.current && shouldAskRebuild(previous, result.homepage.timestamp, Date.now());
-      if (!ask) return;
+      const now = Date.now();
+      if (advanced) {
+        setNotice("updated");
+        return;
+      }
+      if (isFreshPage(result.homepage.timestamp, now)) {
+        setNotice("uptodate");
+        return;
+      }
+      if (rebuildUnsupported.current || !shouldAskRebuild(result.homepage.timestamp, now)) return;
       const posted = await requestHomepageRebuild(origin);
       if (posted.status === "missing") {
         rebuildUnsupported.current = true;
         return;
       }
       if (posted.status !== "ok") return;
+      if (posted.request.cooldown) {
+        if (!oldPageNote(result.homepage.timestamp, result.homepage.syncedAt, Date.now())) setNotice("cooldown");
+        return;
+      }
+      if (posted.request.expired || posted.request.fulfilledAt) {
+        if (posted.request.expired) setNotice("expired");
+        return;
+      }
       setAsked(true);
       setWatch({ baseline: result.homepage.timestamp, until: Date.now() + TODAY_POLL_LIMIT_MS });
     } finally {
@@ -133,6 +157,8 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
     const timer = setInterval(() => {
       if (Date.now() >= watch.until) {
         clearInterval(timer);
+        setAsked(false);
+        setNotice("timeout");
         setWatch(null);
         return;
       }
@@ -157,14 +183,21 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
     const label = builtClock(state.homepage.timestamp);
     const oldNote = oldPageNote(state.homepage.timestamp, state.homepage.syncedAt, Date.now());
     const secure = canShowHomepagePreview();
+    const now = Date.now();
     const status =
-      notice === "uptodate"
-        ? upToDateLabel(state.homepage.timestamp, Date.now())
-        : notice === "updated"
-          ? "Updated"
-          : notice === "stale"
-            ? "Couldn’t refresh — showing the last copy"
-            : null;
+      notice === "uptodate" && !oldNote
+        ? upToDateLabel(state.homepage.timestamp, now)
+        : notice === "cooldown" && !oldNote
+          ? cooldownLabel(state.homepage.timestamp, now)
+          : notice === "updated"
+            ? "Updated"
+            : notice === "stale"
+              ? "Couldn’t refresh — showing the last copy"
+              : notice === "timeout"
+                ? REBUILD_WAIT_TIMED_OUT
+                : notice === "expired"
+                  ? REBUILD_EXPIRED
+                  : null;
     return (
       <>
         <div className="today-strip">
@@ -205,7 +238,7 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
               This page is not a secure context, so the preview can’t run. Open the reader over HTTPS.
             </p>
             <p className="gate-body">
-              <a href={DEFAULT_FALLBACK_ARCHIVE_URL}>{DEFAULT_FALLBACK_ARCHIVE_URL}</a>
+              <a href={`${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`}>{`${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`}</a>
             </p>
           </div>
         )}

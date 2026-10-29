@@ -50,8 +50,8 @@ function installBrowser() {
 test("the offline reader defaults to the tailnet HTTPS address", () => {
   expect(DEFAULT_FALLBACK_ARCHIVE_URL).toBe(READER);
   expect(RETIRED_FALLBACK_ARCHIVE_URLS).toEqual([
-    { url: RETIRED, version: 2 },
-    { url: INTERMEDIATE, version: 2 },
+    { url: RETIRED, version: 1 },
+    { url: INTERMEDIATE, version: 1 },
     { url: PREVIOUS_READER, version: 2 },
   ]);
   expect(FALLBACK_ARCHIVE_MIGRATION_VERSION).toBe(2);
@@ -95,7 +95,13 @@ test("retired defaults migrate once and every other fallback stays", () => {
     changed: true,
     recordVersion: true,
   });
-  expect(migrateFallbackArchiveUrl(RETIRED, 1)).toEqual({ url: READER, changed: true, recordVersion: true });
+  // Version 1 already retired boxj and dell-plx. Choosing either after that is kept.
+  expect(migrateFallbackArchiveUrl(RETIRED, 1)).toEqual({ url: RETIRED, changed: false, recordVersion: true });
+  expect(migrateFallbackArchiveUrl(INTERMEDIATE, 1)).toEqual({
+    url: INTERMEDIATE,
+    changed: false,
+    recordVersion: true,
+  });
   expect(migrateFallbackArchiveUrl(RETIRED, FALLBACK_ARCHIVE_MIGRATION_VERSION)).toEqual({
     url: RETIRED,
     changed: false,
@@ -187,6 +193,23 @@ test("near-misses, an empty address, and a missing address are not rewritten", a
   expect(store.get(KEYS.fallbackArchiveUrl)).toBe(READER);
   expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
   expect(writes).toBe(1);
+
+  for (const chosen of [RETIRED, INTERMEDIATE]) {
+    store.clear();
+    writes = 0;
+    store.set(KEYS.fallbackArchiveUrl, chosen);
+    store.set(KEYS.fallbackArchiveMigrated, 1);
+    const explicit = await loadSettings();
+    expect(explicit.fallbackArchiveUrl).toBe(chosen);
+    expect(store.get(KEYS.fallbackArchiveUrl)).toBe(chosen);
+    expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+    expect(writes).toBe(1);
+
+    writes = 0;
+    const stayed = await loadSettings();
+    expect(stayed.fallbackArchiveUrl).toBe(chosen);
+    expect(writes).toBe(0);
+  }
 
   writes = 0;
   store.set(KEYS.fallbackArchiveUrl, PREVIOUS_READER);

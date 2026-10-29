@@ -1,5 +1,5 @@
 export const HOUR_MS = 60 * 60 * 1000;
-/** A refresh asks the Mac to rebuild when the page is this old, or the refetch changed nothing. */
+/** A refresh asks the Mac to rebuild when the page is at least this old. A fresh page does not. */
 export const TODAY_REBUILD_AFTER_MS = HOUR_MS;
 /** Always tell the reader when the page they are looking at is older than this. */
 export const TODAY_OLD_AFTER_MS = 12 * HOUR_MS;
@@ -7,6 +7,8 @@ export const TODAY_POLL_MS = 20_000;
 export const TODAY_POLL_LIMIT_MS = 10 * 60 * 1000;
 
 export const ASKED_MAC = "Asked your Mac to rebuild. It runs when Chrome is open on the Mac.";
+export const REBUILD_WAIT_TIMED_OUT = "No new page arrived. Your Mac builds when Chrome is open.";
+export const REBUILD_EXPIRED = "The last rebuild request expired before a new page arrived.";
 
 const builtFormat = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -43,6 +45,13 @@ export function upToDateLabel(timestamp: string, now: number): string {
   return clock ? `Up to date. Built ${clock} (${age})` : `Up to date. Built on your Mac (${age})`;
 }
 
+/** Cooldown copy: the server already fulfilled a request and does not want another yet. */
+export function cooldownLabel(timestamp: string, now: number): string {
+  const at = Date.parse(timestamp);
+  const age = Number.isFinite(at) ? agePhrase(now - at) : "some time ago";
+  return `Built ${age}, up to date`;
+}
+
 /** A note for a page older than ~12h, including when the reader last copied it. */
 export function oldPageNote(timestamp: string, syncedAt: string | undefined, now: number): string | null {
   const built = Date.parse(timestamp);
@@ -50,27 +59,34 @@ export function oldPageNote(timestamp: string, syncedAt: string | undefined, now
   let note = `This page is ${ageAmount(now - built)} old`;
   if (syncedAt) {
     const synced = Date.parse(syncedAt);
-    if (Number.isFinite(synced)) note += `. synced ${agePhrase(now - synced)}`;
+    if (Number.isFinite(synced)) note += `. Synced ${agePhrase(now - synced)}`;
   }
   return note;
 }
 
-/**
- * Refresh asks for a rebuild when the page that came back is at least ~1h old,
- * or when its timestamp did not move.
- */
-export function shouldAskRebuild(previousTimestamp: string | null, nextTimestamp: string, now: number): boolean {
-  if (previousTimestamp !== null && previousTimestamp === nextTimestamp) return true;
-  const next = Date.parse(nextTimestamp);
-  if (!Number.isFinite(next)) return true;
-  return now - next >= TODAY_REBUILD_AFTER_MS;
+/** True when the page is under about an hour old, so a refresh should not ask for a rebuild. */
+export function isFreshPage(timestamp: string, now: number): boolean {
+  const at = Date.parse(timestamp);
+  return Number.isFinite(at) && now - at < TODAY_REBUILD_AFTER_MS;
 }
 
-/** True when `next` is a later build than `previous`. */
+/**
+ * Refresh asks for a rebuild only when the page is at least ~1h old.
+ * A fresh page, including one whose timestamp did not move, does not ask.
+ * The server cooldown is what suppresses a second ask after a recent rebuild.
+ */
+export function shouldAskRebuild(timestamp: string, now: number): boolean {
+  const at = Date.parse(timestamp);
+  if (!Number.isFinite(at)) return false;
+  return now - at >= TODAY_REBUILD_AFTER_MS;
+}
+
+/**
+ * True only when both timestamps parse and `next` is strictly later.
+ * An equal instant, a new `synced_at`, or an unparseable value is not an update.
+ */
 export function timestampAdvanced(previous: string, next: string): boolean {
   const before = Date.parse(previous);
   const after = Date.parse(next);
-  if (!Number.isFinite(after)) return false;
-  if (!Number.isFinite(before)) return true;
-  return after > before;
+  return Number.isFinite(before) && Number.isFinite(after) && after > before;
 }

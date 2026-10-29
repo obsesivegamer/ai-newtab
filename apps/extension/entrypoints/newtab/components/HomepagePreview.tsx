@@ -14,16 +14,20 @@ const INDEX_HTML = `<!DOCTYPE html>
 <style>html,body{margin:0;padding:0}</style></head>
 <body><div id="root"></div></body></html>`;
 
-/**
- * Sandpack calls `crypto.subtle` inside its frame, which only exists in a secure
- * context. Callers still check before mounting this; this refuses too, so a plain
- * HTTP page cannot mount a blank frame.
- */
-export class HomepagePreviewBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
+type BoundaryProps = { children: ReactNode; resetKey?: string };
+type BoundaryState = { failed: boolean };
 
-  static getDerivedStateFromError(): { failed: boolean } {
+export class HomepagePreviewBoundary extends Component<BoundaryProps, BoundaryState> {
+  state: BoundaryState = { failed: false };
+
+  static getDerivedStateFromError(): BoundaryState {
     return { failed: true };
+  }
+
+  componentDidUpdate(prev: BoundaryProps) {
+    if (this.state.failed && prev.resetKey !== this.props.resetKey) {
+      this.setState({ failed: false });
+    }
   }
 
   render() {
@@ -41,6 +45,9 @@ export class HomepagePreviewBoundary extends Component<{ children: ReactNode }, 
 /**
  * Renders the agent's component in a Sandpack iframe. The code is
  * model-generated, so it runs sandboxed rather than in the extension's own page.
+ * Sandpack calls `crypto.subtle` inside its frame, which only exists in a secure
+ * context. Callers still check before mounting this; this refuses too, so a plain
+ * HTTP page cannot mount a blank frame.
  */
 export function HomepagePreview({ code }: { code: string }) {
   if (!canShowHomepagePreview()) return null;
@@ -52,7 +59,7 @@ export function HomepagePreview({ code }: { code: string }) {
   };
 
   return (
-    <HomepagePreviewBoundary>
+    <HomepagePreviewBoundary resetKey={code}>
       <SandpackProvider files={files} template="react" options={{ autorun: true }}>
         <SandpackLayout style={{ height: "100vh", width: "100vw", border: 0, borderRadius: 0 }}>
           <SandpackPreview style={{ height: "100%" }} showOpenInCodeSandbox={false} showRefreshButton={false} />

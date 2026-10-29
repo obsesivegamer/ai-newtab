@@ -1,6 +1,7 @@
 import { anySignal, normalizeArchiveUrl, type FeedSource } from "@homepage/agent-core";
 import { IS_WEB } from "@/lib/platform";
 import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
+import { parseRebuildRequest, type RebuildRequest } from "./rebuild-request";
 import { saveSources } from "./sources";
 import { KEYS } from "./storage";
 
@@ -37,16 +38,18 @@ export type HomepageFetch =
   | { status: "unsupported" }
   | { status: "error"; message: string };
 
-export interface RemoteSources {
-  sources: FeedSource[];
-  /** Amber's `updated_at` for this list, when it gave one. */
-  updatedAt: string | null;
-}
+export type RemoteSourcesResult =
+  | { status: "list"; sources: FeedSource[]; updatedAt: string | null; readOnly: boolean }
+  /** The reader refuses source edits and did not return a list (HTTP 405). */
+  | { status: "read_only" }
+  | { status: "unavailable" };
 
 export type SourcesPublish =
   | { status: "ok" }
   /** Amber held a newer list: it has been adopted into storage (list and stamp) and is returned here. */
   | { status: "conflict"; sources: FeedSource[] }
+  /** The reader refused the write. `sources` is the list it returned, when it returned one. */
+  | { status: "read_only"; sources?: FeedSource[] }
   | { status: "skipped" | "failed" };
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -172,8 +175,10 @@ function sameOrigin(a: string, b: string): boolean {
 
 /**
  * Publish the finished page to the offline reader as well, so a phone on that
- * host sees it without waiting for the hourly copy. Best-effort: a failure is
- * logged and never thrown. The reader password is attached only when this
+ * host sees it without waiting for the hourly copy. The timestamp is sent whole,
+ * milliseconds included. An equal timestamp is accepted; an older one is 409 and
+ * one more than 24h ahead is 422. Best-effort: a failure is logged and never
+ * thrown. The reader password is attached only when this
  * request's origin is the reader and not the Mac. No-op without a shareable
  * reader address and a password, and when the reader is the Mac itself.
  */
@@ -221,12 +226,17 @@ export async function publishBuiltHomepage(
   ]);
 }
 
-export type RebuildPost = { status: "ok"; requestedAt: string } | { status: "missing" } | { status: "error" };
+export type RebuildPost =
+  | { status: "ok"; request: RebuildRequest }
+  | { status: "missing" }
+  | { status: "error" };
 
 /**
  * Ask the reader to record a rebuild request for the Mac. The phone is served
- * by that reader, so this sends the session cookie and no Basic header. A 404
- * means this Amber has no such route.
+ * by that reader, so this sends the session cookie and no Basic header. The
+ * body is `{}` with `Content-Type: application/json`. A 404 means this Amber
+ * has no such route. A cooldown or expired object is still `"ok"`: the caller
+ * decides whether it asked for new work.
  */
 export async function requestHomepageRebuild(origin: string, signal?: AbortSignal): Promise<RebuildPost> {
   const base = normalizeArchiveUrl(origin);
@@ -242,9 +252,8 @@ export async function requestHomepageRebuild(origin: string, signal?: AbortSigna
     });
     if (response.status === 404) return { status: "missing" };
     if (!response.ok) return { status: "error" };
-    const body = (await response.json().catch(() => null)) as { requested_at?: unknown } | null;
-    const requestedAt = body?.requested_at;
-    return { status: "ok", requestedAt: typeof requestedAt === "string" && requestedAt ? requestedAt : "" };
+    const request = parseRebuildRequest(await response.json().catch(() => null));
+    return request ? { status: "ok", request } : { status: "error" };
   } catch {
     return { status: "error" };
   }
@@ -280,7 +289,15 @@ export async function publishSources(
       keepalive: opts.keepalive || undefined,
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-    const body = (await response.json().catch(() => null)) as { sources?: unknown; updated_at?: unknown } | null;
+    const body = (await response.json().catch(() => null)) as {
+      sources?: unknown;
+      updated_at?: unknown;
+      read_only?: unknown;
+    } | null;
+    if (response.status === 405) {
+      const theirs = cleanSources(body?.sources);
+      return theirs ? { status: "read_only", sources: theirs } : { status: "read_only" };
+    }
     if (response.ok) {
       amberHasNoSources = false;
       await saveSourcesStamp(typeof body?.updated_at === "string" ? body.updated_at : null);
@@ -336,24 +353,44 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
   return { status: "ok", homepage };
 }
 
-/** The sources list stored in Amber (with its stamp), or null when there is none or it can't be read. */
-export async function fetchRemoteSources(base: string, signal?: AbortSignal): Promise<RemoteSources | null> {
+/**
+ * The sources list stored in Amber (with its stamp). `"read_only"` is a 405, or a
+ * list the reader marked `read_only` without a usable catalog. `"unavailable"` is
+ * a missing route, a failed read, or a server that has no list yet.
+ */
+export async function fetchRemoteSources(base: string, signal?: AbortSignal): Promise<RemoteSourcesResult> {
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
     const response = await fetch(`${base}/api/sources`, {
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
-    if (response.status === 404) amberHasNoSources = true;
-    if (!response.ok) return null;
+    if (response.status === 404) {
+      amberHasNoSources = true;
+      return { status: "unavailable" };
+    }
+    const body = (await response.json().catch(() => null)) as {
+      sources?: unknown;
+      updated_at?: unknown;
+      read_only?: unknown;
+    } | null;
+    if (response.status === 405) {
+      const sources = cleanSources(body?.sources);
+      const updatedAt = typeof body?.updated_at === "string" && body.updated_at ? body.updated_at : null;
+      if (sources && (sources.length > 0 || updatedAt)) {
+        return { status: "list", sources, updatedAt, readOnly: true };
+      }
+      return { status: "read_only" };
+    }
+    if (!response.ok) return { status: "unavailable" };
     amberHasNoSources = false;
-    const body = (await response.json()) as { sources?: unknown; updated_at?: unknown } | null;
+    const readOnly = body?.read_only === true;
     const sources = cleanSources(body?.sources);
-    if (!sources) return null;
+    if (!sources) return readOnly ? { status: "read_only" } : { status: "unavailable" };
     const updatedAt = typeof body?.updated_at === "string" && body.updated_at ? body.updated_at : null;
     // An empty list counts only when someone saved it (updated_at set); a fresh Amber has neither.
-    if (sources.length === 0 && !updatedAt) return null;
-    return { sources, updatedAt };
+    if (sources.length === 0 && !updatedAt) return readOnly ? { status: "read_only" } : { status: "unavailable" };
+    return { status: "list", sources, updatedAt, readOnly };
   } catch {
-    return null;
+    return { status: "unavailable" };
   }
 }

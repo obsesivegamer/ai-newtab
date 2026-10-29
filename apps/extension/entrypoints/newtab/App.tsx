@@ -340,6 +340,12 @@ export default function App() {
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </header>
 
+        {state.notice && (
+          <div className="banner banner-row banner-slim" role="alert">
+            <span className="banner-text">{state.notice}</span>
+          </div>
+        )}
+
         {showTodayError && view !== "today" && (
           <div className="banner error banner-row banner-slim" role="alert">
             <span className="banner-text">

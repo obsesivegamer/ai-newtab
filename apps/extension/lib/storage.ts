@@ -41,6 +41,10 @@ export const KEYS = {
   autoRebuild: "autoRebuild",
   /** ISO timestamp of the last auto-build *attempted* (success or not). */
   lastAutoBuildAttempt: "lastAutoBuildAttempt",
+  /** Rebuild-request ids this profile already started or claimed, oldest first. */
+  handledRebuildRequestIds: "handledRebuildRequestIds",
+  /** Fingerprint of the reader password the reader last rejected. Polling waits until the password changes. */
+  readerAuthRejected: "readerAuthRejected",
   rebuildIntervalHours: "autoRebuildIntervalHours",
   /** Throttled mirror of the live build state, for tabs that open while the worker sleeps. */
   buildSnapshot: "buildSnapshot",

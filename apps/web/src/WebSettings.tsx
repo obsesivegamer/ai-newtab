@@ -6,9 +6,12 @@ import type { Theme } from "@newtab/uiPrefs";
 import {
   flushSourcePush,
   holdRemoteRefresh,
+  onSourcesAccess,
   onSourcesAdopted,
   refreshRemoteSources,
   saveAndPushSources,
+  sourcesAreReadOnly,
+  type SourcesAccess,
 } from "./sync";
 
 type Check = { state: "idle" } | { state: "testing" } | { state: "ok"; message: string } | { state: "error"; message: string };
@@ -31,16 +34,22 @@ export function WebSettings({
   onClose: (changed: boolean) => void;
 }) {
   const [sources, setSources] = useState<FeedSource[] | null>(null);
+  const [access, setAccess] = useState<SourcesAccess>(sourcesAreReadOnly() ? "read_only" : "pending");
   const [error, setError] = useState<string | null>(null);
   const [feedInput, setFeedInput] = useState("");
   const [check, setCheck] = useState<Check>({ state: "idle" });
   const changed = useRef(false);
   const alive = useRef(true);
+  const accessRef = useRef(access);
+  accessRef.current = access;
+  /** The list before this sheet's edits, so a refused write can be shown again. */
+  const baseline = useRef<FeedSource[] | null>(null);
   /** The list as it is now. Async work (a probe, a re-seed) reads it when it finishes, never a copy from when it began. */
   const latest = useRef<FeedSource[] | null>(null);
 
-  const show = (list: FeedSource[]) => {
+  const show = (list: FeedSource[], fromUser = false) => {
     latest.current = list;
+    if (!fromUser) baseline.current = list;
     setSources(list);
   };
 
@@ -55,11 +64,20 @@ export function WebSettings({
       },
     );
     // The Mac may have changed the list since this page last looked: take Amber's, if it differs.
-    void refreshRemoteSources(origin);
+    void refreshRemoteSources(origin).then((next) => {
+      if (!alive.current) return;
+      setAccess(next === "unknown" ? "writable" : next);
+    });
     const stop = onSourcesAdopted((list) => alive.current && show(list));
+    const stopAccess = onSourcesAccess((next) => {
+      if (!alive.current) return;
+      setAccess(next);
+      if (next === "read_only" && baseline.current) show(baseline.current);
+    });
     return () => {
       alive.current = false;
       stop();
+      stopAccess();
     };
   }, [origin]);
 
@@ -75,9 +93,10 @@ export function WebSettings({
   };
 
   const edit = (change: (current: FeedSource[]) => FeedSource[]) => {
+    if (accessRef.current !== "writable") return;
     const next = change(latest.current ?? []);
     changed.current = true;
-    show(next);
+    show(next, true);
     void saveAndPushSources(origin, next);
   };
 
@@ -127,6 +146,8 @@ export function WebSettings({
   };
 
   const status = check.state === "ok" ? "ok" : check.state === "error" ? "error" : "";
+  const readOnly = access === "read_only";
+  const canEdit = access === "writable";
 
   return (
     <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && close()}>
@@ -160,15 +181,22 @@ export function WebSettings({
           <section className="set">
             <h3 className="set-title">Sources</h3>
             <p id="sources-help" className="set-hint">
-              The publications Latest reads, from their public feeds. Changes save as you make them
-              and are shared with the extension on your Mac.
+              {readOnly
+                ? "This reader only displays sources. Edits are made on your Mac."
+                : "The publications Latest reads, from their public feeds. Changes save as you make them and are shared with the extension on your Mac."}
             </p>
             {sources === null ? (
               <p className="src-empty" role="status">
                 Loading your sources…
               </p>
             ) : sources.length === 0 ? (
-              <p className="src-empty">No sources yet. Add a feed below, or re-seed from your archive.</p>
+              <p className="src-empty">
+                {readOnly
+                  ? "No sources yet. Add them on your Mac."
+                  : canEdit
+                    ? "No sources yet. Add a feed below, or re-seed from your archive."
+                    : "Loading your sources…"}
+              </p>
             ) : (
               <ul className="src-list" aria-describedby="sources-help">
                 {sources.map((s) => (
@@ -192,6 +220,7 @@ export function WebSettings({
                       type="checkbox"
                       className="switch"
                       checked={s.enabled}
+                      disabled={!canEdit}
                       aria-label={`Include ${s.name}`}
                       onChange={(e) =>
                         edit((current) =>
@@ -199,64 +228,70 @@ export function WebSettings({
                         )
                       }
                     />
-                    <button
-                      type="button"
-                      className="ghost-btn small"
-                      aria-label={`Remove ${s.name}`}
-                      onClick={() => edit((current) => current.filter((x) => x.id !== s.id))}
-                    >
-                      Remove
-                    </button>
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="ghost-btn small"
+                        aria-label={`Remove ${s.name}`}
+                        onClick={() => edit((current) => current.filter((x) => x.id !== s.id))}
+                      >
+                        Remove
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>
             )}
             {error && <p className="set-status error src-note">{error}</p>}
-            <div className="src-add">
-              <input
-                type="url"
-                inputMode="url"
-                autoCapitalize="off"
-                autoCorrect="off"
-                className="field mono"
-                value={feedInput}
-                disabled={sources === null}
-                onChange={(e) => {
-                  setFeedInput(e.target.value);
-                  if (check.state !== "testing") setCheck({ state: "idle" });
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void add();
-                  }
-                }}
-                placeholder="https://example.com/feed.xml"
-                aria-label="Feed address to add"
-                spellCheck={false}
-              />
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={() => void add()}
-                disabled={sources === null || feedInput.trim() === "" || check.state === "testing"}
-              >
-                Add
-              </button>
-            </div>
-            <div className="set-test">
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={() => void reseed()}
-                disabled={sources === null || check.state === "testing"}
-              >
-                {check.state === "testing" ? "Working…" : "Re-seed from my archive"}
-              </button>
-              <span role="status" className={`set-status ${status}`}>
-                {check.state === "ok" || check.state === "error" ? check.message : ""}
-              </span>
-            </div>
+            {canEdit && (
+              <>
+                <div className="src-add">
+                  <input
+                    type="url"
+                    inputMode="url"
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    className="field mono"
+                    value={feedInput}
+                    disabled={sources === null}
+                    onChange={(e) => {
+                      setFeedInput(e.target.value);
+                      if (check.state !== "testing") setCheck({ state: "idle" });
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void add();
+                      }
+                    }}
+                    placeholder="https://example.com/feed.xml"
+                    aria-label="Feed address to add"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => void add()}
+                    disabled={sources === null || feedInput.trim() === "" || check.state === "testing"}
+                  >
+                    Add
+                  </button>
+                </div>
+                <div className="set-test">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => void reseed()}
+                    disabled={sources === null || check.state === "testing"}
+                  >
+                    {check.state === "testing" ? "Working…" : "Re-seed from my archive"}
+                  </button>
+                  <span role="status" className={`set-status ${status}`}>
+                    {check.state === "ok" || check.state === "error" ? check.message : ""}
+                  </span>
+                </div>
+              </>
+            )}
           </section>
 
           <section className="set">

@@ -295,9 +295,9 @@ is best-effort and never blocks a build or a settings save):
 
 | Endpoint | Written by | Read by | Shape |
 |---|---|---|---|
-| `PUT /api/homepage` | the worker, after each successful build, when the archive address is a shareable host (`pushHomepage`), and again to the fallback reader with Basic `amber` (`pushReaderHomepage`; a failure there does not affect the Mac push) | web Today (`GET`, which may include `synced_at`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`). The reader rejects a PUT older than what it holds. |
-| `POST`/`GET /api/homepage/rebuild-request` | the phone POSTs on Refresh when the page is at least ~1h old or the refetch did not change; the worker GETs about once a minute when a reader address and password are set | the worker starts a build when `requested_at` is newer than the last build and the last attempt | `{ requested_at, id, fulfilled_at }`. A 404 hides the feature. The phone then polls `GET /api/homepage` about every 20s for about 10 min and swaps the page when `timestamp` advances. |
-| `PUT /api/sources` | Settings → Sources → Save in the extension (or a change to the blocked-sites list), when the archive address is a shareable host; the web Settings on every edit, debounced 800 ms (`publishSources`) | web on load, when Settings opens and when the page is shown again; the extension when its Settings opens (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }], if_updated_at? }`, answered with `{ count, updated_at }` |
+| `PUT /api/homepage` | the worker, after each successful build, when the archive address is a shareable host (`pushHomepage`), and again to the fallback reader with Basic `amber` (`pushReaderHomepage`; a failure there does not affect the Mac push) | web Today (`GET`, which may include `synced_at`) | `{ code, timestamp }` (the raw TSX, milliseconds kept). The reader accepts an equal timestamp, rejects an older one with 409, and rejects one more than 24h ahead with 422. |
+| `POST`/`GET /api/homepage/rebuild-request` | the phone POSTs `{}` with `Content-Type: application/json` on Refresh only when the page is at least ~1h old. The worker GETs about once a minute when a reader address, password, API key, and auto-rebuild are all set. That GET times out in a few seconds and does not delay the scheduled rebuild. A 401 is shown once in the extension and polling waits until the password changes | one build per unseen `id` whose `fulfilled_at` is null, and not when `expired` or `cooldown` is set. Handled ids are remembered. The reader and Mac clocks are not compared | `{ requested_at, id, fulfilled_at, baseline_timestamp, expired?, cooldown? }`. The reader sets `fulfilled_at` itself when a page newer than the baseline arrives. POST within 10 min of a fulfilled request returns that object with `cooldown: true`. An open request under 15 min is reused. An unfulfilled request older than 15 min has `expired: true`. A 404 hides the feature. The phone polls `GET /api/homepage` about every 20s for about 10 min and swaps only when `timestamp` is strictly newer. |
+| `PUT /api/sources` | Settings → Sources → Save in the extension (or a change to the blocked-sites list), when the archive address is a shareable host; the web Settings on every edit, debounced 800 ms (`publishSources`) | web on load, when Settings opens and when the page is shown again; the extension when its Settings opens (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }], if_updated_at? }`, answered with `{ count, updated_at }`. `GET` on the reader includes `read_only: true` (a 405 means the same). The phone then shows the list without editing and says to change it on the Mac. |
 
 **Who may receive them.** Both pushes go through one check in `phone-sync.ts`
 (`isShareableArchiveHost`): the archive host must be loopback (`localhost`,
@@ -484,11 +484,11 @@ agent leads with it. The host supplies an `ArchiveBridge` (`types.ts`), passed t
 the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it).
 Reads try that Mac first, then the offline reader at `fallbackArchiveUrl`
 (default `https://dell-plx-reader.tailf9612a.ts.net`, empty turns failover off).
-A stored `http://boxj:8081`, `http://dell-plx:8081`, or `http://dell-plx-reader:8081`
-is rewritten once to the current default when the stored migration version is
-below the version that retires that exact address (currently version 2). The
-version is recorded, so choosing one of those addresses later is kept. Any other
-saved address stays, including an empty one. The harness builds an equivalent Mac bridge from `AMBER_URL`.
+A stored `http://boxj:8081` or `http://dell-plx:8081` is rewritten only when the
+stored migration version is below 1. A stored `http://dell-plx-reader:8081` is
+rewritten when the stored version is below 2. Version 2 does not rewrite any of
+them, so choosing an old address after it was retired is kept. Any other saved
+address stays, including an empty one. The harness builds an equivalent Mac bridge from `AMBER_URL`.
 Without a bridge the archive tools answer with an error result and the build runs on history alone.
 
 | Tool | Does |

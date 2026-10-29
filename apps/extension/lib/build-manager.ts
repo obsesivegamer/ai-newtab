@@ -15,7 +15,17 @@ import {
 } from "./protocol";
 import { publishBuiltHomepage } from "./phone-sync";
 import { fallbackBaseOf } from "./archive-auth";
-import { fetchRebuildRequest, rebuildTickAction, shouldPollRebuildRequest } from "./rebuild-request";
+import {
+  READER_AUTH_MESSAGE,
+  fetchRebuildRequest,
+  normalizeHandledRebuildIds,
+  passwordFingerprint,
+  readerAuthNotice,
+  readerAuthStillRejected,
+  rebuildTickAction,
+  rememberRebuildRequestId,
+  shouldPollRebuildRequest,
+} from "./rebuild-request";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -109,29 +119,33 @@ export class BuildManager {
       return;
     }
 
-    try {
-      if (await this.maybeRequestedRebuild()) return;
-    } catch (err) {
+    // The reader check has its own short timeout and must not hold up the schedule.
+    void this.maybeRequestedRebuild().catch((err) => {
       console.warn(
         "[BuildManager] rebuild request check failed",
         err instanceof Error ? err.message : "request failed",
       );
-    }
+    });
     await this.maybeAutoRebuild();
   }
 
   /**
-   * A phone refresh can ask the reader for a rebuild. Poll that at most once a
-   * minute, and only with a reader address and password. A newer request starts
-   * a build even when the schedule and the failure backoff would wait, and never
-   * while one is already running.
+   * A phone refresh can ask the reader for a rebuild. Ask at most once a minute,
+   * and only with a reader address, a password, an API key, and auto-rebuild on.
+   * One unseen id whose `fulfilled_at` is null starts one build. A wrong password
+   * is reported once, then left alone until the password changes.
    */
-  private async maybeRequestedRebuild(): Promise<boolean> {
+  private async maybeRequestedRebuild(): Promise<void> {
     const now = Date.now();
-    if (this.running) return false;
     const settings = await loadSettings();
     const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
     const configured = Boolean(reader && settings.readerPassword);
+    const [handledRaw, rejected] = await Promise.all([
+      extensionStore.get<unknown>(KEYS.handledRebuildRequestIds),
+      extensionStore.get<string>(KEYS.readerAuthRejected),
+    ]);
+    const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
+    const authRejected = readerAuthStillRejected(rejected, fingerprint);
     if (
       !reader ||
       !shouldPollRebuildRequest({
@@ -139,29 +153,37 @@ export class BuildManager {
         now,
         lastPollAt: this.lastRebuildPollAt,
         readerConfigured: configured,
+        hasApiKey: Boolean(settings.apiKey),
+        autoRebuild: settings.autoRebuild,
+        authRejected,
       })
     ) {
-      return false;
+      return;
     }
     this.lastRebuildPollAt = now;
     const request = await fetchRebuildRequest(reader, settings.readerPassword, settings.archiveUrl);
-    const [homepage, lastAttempt] = await Promise.all([
-      loadHomepage(),
-      extensionStore.get<string>(KEYS.lastAutoBuildAttempt),
-    ]);
-    if (
-      rebuildTickAction({
-        running: this.running,
-        request,
-        lastBuildTimestamp: homepage?.timestamp,
-        lastAttemptTimestamp: lastAttempt,
-      }) !== "start"
-    ) {
-      return false;
+    if (request.status === "unauthorized") {
+      const line = readerAuthNotice(authRejected);
+      if (line) {
+        await extensionStore.set(KEYS.readerAuthRejected, fingerprint);
+        console.warn(`[BuildManager] ${line}`);
+        this.onLog(line);
+        this.onNotice(line);
+      }
+      return;
     }
-    await extensionStore.set(KEYS.lastAutoBuildAttempt, new Date().toISOString());
-    void this.startBuild({ resume: false });
-    return true;
+    if (rejected && (request.status === "ready" || request.status === "none")) {
+      await extensionStore.remove(KEYS.readerAuthRejected);
+      if (this.state.notice === READER_AUTH_MESSAGE) this.onNotice(null);
+    }
+    const handled = normalizeHandledRebuildIds(handledRaw);
+    const action = rebuildTickAction({ running: this.running, request, handledIds: handled });
+    if (action === "skip" || request.status !== "ready") return;
+    await extensionStore.set(
+      KEYS.handledRebuildRequestIds,
+      rememberRebuildRequestId(handled, request.request.id),
+    );
+    if (action === "start") void this.startBuild({ resume: false });
   }
 
   /** Whether opening the day's first tab should already show a fresh homepage. */
@@ -239,7 +261,7 @@ export class BuildManager {
     }
 
     this.controller = new AbortController();
-    this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
+    this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup", notice: this.state.notice };
     this.broadcast({ kind: "snapshot", state: this.state });
     this.startKeepalive();
     console.log("[BuildManager] build started", { resume: Boolean(opts.resume) });
@@ -344,6 +366,12 @@ export class BuildManager {
     this.state = { ...this.state, logs: [...this.state.logs.slice(-LOG_RETENTION), line] };
     this.broadcast({ kind: "log", line });
     void this.mirror(false);
+  }
+
+  private onNotice(message: string | null) {
+    this.state = { ...this.state, notice: message };
+    this.broadcast({ kind: "notice", message });
+    void this.mirror(true);
   }
 
   // ---- storage mirror ------------------------------------------------------

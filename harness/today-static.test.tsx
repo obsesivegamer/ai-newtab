@@ -6,7 +6,13 @@ import { HomepagePreviewBoundary } from "../apps/extension/entrypoints/newtab/co
 import { canShowHomepagePreview } from "../apps/extension/entrypoints/newtab/components/homepagePreviewGate";
 import { DEFAULT_FALLBACK_ARCHIVE_URL } from "../apps/extension/lib/archive-auth";
 import { TodayStatic } from "../apps/web/src/TodayStatic";
-import { ASKED_MAC, TODAY_POLL_MS } from "../apps/web/src/todayStatus";
+import {
+  ASKED_MAC,
+  REBUILD_WAIT_TIMED_OUT,
+  TODAY_POLL_LIMIT_MS,
+  TODAY_POLL_MS,
+  timestampAdvanced,
+} from "../apps/web/src/todayStatus";
 
 const ORIGIN = "http://dell-plx-reader:8081";
 const HOUR = 60 * 60 * 1000;
@@ -16,12 +22,14 @@ interface Seen {
   method: string;
   authorization: string | null;
   credentials: RequestCredentials | undefined;
+  contentType: string | null;
   body?: string;
 }
 
 let seen: Seen[] = [];
 let homepage: { code: string; timestamp: string; synced_at?: string };
 let rebuildStatus = 200;
+let rebuildBody: Record<string, unknown> | undefined;
 let holdHomepage: Promise<void> | null = null;
 let releaseHomepage: (() => void) | undefined;
 let restoreFetch: (() => void) | undefined;
@@ -34,6 +42,7 @@ afterEach(() => {
   restoreDom = undefined;
   holdHomepage = null;
   releaseHomepage = undefined;
+  rebuildBody = undefined;
   jest.useRealTimers();
 });
 
@@ -54,10 +63,14 @@ function installFetch() {
       method: init?.method ?? "GET",
       authorization: new Headers(init?.headers).get("authorization"),
       credentials: init?.credentials,
+      contentType: new Headers(init?.headers).get("content-type"),
       body: typeof init?.body === "string" ? init.body : undefined,
     });
     if (url.endsWith("/api/homepage/rebuild-request")) {
-      return json(rebuildStatus, { requested_at: new Date().toISOString(), id: "r1", fulfilled_at: null });
+      return json(
+        rebuildStatus,
+        rebuildBody ?? { requested_at: new Date().toISOString(), id: "r1", fulfilled_at: null },
+      );
     }
     if (holdHomepage) await holdHomepage;
     return json(200, homepage);
@@ -160,8 +173,9 @@ test("an insecure Today page links to the HTTPS reader instead of mounting a fra
   installDom(false);
   const view = await render(<TodayStatic origin={ORIGIN} active />);
   expect(view.host.textContent).toContain("Today needs HTTPS.");
-  expect(view.host.querySelector("a")?.getAttribute("href")).toBe(DEFAULT_FALLBACK_ARCHIVE_URL);
-  expect(view.host.textContent).toContain("This page is 13h old. synced 2h ago");
+  expect(view.host.querySelector("a")?.getAttribute("href")).toBe(`${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`);
+  expect(view.host.textContent).toContain("This page is 13h old. Synced 2h ago");
+  expect(view.host.textContent).not.toContain("Up to date");
   expect(view.host.querySelector("iframe")).toBeNull();
   view.unmount();
 });
@@ -183,7 +197,48 @@ test("the preview error boundary replaces a frame that throws", async () => {
   view.unmount();
 });
 
-test("Refresh reports checking, then up to date, and asks the Mac when nothing changed", async () => {
+test("the preview error boundary recovers when the page changes", async () => {
+  installDom(true);
+  const previous = console.error;
+  console.error = () => {};
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  function Frame({ boom }: { boom: boolean }) {
+    if (boom) throw new Error("frame failed");
+    return <p>Shown</p>;
+  }
+  await act(async () => {
+    root.render(
+      <HomepagePreviewBoundary resetKey="a">
+        <Frame boom />
+      </HomepagePreviewBoundary>,
+    );
+  });
+  expect(host.textContent).toContain("The preview hit an error on this page.");
+  await act(async () => {
+    root.render(
+      <HomepagePreviewBoundary resetKey="b">
+        <Frame boom={false} />
+      </HomepagePreviewBoundary>,
+    );
+  });
+  await flush();
+  expect(host.textContent).toContain("Shown");
+  console.error = previous;
+  act(() => root.unmount());
+});
+
+test("Updated is only a strictly newer timestamp", () => {
+  const same = "2026-10-29T15:00:00.000Z";
+  expect(timestampAdvanced(same, same)).toBe(false);
+  expect(timestampAdvanced(same, "2026-10-29T15:00:00Z")).toBe(false);
+  expect(timestampAdvanced("", same)).toBe(false);
+  expect(timestampAdvanced(same, "not-a-time")).toBe(false);
+  expect(timestampAdvanced(same, "2026-10-29T15:00:01.000Z")).toBe(true);
+});
+
+test("Refresh on a fresh page says it is up to date and does not ask the Mac", async () => {
   jest.useFakeTimers();
   const now = Date.now();
   const timestamp = new Date(now - 30 * 60_000).toISOString();
@@ -207,18 +262,132 @@ test("Refresh reports checking, then up to date, and asks the Mac when nothing c
   releaseHomepage?.();
   await flush();
   expect(view.host.textContent).toContain("Up to date. Built");
-  expect(view.host.textContent).toContain(ASKED_MAC);
+  expect(view.host.textContent).not.toContain("Updated");
+  expect(view.host.textContent).not.toContain(ASKED_MAC);
   expect((button as HTMLButtonElement).disabled).toBe(false);
+  expect(seen.filter((call) => call.method === "POST")).toHaveLength(0);
+  view.unmount();
+});
+
+test("a stale refresh asks the Mac, then says Updated only when a newer page arrives", async () => {
+  jest.useFakeTimers();
+  const now = Date.now();
+  const timestamp = new Date(now - 2 * HOUR).toISOString();
+  homepage = { code: "export default function App(){ return <p>Old</p> }", timestamp };
+  rebuildStatus = 200;
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  const button = view.host.querySelector("button");
+  await act(async () => {
+    button?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  expect(view.host.textContent).toContain(ASKED_MAC);
+  expect(view.host.textContent).not.toContain("Up to date");
+  expect(view.host.textContent).not.toContain("Updated");
   const posted = seen.filter((call) => call.method === "POST");
   expect(posted).toHaveLength(1);
   expect(posted[0].url).toBe(`${ORIGIN}/api/homepage/rebuild-request`);
   expect(posted[0].authorization).toBeNull();
   expect(posted[0].credentials).toBe("same-origin");
+  expect(posted[0].contentType).toBe("application/json");
   expect(posted[0].body).toBe("{}");
 
-  homepage = { ...homepage, code: "export default function App(){ return <p>New</p> }", timestamp: new Date(Date.now() + 1000).toISOString() };
+  homepage = {
+    ...homepage,
+    code: "export default function App(){ return <p>New</p> }",
+    timestamp: new Date(Date.parse(timestamp) + 1000).toISOString(),
+  };
   await act(async () => {
     jest.advanceTimersByTime(TODAY_POLL_MS);
+  });
+  await flush();
+  expect(view.host.textContent).toContain("Updated");
+  expect(view.host.textContent).not.toContain(ASKED_MAC);
+  view.unmount();
+});
+
+test("a cooldown response says the page is up to date and does not ask the Mac", async () => {
+  const timestamp = new Date(Date.now() - 2 * HOUR).toISOString();
+  homepage = { code: "export default function App(){ return <p>Old</p> }", timestamp };
+  rebuildBody = {
+    requested_at: new Date().toISOString(),
+    id: "req-cool",
+    fulfilled_at: timestamp,
+    baseline_timestamp: timestamp,
+    cooldown: true,
+  };
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  const button = view.host.querySelector("button");
+  await act(async () => {
+    button?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  expect(view.host.textContent).toContain("Built 2h ago, up to date");
+  expect(view.host.textContent).not.toContain(ASKED_MAC);
+  expect(view.host.textContent).not.toContain("Up to date");
+  expect(seen.filter((call) => call.method === "POST")).toHaveLength(1);
+  view.unmount();
+});
+
+test("the wait for a rebuild ends with a timeout instead of leaving the ask up", async () => {
+  jest.useFakeTimers();
+  homepage = {
+    code: "export default function App(){ return <p>Old</p> }",
+    timestamp: new Date(Date.now() - 2 * HOUR).toISOString(),
+  };
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  const button = view.host.querySelector("button");
+  await act(async () => {
+    button?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  expect(view.host.textContent).toContain(ASKED_MAC);
+
+  await act(async () => {
+    jest.advanceTimersByTime(TODAY_POLL_LIMIT_MS);
+  });
+  await flush();
+  expect(view.host.textContent).toContain(REBUILD_WAIT_TIMED_OUT);
+  expect(view.host.textContent).not.toContain(ASKED_MAC);
+  expect(view.host.textContent).not.toContain("Up to date");
+  view.unmount();
+});
+
+test("an hourly reload does not say Updated when only the sync time changed", async () => {
+  jest.useFakeTimers();
+  const timestamp = new Date(Date.now() - 30 * 60_000).toISOString();
+  homepage = {
+    code: "export default function App(){ return <p>Same</p> }",
+    timestamp,
+    synced_at: new Date(Date.now() - HOUR).toISOString(),
+  };
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  expect(view.host.textContent).not.toContain("Updated");
+
+  homepage = {
+    ...homepage,
+    code: "export default function App(){ return <p>Copied</p> }",
+    synced_at: new Date().toISOString(),
+  };
+  await act(async () => {
+    jest.advanceTimersByTime(6 * 60_000);
+    document.dispatchEvent(new window.Event("visibilitychange"));
+  });
+  await flush();
+  expect(view.host.textContent).not.toContain("Updated");
+
+  homepage = { ...homepage, timestamp: new Date(Date.parse(timestamp) + 1000).toISOString() };
+  await act(async () => {
+    jest.advanceTimersByTime(6 * 60_000);
+    document.dispatchEvent(new window.Event("visibilitychange"));
   });
   await flush();
   expect(view.host.textContent).toContain("Updated");
@@ -239,7 +408,7 @@ test("a missing rebuild endpoint stays hidden and is not asked again", async () 
     button?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   });
   await flush();
-  expect(view.host.textContent).toContain("Up to date. Built");
+  expect(view.host.textContent).not.toContain("Up to date");
   expect(view.host.textContent).not.toContain(ASKED_MAC);
   const firstPosts = seen.filter((call) => call.method === "POST").length;
   expect(firstPosts).toBe(1);
@@ -248,7 +417,7 @@ test("a missing rebuild endpoint stays hidden and is not asked again", async () 
     button?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   });
   await flush();
-  expect(view.host.textContent).toContain("Up to date. Built");
+  expect(view.host.textContent).not.toContain("Up to date");
   expect(seen.filter((call) => call.method === "POST")).toHaveLength(firstPosts);
   view.unmount();
 });

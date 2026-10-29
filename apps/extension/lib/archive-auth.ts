@@ -4,14 +4,15 @@ import { normalizeArchiveUrl } from "@homepage/agent-core";
 export const DEFAULT_FALLBACK_ARCHIVE_URL = "https://dell-plx-reader.tailf9612a.ts.net";
 
 /**
- * Exact retired defaults, and the migration version that rewrites each one.
- * `http://dell-plx:8081` and `http://dell-plx-reader:8081` were unreleased
- * intermediate defaults. A stored version below `version` still rewrites that
- * address; a later choice of it, after that version is stored, is kept.
+ * Exact retired defaults, and the migration version that first rewrites each one.
+ * `http://boxj:8081` and `http://dell-plx:8081` were retired by version 1, so a
+ * stored version of 1 keeps them: that is a later choice, not the old default.
+ * `http://dell-plx-reader:8081` was the version-1 default and is rewritten by
+ * version 2. After version 2 is stored, none of these are rewritten again.
  */
 export const RETIRED_FALLBACK_ARCHIVE_URLS = [
-  { url: "http://boxj:8081", version: 2 },
-  { url: "http://dell-plx:8081", version: 2 },
+  { url: "http://boxj:8081", version: 1 },
+  { url: "http://dell-plx:8081", version: 1 },
   { url: "http://dell-plx-reader:8081", version: 2 },
 ] as const;
 
@@ -28,10 +29,10 @@ export interface FallbackArchiveMigration {
 
 /**
  * The fallback address to use. Missing means the current default and is not a
- * stored change. Each retired address is rewritten once, when the stored
- * version is below the version that retires it. After the current version is
- * stored, those addresses stay, including when someone chooses one on purpose.
- * Any other value, including "" (failover off), stays.
+ * stored change. An address is rewritten only when it is one of the exact
+ * retired defaults and the stored version is still below the version that
+ * retires that address. A later choice of an older address is kept. Any other
+ * value, including "" (failover off) and near-misses, stays.
  */
 export function migrateFallbackArchiveUrl(
   stored: string | undefined,
