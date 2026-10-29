@@ -34,6 +34,7 @@ const LIST_PATH = "/api/snapshots?since_days=1&limit=1";
 interface Call {
   url: string;
   authorization: string | null;
+  redirect: RequestRedirect | undefined;
   signal: AbortSignal | undefined;
 }
 
@@ -107,7 +108,7 @@ function heldBody(status = 200): { response: Response; release: (body: unknown) 
   return { response, release: gate.resolve };
 }
 
-function hang(signal: AbortSignal | undefined): Promise<Response> {
+function hang(signal: AbortSignal | null | undefined): Promise<Response> {
   return new Promise((_resolve, reject) => {
     const fail = () => reject(new DOMException("The operation was aborted.", "AbortError"));
     if (!signal) return;
@@ -127,6 +128,7 @@ function install(handler: (url: string, init: RequestInit | undefined) => Promis
     calls.push({
       url,
       authorization: new Headers(init?.headers).get("authorization"),
+      redirect: init?.redirect,
       signal: init?.signal ?? undefined,
     });
     return handler(url, init);
@@ -139,7 +141,7 @@ function install(handler: (url: string, init: RequestInit | undefined) => Promis
   return calls;
 }
 
-function race(cache: OriginCache, fetchImpl: typeof fetch, path = LIST_PATH) {
+function race(cache: OriginCache, fetchImpl: typeof fetch, path = LIST_PATH, signal?: AbortSignal) {
   return raceArchiveJson({
     macBase: MAC,
     fallbackBase: BOX,
@@ -148,6 +150,7 @@ function race(cache: OriginCache, fetchImpl: typeof fetch, path = LIST_PATH) {
     timeoutMs: LIST_TIMEOUT_MS,
     cache,
     fetchImpl,
+    signal,
   });
 }
 
@@ -374,6 +377,7 @@ test("a late Mac answer refreshes the cache and leaves the list that already won
   await flush();
   jest.advanceTimersByTime(FALLBACK_DELAY_MS);
   const result = await pending;
+  const won = result.json;
   const shown = parseSnapshotList(result.base, result.json);
   expect(result.origin).toBe("fallback");
   expect(shown?.articles[0]).toMatchObject({ title: "From boxj", permalink: `${BOX}/Ab12Cd` });
@@ -382,10 +386,12 @@ test("a late Mac answer refreshes the cache and leaves the list that already won
   await flush();
   expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
   expect(cache.downUntil).toBeNull();
+  expect(result.json).toBe(won);
   expect(result.origin).toBe("fallback");
   expect(result.base).toBe(BOX);
   expect(parseSnapshotList(result.base, result.json)?.articles[0]?.title).toBe("From boxj");
   expect(calls.filter((call) => call.url.startsWith(MAC)).every((call) => call.authorization === null)).toBe(true);
+  expect(result.json).toBe(won);
 
   const beforeText = calls.length;
   const text = await loadReadingArticles({
@@ -458,4 +464,144 @@ test("when the Mac wins, the fallback already in flight is aborted", async () =>
   expect(calls[0]?.authorization).toBeNull();
   expect(calls[1]?.authorization).toBe(BASIC);
   expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
+});
+
+test("aborting after the Mac failed rejects while boxj is still in flight", async () => {
+  const caller = new AbortController();
+  const calls = install((url, init) => {
+    if (url.startsWith(MAC)) return Promise.reject(new TypeError("connection refused"));
+    return hang(init?.signal);
+  });
+  const cache = createOriginCache();
+  const pending = race(cache, globalThis.fetch, LIST_PATH, caller.signal);
+
+  await flush();
+  expect(calls.map((call) => new URL(call.url).origin)).toEqual([new URL(MAC).origin, new URL(BOX).origin]);
+  caller.abort();
+  await expect(pending).rejects.toThrow(/aborted/);
+  await flush();
+  // Settled by the cancel, not by boxj's own 10s limit.
+  expect(jest.getTimerCount()).toBe(0);
+});
+
+test("a boxj request refuses redirects so the password cannot follow one", async () => {
+  const calls = install((url) => {
+    if (url.startsWith(MAC)) return Promise.reject(new TypeError("connection refused"));
+    return jsonResponse(listBody("From boxj"));
+  });
+  const cache = createOriginCache();
+
+  await race(cache, globalThis.fetch);
+  expect(calls[0]).toMatchObject({ authorization: null, redirect: undefined });
+  expect(calls[1]).toMatchObject({ authorization: BASIC, redirect: "error" });
+});
+
+test("a late Mac answer does not swap the list already returned", async () => {
+  const mac = deferred<Response>();
+  install((url) => {
+    if (url.startsWith(MAC)) return mac.promise;
+    return jsonResponse(listBody("From boxj"));
+  });
+  const cache = createOriginCache();
+  const pending = loadReadingList({
+    macBase: MAC,
+    sinceDays: 1,
+    limit: 1,
+    auth: { macBase: MAC, fallbackBase: BOX, password: PASSWORD },
+    cache,
+    fetchImpl: globalThis.fetch,
+  });
+
+  await flush();
+  jest.advanceTimersByTime(FALLBACK_DELAY_MS);
+  const listed = await pending;
+  const articles = listed.articles;
+  expect(listed.originBase).toBe(BOX);
+  expect(articles[0]?.title).toBe("From boxj");
+  expect(articles[0]?.permalink).toBe(`${BOX}/Ab12Cd`);
+
+  mac.resolve(jsonResponse(listBody("From mac")));
+  await flush();
+  expect(listed.articles).toBe(articles);
+  expect(listed.originBase).toBe(BOX);
+  expect(listed.articles[0]?.title).toBe("From boxj");
+  expect(listed.articles[0]?.permalink).toBe(`${BOX}/Ab12Cd`);
+  expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
+  expect(cache.downUntil).toBeNull();
+});
+
+test("the two-minute Mac-up window expires back into a cold race", async () => {
+  let macHung = false;
+  const calls = install((url, init) => {
+    if (url.startsWith(MAC)) return macHung ? hang(init?.signal) : jsonResponse(listBody("From mac"));
+    return jsonResponse(listBody("From boxj"));
+  });
+  const cache = createOriginCache();
+
+  const first = await race(cache, globalThis.fetch);
+  expect(first.origin).toBe("mac");
+  expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
+
+  jest.advanceTimersByTime(MAC_UP_MS - 1);
+  calls.length = 0;
+  const during = await race(cache, globalThis.fetch);
+  expect(during.origin).toBe("mac");
+  expect(calls.map((call) => call.url)).toEqual([`${MAC}${LIST_PATH}`]);
+  // A Mac win inside the window starts it over.
+  expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
+
+  jest.advanceTimersByTime(MAC_UP_MS);
+  macHung = true;
+  calls.length = 0;
+  let settled = false;
+  const pending = race(cache, globalThis.fetch).then((result) => {
+    settled = true;
+    return result;
+  });
+  await flush();
+  expect(settled).toBe(false);
+  expect(calls.map((call) => call.url)).toEqual([`${MAC}${LIST_PATH}`]);
+  jest.advanceTimersByTime(FALLBACK_DELAY_MS - 1);
+  await flush();
+  expect(calls).toHaveLength(1);
+  expect(settled).toBe(false);
+  jest.advanceTimersByTime(1);
+  const after = await pending;
+  expect(after.origin).toBe("fallback");
+  expect(after.base).toBe(BOX);
+  expect(calls[1]?.url).toBe(`${BOX}${LIST_PATH}`);
+});
+
+test("the five-minute Mac-down window expires back into a cold race", async () => {
+  let macDown = true;
+  const calls = install((url) => {
+    if (url.startsWith(MAC)) {
+      return macDown ? Promise.reject(new TypeError("connection refused")) : jsonResponse(listBody("From mac"));
+    }
+    return jsonResponse(listBody("From boxj"));
+  });
+  const cache = createOriginCache();
+
+  const first = await race(cache, globalThis.fetch);
+  expect(first.origin).toBe("fallback");
+  const downUntil = cache.downUntil;
+  expect(downUntil).toBe(Date.now() + MAC_DOWN_MS);
+
+  jest.advanceTimersByTime(MAC_DOWN_MS - 1);
+  calls.length = 0;
+  const during = await race(cache, globalThis.fetch);
+  expect(during.origin).toBe("fallback");
+  expect(calls.map((call) => call.url)).toEqual([`${BOX}${LIST_PATH}`]);
+  // A boxj read does not extend the window.
+  expect(cache.downUntil).toBe(downUntil);
+
+  jest.advanceTimersByTime(1);
+  macDown = false;
+  calls.length = 0;
+  const after = await race(cache, globalThis.fetch);
+  expect(after.origin).toBe("mac");
+  expect(after.base).toBe(MAC);
+  expect(calls.map((call) => call.url)).toEqual([`${MAC}${LIST_PATH}`]);
+  expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
+  expect(cache.downUntil).toBeNull();
 });

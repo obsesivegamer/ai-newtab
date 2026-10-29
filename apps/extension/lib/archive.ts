@@ -5,7 +5,7 @@ import {
   type ArchiveArticleMeta,
   type ArchiveBridge,
 } from "@homepage/agent-core";
-import { archiveRequestHeaders, type ArchiveAuth } from "./archive-auth";
+import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 
 export const DEFAULT_ARCHIVE_URL = "http://127.0.0.1:8080";
 
@@ -149,11 +149,11 @@ export function parseSnapshotArticle(base: string, raw: unknown): ArchiveArticle
   return { ...toMeta(base, body as ApiText), text: body.text };
 }
 
-async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal, headers?: HeadersInit): Promise<T> {
+async function getJson<T>(url: string, timeoutMs: number, signal: AbortSignal | undefined, auth?: ArchiveAuth): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const response = await fetch(url, {
     signal: signal ? anySignal([timeout, signal]) : timeout,
-    ...(headers ? { headers } : {}),
+    ...archiveGetInit(url, auth),
   });
   if (!response.ok) throw new Error(`archive responded ${response.status} for ${url}`);
   return (await response.json()) as T;
@@ -183,12 +183,11 @@ export function createArchiveBridge(archiveUrl: string, auth?: ArchiveAuth): Can
     if (normalized === null) throw new Error("Invalid archive URL");
     return normalized;
   };
-  const headersFor = (url: string) => archiveRequestHeaders(url, auth);
   return {
     async listArticles({ sinceDays, limit }) {
       const base = need();
       const url = `${base}/api/snapshots?since_days=${sinceDays}&limit=${limit}`;
-      const list = await getJson<ApiList>(url, LIST_TIMEOUT_MS, undefined, headersFor(url));
+      const list = await getJson<ApiList>(url, LIST_TIMEOUT_MS, undefined, auth);
       return {
         totalUsable: list.total_usable,
         sources: list.sources,
@@ -204,7 +203,7 @@ export function createArchiveBridge(archiveUrl: string, auth?: ArchiveAuth): Can
         ids.map(async (id) => {
           try {
             const url = `${base}/api/snapshots/${encodeURIComponent(id)}/text`;
-            const body = await getJson<ApiText>(url, TEXT_TIMEOUT_MS, signal, headersFor(url));
+            const body = await getJson<ApiText>(url, TEXT_TIMEOUT_MS, signal, auth);
             articles.push({ ...toMeta(base, body), text: body.text });
           } catch (err) {
             failed.push({ id, reason: String(err) });
@@ -217,7 +216,7 @@ export function createArchiveBridge(archiveUrl: string, auth?: ArchiveAuth): Can
     async listCandidates({ signal } = {}) {
       const base = need();
       const url = `${base}/api/candidates`;
-      const list = await getJson<{ candidates?: ApiCandidate[] }>(url, LIST_TIMEOUT_MS, signal, headersFor(url));
+      const list = await getJson<{ candidates?: ApiCandidate[] }>(url, LIST_TIMEOUT_MS, signal, auth);
       if (!Array.isArray(list.candidates)) return [];
       return list.candidates.flatMap((row) => {
         const candidate = toCandidate(row);

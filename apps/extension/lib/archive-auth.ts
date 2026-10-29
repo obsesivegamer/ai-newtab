@@ -54,6 +54,16 @@ export function archiveRequestHeaders(url: string, auth: ArchiveAuth | undefined
   return new Headers({ Authorization: authorization });
 }
 
+/**
+ * Options for an archive GET. A request that carries the reader password refuses
+ * redirects, so the password cannot be sent on to another host.
+ */
+export function archiveGetInit(url: string, auth: ArchiveAuth | undefined): RequestInit {
+  const headers = archiveRequestHeaders(url, auth);
+  if (!headers) return {};
+  return { headers, redirect: "error" };
+}
+
 /** A cleaned fallback base, or null when it is off or not an address. */
 export function fallbackBaseOf(input: string | null | undefined): string | null {
   const text = input?.trim() ?? "";

@@ -1,5 +1,5 @@
 import { anySignal, normalizeArchiveUrl } from "@homepage/agent-core";
-import { archiveRequestHeaders, type ArchiveAuth } from "./archive-auth";
+import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 
 /** After a Mac win, later reads call only the Mac. */
 export const MAC_UP_MS = 2 * 60 * 1000;
@@ -76,7 +76,7 @@ async function runFetch(
   url: string,
   timeoutMs: number,
   fetchImpl: typeof fetch,
-  headers: Headers | undefined,
+  auth: ArchiveAuth,
   caller: AbortSignal | undefined,
   localAbort: AbortSignal | undefined,
   onHeaders?: () => void,
@@ -88,8 +88,8 @@ async function runFetch(
   const stop = anySignal(signals);
   try {
     const response = await fetchImpl(url, {
+      ...archiveGetInit(url, auth),
       signal: stop,
-      ...(headers ? { headers } : {}),
     });
     onHeaders?.();
     if (caller?.aborted || localAbort?.aborted) return { kind: "aborted" };
@@ -206,7 +206,7 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
 
   const one = async (origin: "mac" | "fallback", base: string): Promise<RaceSuccess> => {
     const url = join(base, opts.path);
-    const result = await runFetch(url, opts.timeoutMs, fetchImpl, archiveRequestHeaders(url, auth), opts.signal, undefined);
+    const result = await runFetch(url, opts.timeoutMs, fetchImpl, auth, opts.signal, undefined);
     if (result.kind === "usable") {
       if (origin === "mac") markUp();
       return { origin, base, json: result.json };
@@ -236,25 +236,35 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
         headerTimer = undefined;
       }
     };
+    let onCallerAbort: () => void = () => {};
+    const stopCaller = () => opts.signal?.removeEventListener("abort", onCallerAbort);
     const finishOk = (value: RaceSuccess) => {
       if (settled) return;
       settled = true;
       clearHeaderTimer();
+      stopCaller();
       resolve(value);
     };
     const finishErr = (err: Error) => {
       if (settled) return;
       settled = true;
       clearHeaderTimer();
+      stopCaller();
       reject(err);
     };
     const abortBox = () => boxAbort?.abort();
+    onCallerAbort = () => {
+      // The Mac may already have failed and the fallback fetch may ignore the
+      // signal. Cancel still has to reject; waiting on that fetch would hang.
+      abortBox();
+      if (!settled) finishErr(describe({ kind: "aborted" }, macUrl));
+    };
 
     const startBox = () => {
       if (boxStarted || settled) return;
       boxStarted = true;
       boxAbort = new AbortController();
-      void runFetch(boxUrl, opts.timeoutMs, fetchImpl, archiveRequestHeaders(boxUrl, auth), opts.signal, boxAbort.signal).then(
+      void runFetch(boxUrl, opts.timeoutMs, fetchImpl, auth, opts.signal, boxAbort.signal).then(
         handleBox,
         () => handleBox({ kind: "network" }),
       );
@@ -266,7 +276,13 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
         startBox();
         return;
       }
-      if (!boxResult || boxResult.kind === "usable" || boxResult.kind === "aborted") return;
+      // A usable fallback already resolved. An aborted one is finished too, so a
+      // Mac that has already failed rejects here instead of waiting for a body.
+      if (!boxResult || boxResult.kind === "usable") return;
+      if (boxResult.kind === "aborted" && opts.signal?.aborted) {
+        finishErr(describe(boxResult, boxUrl));
+        return;
+      }
       const error = boxResult.kind === "status" ? describe(boxResult, boxUrl) : describe(macResult, macUrl);
       finishErr(error);
     };
@@ -285,7 +301,8 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
     function handleMac(result: FetchResult) {
       clearHeaderTimer();
       if (result.kind === "aborted") {
-        if (!settled && opts.signal?.aborted) finishErr(describe(result, macUrl));
+        abortBox();
+        if (!settled) finishErr(describe(result, macUrl));
         return;
       }
       if (result.kind === "usable") {
@@ -307,11 +324,17 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
       failIfBothDone();
     }
 
+    if (opts.signal?.aborted) {
+      finishErr(describe({ kind: "aborted" }, macUrl));
+      return;
+    }
+    opts.signal?.addEventListener("abort", onCallerAbort);
+
     headerTimer = setTimeout(() => {
       if (!headersSeen && !settled) startBox();
     }, FALLBACK_DELAY_MS);
 
-    void runFetch(macUrl, opts.timeoutMs, fetchImpl, archiveRequestHeaders(macUrl, auth), opts.signal, undefined, () => {
+    void runFetch(macUrl, opts.timeoutMs, fetchImpl, auth, opts.signal, undefined, () => {
       headersSeen = true;
       clearHeaderTimer();
     }).then(handleMac, () => handleMac({ kind: "network" }));
