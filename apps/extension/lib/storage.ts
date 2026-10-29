@@ -21,7 +21,7 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
-  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://dell-plx-reader:8081`. */
+  /** Read-only amber-reader base. Empty string turns the fallback off. Default `https://dell-plx-reader.tailf9612a.ts.net`. */
   fallbackArchiveUrl: "fallbackArchiveUrl",
   /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
   readerPassword: "readerPassword",

@@ -1,16 +1,22 @@
 import { normalizeArchiveUrl } from "@homepage/agent-core";
 
 /** Read-only amber-reader. Used when the Mac archive doesn't answer. */
-export const DEFAULT_FALLBACK_ARCHIVE_URL = "http://dell-plx-reader:8081";
+export const DEFAULT_FALLBACK_ARCHIVE_URL = "https://dell-plx-reader.tailf9612a.ts.net";
 
 /**
- * Exact retired defaults. Each is rewritten once, to the current default.
- * `http://dell-plx:8081` was an unreleased intermediate default.
+ * Exact retired defaults, and the migration version that rewrites each one.
+ * `http://dell-plx:8081` and `http://dell-plx-reader:8081` were unreleased
+ * intermediate defaults. A stored version below `version` still rewrites that
+ * address; a later choice of it, after that version is stored, is kept.
  */
-export const RETIRED_FALLBACK_ARCHIVE_URLS = ["http://boxj:8081", "http://dell-plx:8081"] as const;
+export const RETIRED_FALLBACK_ARCHIVE_URLS = [
+  { url: "http://boxj:8081", version: 2 },
+  { url: "http://dell-plx:8081", version: 2 },
+  { url: "http://dell-plx-reader:8081", version: 2 },
+] as const;
 
-/** Stored once this fallback-host migration has run, so a later choice of a retired address is kept. */
-export const FALLBACK_ARCHIVE_MIGRATION_VERSION = 1;
+/** Highest fallback-host migration applied. Raising it is what runs the next rewrite. */
+export const FALLBACK_ARCHIVE_MIGRATION_VERSION = 2;
 
 export interface FallbackArchiveMigration {
   url: string;
@@ -22,8 +28,8 @@ export interface FallbackArchiveMigration {
 
 /**
  * The fallback address to use. Missing means the current default and is not a
- * stored change. The first time this runs, an exact retired default moves to
- * the current one and the migration version is recorded. After that version is
+ * stored change. Each retired address is rewritten once, when the stored
+ * version is below the version that retires it. After the current version is
  * stored, those addresses stay, including when someone chooses one on purpose.
  * Any other value, including "" (failover off), stays.
  */
@@ -31,13 +37,12 @@ export function migrateFallbackArchiveUrl(
   stored: string | undefined,
   migratedVersion: number | undefined,
 ): FallbackArchiveMigration {
-  const done =
-    typeof migratedVersion === "number" &&
-    Number.isFinite(migratedVersion) &&
-    migratedVersion >= FALLBACK_ARCHIVE_MIGRATION_VERSION;
+  const seen = typeof migratedVersion === "number" ? migratedVersion : 0;
   const url = stored === undefined ? DEFAULT_FALLBACK_ARCHIVE_URL : stored;
-  if (done) return { url, changed: false, recordVersion: false };
-  const retired = stored !== undefined && (RETIRED_FALLBACK_ARCHIVE_URLS as readonly string[]).includes(stored);
+  // One comparison against the current version. Each retired address carries its own.
+  if (seen >= FALLBACK_ARCHIVE_MIGRATION_VERSION) return { url, changed: false, recordVersion: false };
+  const retired =
+    stored !== undefined && RETIRED_FALLBACK_ARCHIVE_URLS.some((item) => item.url === stored && seen < item.version);
   if (retired) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: true, recordVersion: true };
   return { url, changed: false, recordVersion: true };
 }

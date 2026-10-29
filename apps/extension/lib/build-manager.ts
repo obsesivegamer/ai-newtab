@@ -13,7 +13,9 @@ import {
   type BuildState,
   type PageMsg,
 } from "./protocol";
-import { pushHomepage } from "./phone-sync";
+import { publishBuiltHomepage } from "./phone-sync";
+import { fallbackBaseOf } from "./archive-auth";
+import { fetchRebuildRequest, rebuildTickAction, shouldPollRebuildRequest } from "./rebuild-request";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -47,6 +49,8 @@ export class BuildManager {
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotAt = 0;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms of the last reader rebuild-request poll. The alarm is already ~1 min. */
+  private lastRebuildPollAt = 0;
 
   // ---- port lifecycle ------------------------------------------------------
 
@@ -105,7 +109,59 @@ export class BuildManager {
       return;
     }
 
+    try {
+      if (await this.maybeRequestedRebuild()) return;
+    } catch (err) {
+      console.warn(
+        "[BuildManager] rebuild request check failed",
+        err instanceof Error ? err.message : "request failed",
+      );
+    }
     await this.maybeAutoRebuild();
+  }
+
+  /**
+   * A phone refresh can ask the reader for a rebuild. Poll that at most once a
+   * minute, and only with a reader address and password. A newer request starts
+   * a build even when the schedule and the failure backoff would wait, and never
+   * while one is already running.
+   */
+  private async maybeRequestedRebuild(): Promise<boolean> {
+    const now = Date.now();
+    if (this.running) return false;
+    const settings = await loadSettings();
+    const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
+    const configured = Boolean(reader && settings.readerPassword);
+    if (
+      !reader ||
+      !shouldPollRebuildRequest({
+        running: this.running,
+        now,
+        lastPollAt: this.lastRebuildPollAt,
+        readerConfigured: configured,
+      })
+    ) {
+      return false;
+    }
+    this.lastRebuildPollAt = now;
+    const request = await fetchRebuildRequest(reader, settings.readerPassword, settings.archiveUrl);
+    const [homepage, lastAttempt] = await Promise.all([
+      loadHomepage(),
+      extensionStore.get<string>(KEYS.lastAutoBuildAttempt),
+    ]);
+    if (
+      rebuildTickAction({
+        running: this.running,
+        request,
+        lastBuildTimestamp: homepage?.timestamp,
+        lastAttemptTimestamp: lastAttempt,
+      }) !== "start"
+    ) {
+      return false;
+    }
+    await extensionStore.set(KEYS.lastAutoBuildAttempt, new Date().toISOString());
+    void this.startBuild({ resume: false });
+    return true;
   }
 
   /** Whether opening the day's first tab should already show a fresh homepage. */
@@ -235,10 +291,15 @@ export class BuildManager {
 
       // Persist the raw TSX; the page transpiles it for preview.
       const homepage = await saveHomepage(result.code);
-      // Also hand it to Amber so the phone/web version can show it. Best-effort: a failure is only
-      // logged and never holds up the build. Only when an archive address is configured and it is a
-      // local, private-network or tailnet host (`pushHomepage` checks); never a public address.
-      if (archiveBase) void pushHomepage(archiveBase, homepage);
+      // Hand it to the Mac archive and, separately, to the offline reader. Both are
+      // best-effort. The reader push cannot fail the Mac one, and its password never
+      // goes to the Mac. Each refuses a public address (`publishBuiltHomepage`).
+      void publishBuiltHomepage(
+        archiveBase,
+        settings.fallbackArchiveUrl,
+        settings.readerPassword,
+        homepage,
+      );
 
       this.state = { ...this.state, running: false, phase: "done" };
       this.broadcast({ kind: "done", code: result.code });

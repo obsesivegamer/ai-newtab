@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { installFeedProxy, proxiedUrl } from "../apps/web/src/feedProxy";
 
-const ORIGIN = "http://dell-plx-reader:8081";
+const ORIGIN = "https://dell-plx-reader.tailf9612a.ts.net";
 
 interface Seen {
   url: string;

@@ -1,5 +1,6 @@
 import { anySignal, normalizeArchiveUrl, type FeedSource } from "@homepage/agent-core";
 import { IS_WEB } from "@/lib/platform";
+import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 import { saveSources } from "./sources";
 import { KEYS } from "./storage";
 
@@ -24,6 +25,8 @@ export interface SharedHomepage {
   code: string;
   /** ISO timestamp of when it was built. */
   timestamp: string;
+  /** When the reader last copied this page from the Mac, if the response said. */
+  syncedAt?: string;
 }
 
 export type HomepageFetch =
@@ -149,9 +152,101 @@ export async function pushHomepage(archiveUrl: string, homepage: SharedHomepage)
   const base = shareTarget(archiveUrl);
   if (!base) return;
   try {
-    await putJson(`${base}/api/homepage`, { code: homepage.code, timestamp: homepage.timestamp });
+    await putJson(`${base}/api/homepage`, homepageBody(homepage));
   } catch (err) {
     console.warn("[phone-sync] couldn't publish the homepage to Amber:", err instanceof Error ? err.message : err);
+  }
+}
+
+function homepageBody(homepage: SharedHomepage): { code: string; timestamp: string } {
+  return { code: homepage.code, timestamp: homepage.timestamp };
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish the finished page to the offline reader as well, so a phone on that
+ * host sees it without waiting for the hourly copy. Best-effort: a failure is
+ * logged and never thrown. The reader password is attached only when this
+ * request's origin is the reader and not the Mac. No-op without a shareable
+ * reader address and a password, and when the reader is the Mac itself.
+ */
+export async function pushReaderHomepage(
+  readerUrl: string,
+  password: string,
+  homepage: SharedHomepage,
+  macUrl: string,
+): Promise<void> {
+  const base = shareTarget(readerUrl);
+  if (!base || !password || (macUrl && sameOrigin(base, macUrl))) return;
+  const url = `${base}/api/homepage`;
+  const auth: ArchiveAuth = { macBase: macUrl, fallbackBase: base, password };
+  const gated = archiveGetInit(url, auth);
+  try {
+    const headers = new Headers(gated.headers);
+    headers.set("Content-Type", "application/json");
+    const response = await fetch(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(homepageBody(homepage)),
+      redirect: gated.redirect,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`reader answered ${response.status}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "request failed";
+    console.warn(`[phone-sync] couldn't publish the homepage to the reader: ${message}`);
+  }
+}
+
+/**
+ * After a successful build, publish to the Mac archive and the reader. Either
+ * failure stays inside its own call, so the reader cannot fail the Mac push.
+ */
+export async function publishBuiltHomepage(
+  macBase: string | null,
+  readerUrl: string,
+  password: string,
+  homepage: SharedHomepage,
+): Promise<void> {
+  await Promise.all([
+    macBase ? pushHomepage(macBase, homepage) : Promise.resolve(),
+    pushReaderHomepage(readerUrl, password, homepage, macBase ?? ""),
+  ]);
+}
+
+export type RebuildPost = { status: "ok"; requestedAt: string } | { status: "missing" } | { status: "error" };
+
+/**
+ * Ask the reader to record a rebuild request for the Mac. The phone is served
+ * by that reader, so this sends the session cookie and no Basic header. A 404
+ * means this Amber has no such route.
+ */
+export async function requestHomepageRebuild(origin: string, signal?: AbortSignal): Promise<RebuildPost> {
+  const base = normalizeArchiveUrl(origin);
+  if (!base) return { status: "error" };
+  try {
+    const timeout = AbortSignal.timeout(TIMEOUT_MS);
+    const response = await fetch(`${base}/api/homepage/rebuild-request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      credentials: "same-origin",
+      signal: signal ? anySignal([timeout, signal]) : timeout,
+    });
+    if (response.status === 404) return { status: "missing" };
+    if (!response.ok) return { status: "error" };
+    const body = (await response.json().catch(() => null)) as { requested_at?: unknown } | null;
+    const requestedAt = body?.requested_at;
+    return { status: "ok", requestedAt: typeof requestedAt === "string" && requestedAt ? requestedAt : "" };
+  } catch {
+    return { status: "error" };
   }
 }
 
@@ -230,12 +325,15 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
     return typeof detail === "string" && /no homepage/i.test(detail) ? { status: "empty" } : { status: "unsupported" };
   }
   if (!response.ok) return { status: "error", message: `Amber answered ${response.status}` };
-  const { code, timestamp } = (body ?? {}) as { code?: unknown; timestamp?: unknown };
-  if (typeof code !== "string" || code.length === 0) return { status: "empty" };
-  return {
-    status: "ok",
-    homepage: { code, timestamp: typeof timestamp === "string" ? timestamp : "" },
+  const { code, timestamp, synced_at } = (body ?? {}) as {
+    code?: unknown;
+    timestamp?: unknown;
+    synced_at?: unknown;
   };
+  if (typeof code !== "string" || code.length === 0) return { status: "empty" };
+  const homepage: SharedHomepage = { code, timestamp: typeof timestamp === "string" ? timestamp : "" };
+  if (typeof synced_at === "string" && synced_at) homepage.syncedAt = synced_at;
+  return { status: "ok", homepage };
 }
 
 /** The sources list stored in Amber (with its stamp), or null when there is none or it can't be read. */

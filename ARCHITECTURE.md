@@ -295,7 +295,8 @@ is best-effort and never blocks a build or a settings save):
 
 | Endpoint | Written by | Read by | Shape |
 |---|---|---|---|
-| `PUT /api/homepage` | the worker, after each successful build, when the archive address is a shareable host (`pushHomepage`) | web Today (`GET`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`) |
+| `PUT /api/homepage` | the worker, after each successful build, when the archive address is a shareable host (`pushHomepage`), and again to the fallback reader with Basic `amber` (`pushReaderHomepage`; a failure there does not affect the Mac push) | web Today (`GET`, which may include `synced_at`) | `{ code, timestamp }` (the raw TSX, as stored in `chrome.storage`). The reader rejects a PUT older than what it holds. |
+| `POST`/`GET /api/homepage/rebuild-request` | the phone POSTs on Refresh when the page is at least ~1h old or the refetch did not change; the worker GETs about once a minute when a reader address and password are set | the worker starts a build when `requested_at` is newer than the last build and the last attempt | `{ requested_at, id, fulfilled_at }`. A 404 hides the feature. The phone then polls `GET /api/homepage` about every 20s for about 10 min and swaps the page when `timestamp` advances. |
 | `PUT /api/sources` | Settings → Sources → Save in the extension (or a change to the blocked-sites list), when the archive address is a shareable host; the web Settings on every edit, debounced 800 ms (`publishSources`) | web on load, when Settings opens and when the page is shown again; the extension when its Settings opens (`GET`; used when present, else seeded from the archive) | `{ sources: [{ id, name, feedUrls[], enabled }], if_updated_at? }`, answered with `{ count, updated_at }` |
 
 **Who may receive them.** Both pushes go through one check in `phone-sync.ts`
@@ -340,7 +341,11 @@ Other web-specific behaviour:
   same wrapper.
 - **Today (`TodayStatic`)** fetches `/api/homepage`, transpiles it with `toRenderable`
   and renders it in the same sandboxed Sandpack frame (`HomepagePreview`), with
-  "Built <time> on your Mac". Open requests from that frame use the *same gate* as the
+  "Built <time> on your Mac". The frame mounts only when `isSecureContext` and
+  `crypto.subtle` are both present; otherwise the page links to the HTTPS reader
+  instead of a blank preview, and an error boundary wraps the frame. Refresh says
+  what it found, and a page older than about 12 hours says so (plus `synced_at`
+  when the reader sent one). Open requests from that frame use the *same gate* as the
   extension: both apps call `entrypoints/newtab/useHomepageOpen.ts` (exact message
   `type`, `source` is an iframe inside `.today-frame`, Today showing, no Reader or
   Settings open, 3 per second, 2 s repeat window, URL validation + `isAllowedUrl`;
@@ -478,11 +483,12 @@ agent leads with it. The host supplies an `ArchiveBridge` (`types.ts`), passed t
 `runHomepageBuild` as `archive`; the extension builds it in `lib/archive.ts` from
 the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it).
 Reads try that Mac first, then the offline reader at `fallbackArchiveUrl`
-(default `http://dell-plx-reader:8081`, empty turns failover off). A stored
-`http://boxj:8081` or `http://dell-plx:8081` (retired defaults; the second was
-an unreleased intermediate) is rewritten once to the current default, and that
-migration is recorded so choosing either address later is kept. Any other saved
-address stays. The harness builds an equivalent Mac bridge from `AMBER_URL`.
+(default `https://dell-plx-reader.tailf9612a.ts.net`, empty turns failover off).
+A stored `http://boxj:8081`, `http://dell-plx:8081`, or `http://dell-plx-reader:8081`
+is rewritten once to the current default when the stored migration version is
+below the version that retires that exact address (currently version 2). The
+version is recorded, so choosing one of those addresses later is kept. Any other
+saved address stays, including an empty one. The harness builds an equivalent Mac bridge from `AMBER_URL`.
 Without a bridge the archive tools answer with an error result and the build runs on history alone.
 
 | Tool | Does |

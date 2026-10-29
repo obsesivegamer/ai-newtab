@@ -11,10 +11,18 @@ declare global {
         remove(keys: string | string[]): Promise<void>;
       };
     };
+    // Pulled in because phone-sync imports the sources catalog, which reads history.
+    history: {
+      search(query: {
+        text: string;
+        startTime: number;
+        maxResults: number;
+      }): Promise<Array<{ url?: string; title?: string; lastVisitTime?: number; visitCount?: number }>>;
+    };
   };
 }
 import { LIST_TIMEOUT_MS, TEXT_TIMEOUT_MS, parseSnapshotList } from "../apps/extension/lib/archive";
-import { READER_BASIC_USER, basicAuthorization } from "../apps/extension/lib/archive-auth";
+import { DEFAULT_FALLBACK_ARCHIVE_URL, READER_BASIC_USER, basicAuthorization } from "../apps/extension/lib/archive-auth";
 import { loadReadingArticles, loadReadingList } from "../apps/extension/lib/archive-reading";
 import {
   FALLBACK_DELAY_MS,
@@ -26,7 +34,7 @@ import {
 } from "../apps/extension/lib/archive-race";
 
 const MAC = "http://127.0.0.1:8080";
-const FALLBACK = "http://dell-plx-reader:8081";
+const FALLBACK = DEFAULT_FALLBACK_ARCHIVE_URL;
 const PASSWORD = "secret";
 const BASIC = basicAuthorization(READER_BASIC_USER, PASSWORD);
 const LIST_PATH = "/api/snapshots?since_days=1&limit=1";

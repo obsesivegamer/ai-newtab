@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { createArchiveBridge } from "../apps/extension/lib/archive";
-import { READER_BASIC_USER } from "../apps/extension/lib/archive-auth";
+import { DEFAULT_FALLBACK_ARCHIVE_URL, READER_BASIC_USER } from "../apps/extension/lib/archive-auth";
 
 const MAC = "http://127.0.0.1:8080";
-const FALLBACK = "http://dell-plx-reader:8081";
+const FALLBACK = DEFAULT_FALLBACK_ARCHIVE_URL;
 const PASSWORD = "secret";
 
 interface Seen {

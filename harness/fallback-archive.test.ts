@@ -7,7 +7,8 @@ import {
 } from "../apps/extension/lib/archive-auth";
 import { KEYS, loadSettings } from "../apps/extension/lib/storage";
 
-const READER = "http://dell-plx-reader:8081";
+const READER = "https://dell-plx-reader.tailf9612a.ts.net";
+const PREVIOUS_READER = "http://dell-plx-reader:8081";
 const RETIRED = "http://boxj:8081";
 const INTERMEDIATE = "http://dell-plx:8081";
 
@@ -46,10 +47,14 @@ function installBrowser() {
   (globalThis as unknown as { browser: typeof mockBrowser }).browser = mockBrowser;
 }
 
-test("the offline reader defaults to dell-plx-reader", () => {
+test("the offline reader defaults to the tailnet HTTPS address", () => {
   expect(DEFAULT_FALLBACK_ARCHIVE_URL).toBe(READER);
-  expect(RETIRED_FALLBACK_ARCHIVE_URLS).toEqual([RETIRED, INTERMEDIATE]);
-  expect(FALLBACK_ARCHIVE_MIGRATION_VERSION).toBe(1);
+  expect(RETIRED_FALLBACK_ARCHIVE_URLS).toEqual([
+    { url: RETIRED, version: 2 },
+    { url: INTERMEDIATE, version: 2 },
+    { url: PREVIOUS_READER, version: 2 },
+  ]);
+  expect(FALLBACK_ARCHIVE_MIGRATION_VERSION).toBe(2);
 });
 
 test("retired defaults migrate once and every other fallback stays", () => {
@@ -80,6 +85,17 @@ test("retired defaults migrate once and every other fallback stays", () => {
     changed: true,
     recordVersion: true,
   });
+  expect(migrateFallbackArchiveUrl(PREVIOUS_READER, undefined)).toEqual({
+    url: READER,
+    changed: true,
+    recordVersion: true,
+  });
+  expect(migrateFallbackArchiveUrl(PREVIOUS_READER, 1)).toEqual({
+    url: READER,
+    changed: true,
+    recordVersion: true,
+  });
+  expect(migrateFallbackArchiveUrl(RETIRED, 1)).toEqual({ url: READER, changed: true, recordVersion: true });
   expect(migrateFallbackArchiveUrl(RETIRED, FALLBACK_ARCHIVE_MIGRATION_VERSION)).toEqual({
     url: RETIRED,
     changed: false,
@@ -90,12 +106,23 @@ test("retired defaults migrate once and every other fallback stays", () => {
     changed: false,
     recordVersion: false,
   });
+  expect(migrateFallbackArchiveUrl(PREVIOUS_READER, FALLBACK_ARCHIVE_MIGRATION_VERSION)).toEqual({
+    url: PREVIOUS_READER,
+    changed: false,
+    recordVersion: false,
+  });
+  // A stored version already at or above the current one is done, in one comparison.
+  expect(migrateFallbackArchiveUrl(PREVIOUS_READER, 3)).toEqual({
+    url: PREVIOUS_READER,
+    changed: false,
+    recordVersion: false,
+  });
 });
 
 test("a stored retired default is rewritten once and the migration is recorded", async () => {
   installBrowser();
 
-  for (const retired of [RETIRED, INTERMEDIATE]) {
+  for (const retired of [RETIRED, INTERMEDIATE, PREVIOUS_READER]) {
     store.clear();
     writes = 0;
     store.set(KEYS.fallbackArchiveUrl, retired);
@@ -121,7 +148,7 @@ test("the migration flag keeps a later choice of a retired address", async () =>
   expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
   expect(writes).toBe(1);
 
-  for (const chosen of [RETIRED, INTERMEDIATE]) {
+  for (const chosen of [RETIRED, INTERMEDIATE, PREVIOUS_READER]) {
     writes = 0;
     store.set(KEYS.fallbackArchiveUrl, chosen);
     const kept = await loadSettings();
@@ -134,7 +161,7 @@ test("the migration flag keeps a later choice of a retired address", async () =>
 test("near-misses, an empty address, and a missing address are not rewritten", async () => {
   installBrowser();
 
-  for (const kept of ["https://boxj:8081", "http://boxj:8081/", ""]) {
+  for (const kept of ["https://boxj:8081", "http://boxj:8081/", "http://dell-plx-reader:8081/", ""]) {
     store.clear();
     writes = 0;
     store.set(KEYS.fallbackArchiveUrl, kept);
@@ -150,6 +177,23 @@ test("near-misses, an empty address, and a missing address are not rewritten", a
     expect(later.fallbackArchiveUrl).toBe(RETIRED);
     expect(writes).toBe(0);
   }
+
+  store.clear();
+  writes = 0;
+  store.set(KEYS.fallbackArchiveUrl, PREVIOUS_READER);
+  store.set(KEYS.fallbackArchiveMigrated, 1);
+  const already = await loadSettings();
+  expect(already.fallbackArchiveUrl).toBe(READER);
+  expect(store.get(KEYS.fallbackArchiveUrl)).toBe(READER);
+  expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+  expect(writes).toBe(1);
+
+  writes = 0;
+  store.set(KEYS.fallbackArchiveUrl, PREVIOUS_READER);
+  const chosenLater = await loadSettings();
+  expect(chosenLater.fallbackArchiveUrl).toBe(PREVIOUS_READER);
+  expect(store.get(KEYS.fallbackArchiveUrl)).toBe(PREVIOUS_READER);
+  expect(writes).toBe(0);
 
   store.clear();
   writes = 0;

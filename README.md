@@ -168,11 +168,11 @@ box empty to build from browsing history only. The blocked-sites list above also
 applies to archived articles, matched on the publisher's address.
 
 **Offline reader.** When the Mac archive doesn't answer, saved articles are read
-from here instead. The default is `http://dell-plx-reader:8081`. Leave it empty to turn
-that off. Its password is sent only to that address, as HTTP Basic for the user
-`amber`. A stored `http://boxj:8081` or `http://dell-plx:8081` (retired defaults,
-the second an unreleased intermediate) is rewritten once to the current default.
-Choosing either address later is kept. Any other address is left as you saved it.
+from here instead. The default is `https://dell-plx-reader.tailf9612a.ts.net`.
+Leave it empty to turn that off. Its password is sent only to that address, as
+HTTP Basic for the user `amber`. A saved copy of an older default is updated
+once. Choosing that older address again later is kept. Any other address is
+left as you saved it.
 
 **Model.** Choose which Claude model writes your page:
 
