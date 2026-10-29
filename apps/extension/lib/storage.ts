@@ -7,7 +7,7 @@ import {
   type KVStore,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "./archive";
-import { DEFAULT_FALLBACK_ARCHIVE_URL } from "./archive-auth";
+import { migrateFallbackArchiveUrl } from "./archive-auth";
 
 /**
  * Everything the extension persists, in one place. All of it lives in
@@ -21,7 +21,7 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
-  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://boxj:8081`. */
+  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://dell-plx:8081`. */
   fallbackArchiveUrl: "fallbackArchiveUrl",
   /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
   readerPassword: "readerPassword",
@@ -96,12 +96,21 @@ export async function loadSettings(): Promise<Settings> {
     KEYS.rebuildIntervalHours,
   ]);
   const model = s[KEYS.model] as string | undefined;
+  const storedFallback = s[KEYS.fallbackArchiveUrl];
+  const fallback = migrateFallbackArchiveUrl(typeof storedFallback === "string" ? storedFallback : undefined);
+  if (fallback.changed) {
+    try {
+      await saveSetting("fallbackArchiveUrl", fallback.url);
+    } catch {
+      /* The read below still uses the new address. */
+    }
+  }
   return {
     apiKey: (s[KEYS.apiKey] as string | undefined) ?? null,
     systemPrompt: (s[KEYS.systemPrompt] as string | undefined) ?? "",
     blockedSites: (s[KEYS.blockedSites] as string[] | undefined) ?? [...DEFAULT_BLOCKED_SITES],
     archiveUrl: (s[KEYS.archiveUrl] as string | undefined) ?? DEFAULT_ARCHIVE_URL,
-    fallbackArchiveUrl: (s[KEYS.fallbackArchiveUrl] as string | undefined) ?? DEFAULT_FALLBACK_ARCHIVE_URL,
+    fallbackArchiveUrl: fallback.url,
     readerPassword: (s[KEYS.readerPassword] as string | undefined) ?? "",
     // Fall back if a stored model is no longer offered.
     model: MODEL_CHOICES.find((m) => m.id === model)?.id ?? DEFAULT_MODEL,

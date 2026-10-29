@@ -476,8 +476,11 @@ The build phase reuses `history` (`feeds <n>h` as the detail), like `getArchive`
 Amber is a separate local app that saves readable copies of articles. This fork's
 agent leads with it. The host supplies an `ArchiveBridge` (`types.ts`), passed to
 `runHomepageBuild` as `archive`; the extension builds it in `lib/archive.ts` from
-the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it), and
-the harness builds an equivalent one from `AMBER_URL`. Without a bridge the
+the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it).
+Reads try that Mac first, then the offline reader at `fallbackArchiveUrl`
+(default `http://dell-plx:8081`, empty turns failover off). A stored
+`http://boxj:8081` is migrated to the current default; any other saved address
+stays. The harness builds an equivalent Mac bridge from `AMBER_URL`. Without a bridge the
 archive tools answer with an error result and the build runs on history alone.
 
 | Tool | Does |

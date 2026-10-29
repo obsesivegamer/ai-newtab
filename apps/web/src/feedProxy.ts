@@ -39,8 +39,8 @@ export function installFeedProxy(): void {
     if (accept) forwarded.Accept = accept;
     const response = await nativeFetch(proxiedUrl(target.href), {
       method: "GET",
-      // The phone is served by whichever Amber is up (the Mac, or boxj). The feed proxy is
-      // that same origin, and boxj only answers when the reader session cookie is sent.
+      // The phone is served by whichever Amber is up (the Mac, or the offline reader). The feed
+      // proxy is that same origin, and the reader only answers when its session cookie is sent.
       credentials: "same-origin",
       headers: forwarded,
       signal,

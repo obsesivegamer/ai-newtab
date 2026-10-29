@@ -26,7 +26,7 @@ import {
 } from "../apps/extension/lib/archive-race";
 
 const MAC = "http://127.0.0.1:8080";
-const BOX = "http://boxj:8081";
+const BOX = "http://dell-plx:8081";
 const PASSWORD = "secret";
 const BASIC = basicAuthorization(READER_BASIC_USER, PASSWORD);
 const LIST_PATH = "/api/snapshots?since_days=1&limit=1";
@@ -162,7 +162,7 @@ test("the Mac limits stay 10s for a list and 20s for text", () => {
   expect(FALLBACK_DELAY_MS).toBe(1_500);
 });
 
-test("a fast Mac wins and boxj is never called", async () => {
+test("a fast Mac wins and dell-plx is never called", async () => {
   const calls = install(() => jsonResponse(listBody("From mac")));
   const cache = createOriginCache();
 
@@ -187,10 +187,10 @@ test("a fast Mac wins and boxj is never called", async () => {
   expect(calls.every((call) => call.url.startsWith(MAC) && call.authorization === null)).toBe(true);
 });
 
-test("a hung Mac starts boxj at 1.5s and boxj's JSON wins", async () => {
+test("a hung Mac starts dell-plx at 1.5s and dell-plx's JSON wins", async () => {
   const calls = install((url, init) => {
     if (url.startsWith(MAC)) return hang(init?.signal ?? undefined);
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
   let settled = false;
@@ -214,7 +214,7 @@ test("a hung Mac starts boxj at 1.5s and boxj's JSON wins", async () => {
   expect(result.origin).toBe("fallback");
   expect(result.base).toBe(BOX);
   expect(parseSnapshotList(result.base, result.json)?.articles[0]).toMatchObject({
-    title: "From boxj",
+    title: "From dell-plx",
     permalink: `${BOX}/Ab12Cd`,
   });
   expect(calls).toHaveLength(2);
@@ -231,10 +231,10 @@ test("a hung Mac starts boxj at 1.5s and boxj's JSON wins", async () => {
   expect(result.origin).toBe("fallback");
 });
 
-test("Mac response headers inside 1.5s keep boxj from starting", async () => {
+test("Mac response headers inside 1.5s keep dell-plx from starting", async () => {
   const held = heldBody();
   const calls = install((url) => {
-    if (url.startsWith(BOX)) return jsonResponse(listBody("From boxj"));
+    if (url.startsWith(BOX)) return jsonResponse(listBody("From dell-plx"));
     return held.response;
   });
   const cache = createOriginCache();
@@ -255,7 +255,7 @@ test("Mac response headers inside 1.5s keep boxj from starting", async () => {
 test("a Mac body that never arrives fails over when the Mac limit expires", async () => {
   const held = heldBody();
   const calls = install((url) => {
-    if (url.startsWith(BOX)) return jsonResponse(listBody("From boxj"));
+    if (url.startsWith(BOX)) return jsonResponse(listBody("From dell-plx"));
     return held.response;
   });
   const cache = createOriginCache();
@@ -276,9 +276,9 @@ test("a Mac body that never arrives fails over when the Mac limit expires", asyn
   expect(cache.upUntil).toBeNull();
 });
 
-test("a Mac 401 is the answer and boxj is not called", async () => {
+test("a Mac 401 is the answer and dell-plx is not called", async () => {
   const calls = install((url) => {
-    if (url.startsWith(BOX)) return jsonResponse(listBody("From boxj"));
+    if (url.startsWith(BOX)) return jsonResponse(listBody("From dell-plx"));
     return new Response("no", { status: 401 });
   });
   const cache = createOriginCache();
@@ -292,7 +292,7 @@ test("a Mac 401 is the answer and boxj is not called", async () => {
   expect(cache.downUntil).toBeNull();
 });
 
-test("a Mac 404 is the answer and boxj is not called", async () => {
+test("a Mac 404 is the answer and dell-plx is not called", async () => {
   const calls = install(() => new Response("missing", { status: 404 }));
   const cache = createOriginCache();
 
@@ -304,7 +304,7 @@ test("a Mac 404 is the answer and boxj is not called", async () => {
   expect(cache.downUntil).toBeNull();
 });
 
-test("a Mac 401 aborts boxj when the fallback already started", async () => {
+test("a Mac 401 aborts dell-plx when the fallback already started", async () => {
   const mac = deferred<Response>();
   let boxAborted = false;
   const calls = install((url, init) => {
@@ -330,10 +330,10 @@ test("a Mac 401 aborts boxj when the fallback already started", async () => {
   expect(cache.downUntil).toBeNull();
 });
 
-test("a cached Mac-down window calls only boxj", async () => {
+test("a cached Mac-down window calls only dell-plx", async () => {
   const calls = install((url) => {
     if (url.startsWith(MAC)) return jsonResponse(listBody("From mac"));
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
   cache.downUntil = Date.now() + MAC_DOWN_MS;
@@ -351,7 +351,7 @@ test("a cached Mac-down window calls only boxj", async () => {
 test("a Mac network error fails over without waiting out 1.5s", async () => {
   const calls = install((url) => {
     if (url.startsWith(MAC)) return Promise.reject(new TypeError("connection refused"));
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
 
@@ -368,8 +368,8 @@ test("a late Mac answer refreshes the cache and leaves the list that already won
   const calls = install((url, init) => {
     if (url.startsWith(MAC) && url.endsWith("/text")) return jsonResponse(textBody("From mac"));
     if (url.startsWith(MAC)) return mac.promise;
-    if (url.endsWith("/text")) return jsonResponse(textBody("From boxj"));
-    return jsonResponse(listBody("From boxj"));
+    if (url.endsWith("/text")) return jsonResponse(textBody("From dell-plx"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
   const pending = race(cache, globalThis.fetch);
@@ -380,7 +380,7 @@ test("a late Mac answer refreshes the cache and leaves the list that already won
   const won = result.json;
   const shown = parseSnapshotList(result.base, result.json);
   expect(result.origin).toBe("fallback");
-  expect(shown?.articles[0]).toMatchObject({ title: "From boxj", permalink: `${BOX}/Ab12Cd` });
+  expect(shown?.articles[0]).toMatchObject({ title: "From dell-plx", permalink: `${BOX}/Ab12Cd` });
 
   mac.resolve(jsonResponse(listBody("From mac")));
   await flush();
@@ -389,7 +389,7 @@ test("a late Mac answer refreshes the cache and leaves the list that already won
   expect(result.json).toBe(won);
   expect(result.origin).toBe("fallback");
   expect(result.base).toBe(BOX);
-  expect(parseSnapshotList(result.base, result.json)?.articles[0]?.title).toBe("From boxj");
+  expect(parseSnapshotList(result.base, result.json)?.articles[0]?.title).toBe("From dell-plx");
   expect(calls.filter((call) => call.url.startsWith(MAC)).every((call) => call.authorization === null)).toBe(true);
   expect(result.json).toBe(won);
 
@@ -466,7 +466,7 @@ test("when the Mac wins, the fallback already in flight is aborted", async () =>
   expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
 });
 
-test("aborting after the Mac failed rejects while boxj is still in flight", async () => {
+test("aborting after the Mac failed rejects while dell-plx is still in flight", async () => {
   const caller = new AbortController();
   const calls = install((url, init) => {
     if (url.startsWith(MAC)) return Promise.reject(new TypeError("connection refused"));
@@ -480,14 +480,14 @@ test("aborting after the Mac failed rejects while boxj is still in flight", asyn
   caller.abort();
   await expect(pending).rejects.toThrow(/aborted/);
   await flush();
-  // Settled by the cancel, not by boxj's own 10s limit.
+  // Settled by the cancel, not by dell-plx's own 10s limit.
   expect(jest.getTimerCount()).toBe(0);
 });
 
-test("a boxj request refuses redirects so the password cannot follow one", async () => {
+test("a dell-plx request refuses redirects so the password cannot follow one", async () => {
   const calls = install((url) => {
     if (url.startsWith(MAC)) return Promise.reject(new TypeError("connection refused"));
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
 
@@ -500,7 +500,7 @@ test("a late Mac answer does not swap the list already returned", async () => {
   const mac = deferred<Response>();
   install((url) => {
     if (url.startsWith(MAC)) return mac.promise;
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
   const pending = loadReadingList({
@@ -517,14 +517,14 @@ test("a late Mac answer does not swap the list already returned", async () => {
   const listed = await pending;
   const articles = listed.articles;
   expect(listed.originBase).toBe(BOX);
-  expect(articles[0]?.title).toBe("From boxj");
+  expect(articles[0]?.title).toBe("From dell-plx");
   expect(articles[0]?.permalink).toBe(`${BOX}/Ab12Cd`);
 
   mac.resolve(jsonResponse(listBody("From mac")));
   await flush();
   expect(listed.articles).toBe(articles);
   expect(listed.originBase).toBe(BOX);
-  expect(listed.articles[0]?.title).toBe("From boxj");
+  expect(listed.articles[0]?.title).toBe("From dell-plx");
   expect(listed.articles[0]?.permalink).toBe(`${BOX}/Ab12Cd`);
   expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
   expect(cache.downUntil).toBeNull();
@@ -534,7 +534,7 @@ test("the two-minute Mac-up window expires back into a cold race", async () => {
   let macHung = false;
   const calls = install((url, init) => {
     if (url.startsWith(MAC)) return macHung ? hang(init?.signal) : jsonResponse(listBody("From mac"));
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
 
@@ -578,7 +578,7 @@ test("the five-minute Mac-down window expires back into a cold race", async () =
     if (url.startsWith(MAC)) {
       return macDown ? Promise.reject(new TypeError("connection refused")) : jsonResponse(listBody("From mac"));
     }
-    return jsonResponse(listBody("From boxj"));
+    return jsonResponse(listBody("From dell-plx"));
   });
   const cache = createOriginCache();
 
@@ -592,7 +592,7 @@ test("the five-minute Mac-down window expires back into a cold race", async () =
   const during = await race(cache, globalThis.fetch);
   expect(during.origin).toBe("fallback");
   expect(calls.map((call) => call.url)).toEqual([`${BOX}${LIST_PATH}`]);
-  // A boxj read does not extend the window.
+  // A dell-plx read does not extend the window.
   expect(cache.downUntil).toBe(downUntil);
 
   jest.advanceTimersByTime(1);

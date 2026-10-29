@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { installFeedProxy, proxiedUrl } from "../apps/web/src/feedProxy";
 
-const ORIGIN = "http://boxj:8081";
+const ORIGIN = "http://dell-plx:8081";
 
 interface Seen {
   url: string;
@@ -17,7 +17,7 @@ afterEach(() => {
 
 /**
  * `installFeedProxy` wraps the page's `window.fetch` and reads `location`.
- * Stand the page up on boxj so the assertions are about that origin.
+ * Stand the page up on the offline reader so the assertions are about that origin.
  */
 function installPage(): { seen: Seen[] } {
   const win = new Window({ url: `${ORIGIN}/app/` });

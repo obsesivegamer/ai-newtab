@@ -3,7 +3,7 @@ import { createArchiveBridge } from "../apps/extension/lib/archive";
 import { READER_BASIC_USER } from "../apps/extension/lib/archive-auth";
 
 const MAC = "http://127.0.0.1:8080";
-const BOX = "http://boxj:8081";
+const BOX = "http://dell-plx:8081";
 const PASSWORD = "secret";
 
 interface Seen {

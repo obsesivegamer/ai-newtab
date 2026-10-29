@@ -217,7 +217,7 @@ export function SettingsModal({
       archiveRequest.current++;
       setArchiveCheck({
         state: "error",
-        message: "That doesn't look like a web address. Try http://boxj:8081",
+        message: `That doesn't look like a web address. Try ${DEFAULT_FALLBACK_ARCHIVE_URL}`,
       });
       return false;
     }

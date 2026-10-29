@@ -1,7 +1,21 @@
 import { normalizeArchiveUrl } from "@homepage/agent-core";
 
 /** Read-only amber-reader. Used when the Mac archive doesn't answer. */
-export const DEFAULT_FALLBACK_ARCHIVE_URL = "http://boxj:8081";
+export const DEFAULT_FALLBACK_ARCHIVE_URL = "http://dell-plx:8081";
+
+/** The previous default. A stored copy of this exact address is rewritten to the current default. */
+export const RETIRED_FALLBACK_ARCHIVE_URL = "http://boxj:8081";
+
+/**
+ * The fallback address to use for `stored`. Missing means the current default.
+ * The retired default moves to the current one. Any other value, including ""
+ * (failover off), stays.
+ */
+export function migrateFallbackArchiveUrl(stored: string | undefined): { url: string; changed: boolean } {
+  if (stored === RETIRED_FALLBACK_ARCHIVE_URL) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: true };
+  if (stored === undefined) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: false };
+  return { url: stored, changed: false };
+}
 
 /** HTTP Basic user amber-reader expects. The password is the reader's. */
 export const READER_BASIC_USER = "amber";

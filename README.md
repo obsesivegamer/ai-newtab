@@ -167,6 +167,12 @@ discards edits. A missing `http://` is added for you. Leave the
 box empty to build from browsing history only. The blocked-sites list above also
 applies to archived articles, matched on the publisher's address.
 
+**Offline reader.** When the Mac archive doesn't answer, saved articles are read
+from here instead. The default is `http://dell-plx:8081`. Leave it empty to turn
+that off. Its password is sent only to that address, as HTTP Basic for the user
+`amber`. A stored `http://boxj:8081` (the previous default) is rewritten to the
+current default; any other address is left as you saved it.
+
 **Model.** Choose which Claude model writes your page:
 
 - **Claude Sonnet 5.5** (default): the best balance of quality and cost.
