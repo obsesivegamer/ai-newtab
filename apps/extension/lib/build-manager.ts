@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { archiveHostOf, normalizeArchiveUrl, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
-import { createArchiveBridge } from "./archive";
+import { createFailoverArchiveBridge } from "./archive-reading";
 import { createFeedBridge } from "./feeds";
 import { isSourceBlocked, loadSources } from "./sources";
 import { browserBridge } from "./browser-bridge";
@@ -201,7 +201,13 @@ export class BuildManager {
         client,
         bridge: browserBridge,
         // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
-        archive: archiveBase ? createArchiveBridge(archiveBase) : undefined,
+        archive: archiveBase
+          ? createFailoverArchiveBridge(archiveBase, {
+              macBase: archiveBase,
+              fallbackBase: settings.fallbackArchiveUrl,
+              password: settings.readerPassword,
+            })
+          : undefined,
         feeds,
         timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         store: extensionStore,
@@ -211,8 +217,10 @@ export class BuildManager {
         // address this build started with and the one in Settings now are blocked,
         // so changing the setting mid-build can't expose the one in use.
         blockedSites: async () => {
-          const { blockedSites, archiveUrl: current } = await loadSettings();
-          const hosts = [archiveBase, current].flatMap((url) => (url ? archiveHostOf(url) ?? [] : []));
+          const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
+          const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
+            url ? (archiveHostOf(url) ?? []) : [],
+          );
           return [...blockedSites, ...hosts];
         },
         model,

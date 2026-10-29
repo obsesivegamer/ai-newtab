@@ -25,6 +25,8 @@ export const KEYS = {
   fallbackArchiveUrl: "fallbackArchiveUrl",
   /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
   readerPassword: "readerPassword",
+  /** `{ upUntil, downUntil, updatedAt }` for the Mac/fallback archive race. */
+  archiveOriginCache: "archiveOriginCache",
   /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
   sources: "sources",
   /** Amber's `updated_at` for the sources list as this device last saw it; sent back as `if_updated_at`. See lib/phone-sync.ts. */

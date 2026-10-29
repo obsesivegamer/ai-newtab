@@ -69,7 +69,9 @@ export default function App() {
   /** A passing line shown when the sources list was replaced by the one Amber holds (edited on the phone). */
   const [syncNote, setSyncNote] = useState<string | null>(null);
   const clearSyncNote = useCallback(() => setSyncNote(null), []);
-  const archive = useArchiveList(archiveUrl);
+  /** Bumped when Settings closes so a new fallback address is read into the library. */
+  const [archiveReload, setArchiveReload] = useState(0);
+  const archive = useArchiveList(archiveUrl, archiveReload);
 
   useEffect(() => {
     document.title = view === "today" ? "Today" : view === "latest" ? "Latest" : "Library";
@@ -115,13 +117,15 @@ export default function App() {
       settingsWasOpen.current = true;
       return;
     }
-    if (settingsWasOpen.current) {
-      settingsWasOpen.current = false;
-      setSourcesRev((n) => n + 1);
-    }
+    const closed = settingsWasOpen.current;
+    settingsWasOpen.current = false;
     void loadSettings().then((s) => {
       setArchiveUrl(s.archiveUrl);
       setBlockedSites(s.blockedSites);
+      if (closed) {
+        setSourcesRev((n) => n + 1);
+        setArchiveReload((n) => n + 1);
+      }
     });
   }, [showSettings]);
 

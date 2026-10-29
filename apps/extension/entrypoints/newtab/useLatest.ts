@@ -8,6 +8,8 @@ import {
   type FeedSourceStatus,
 } from "@homepage/agent-core";
 import { createArchiveBridge } from "@/lib/archive";
+import { loadReadingList } from "@/lib/archive-reading";
+import { IS_WEB } from "@/lib/platform";
 import { fetchSourceFeeds, mergeSourceFetches, type SourceFetch } from "@/lib/feeds";
 import { loadSources } from "@/lib/sources";
 import { KEYS } from "@/lib/storage";
@@ -200,8 +202,10 @@ export function useLatest({
         setArchived(indexArchive([]));
         return;
       }
-      createArchiveBridge(archiveUrl)
-        .listArticles({ sinceDays: 365, limit: 200 })
+      const pending = IS_WEB
+        ? createArchiveBridge(archiveUrl).listArticles({ sinceDays: 365, limit: 200 })
+        : loadReadingList({ macBase: archiveUrl, sinceDays: 365, limit: 200 });
+      pending
         .then((list) => {
           if (gen === generation.current) setArchived(indexArchive(list.articles));
         })

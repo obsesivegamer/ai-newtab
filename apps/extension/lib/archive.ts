@@ -113,6 +113,42 @@ function toMeta(base: string, s: ApiSnapshot): ArchiveArticleMeta {
   };
 }
 
+/** The archive base a permalink was built from (`${base}/${id}`). */
+export function archiveBaseFromPermalink(permalink: string | undefined): string | null {
+  if (!permalink) return null;
+  let url: URL;
+  try {
+    url = new URL(permalink);
+  } catch {
+    return null;
+  }
+  const path = url.pathname.replace(/\/[^/]+$/, "");
+  return normalizeArchiveUrl(`${url.origin}${path}`);
+}
+
+/** The list document, with permalinks on `base`. Null when it is not that document. */
+export function parseSnapshotList(
+  base: string,
+  raw: unknown,
+): { totalUsable: number; sources: ApiList["sources"]; articles: ArchiveArticleMeta[] } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const list = raw as Partial<ApiList>;
+  if (typeof list.total_usable !== "number" || !Array.isArray(list.snapshots)) return null;
+  return {
+    totalUsable: list.total_usable,
+    sources: Array.isArray(list.sources) ? list.sources : [],
+    articles: list.snapshots.map((s) => toMeta(base, s)),
+  };
+}
+
+/** One snapshot plus its text. Null when the document is not that shape. */
+export function parseSnapshotArticle(base: string, raw: unknown): ArchiveArticle | null {
+  if (!raw || typeof raw !== "object") return null;
+  const body = raw as Partial<ApiText>;
+  if (typeof body.id !== "string" || typeof body.text !== "string") return null;
+  return { ...toMeta(base, body as ApiText), text: body.text };
+}
+
 async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal, headers?: HeadersInit): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const response = await fetch(url, {

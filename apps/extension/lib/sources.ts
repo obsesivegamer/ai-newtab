@@ -6,6 +6,8 @@ import {
   type FeedSource,
 } from "@homepage/agent-core";
 import { createArchiveBridge } from "./archive";
+import { loadReadingList } from "./archive-reading";
+import { IS_WEB } from "@/lib/platform";
 import { getHistorySites } from "./history";
 import { KEYS, loadSettings } from "./storage";
 
@@ -45,7 +47,9 @@ export async function seedFromArchive(archiveUrl: string): Promise<SeedResult & 
   let archiveError: string | undefined;
   if (archiveUrl.trim() !== "") {
     try {
-      const list = await createArchiveBridge(archiveUrl).listArticles({ sinceDays: 365, limit: 1 });
+      const list = IS_WEB
+        ? await createArchiveBridge(archiveUrl).listArticles({ sinceDays: 365, limit: 1 })
+        : await loadReadingList({ macBase: archiveUrl, sinceDays: 365, limit: 1 });
       archive = list.sources;
     } catch (err) {
       archiveError = err instanceof Error ? err.message : String(err);
