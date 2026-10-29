@@ -7,7 +7,7 @@ import {
   type KVStore,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "./archive";
-import { migrateFallbackArchiveUrl } from "./archive-auth";
+import { FALLBACK_ARCHIVE_MIGRATION_VERSION, migrateFallbackArchiveUrl } from "./archive-auth";
 
 /**
  * Everything the extension persists, in one place. All of it lives in
@@ -21,10 +21,12 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
-  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://dell-plx:8081`. */
+  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://dell-plx-reader:8081`. */
   fallbackArchiveUrl: "fallbackArchiveUrl",
   /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
   readerPassword: "readerPassword",
+  /** Version of the one-time fallback-host migration already applied (a number). */
+  fallbackArchiveMigrated: "fallbackArchiveMigrated",
   /** `{ upUntil, downUntil, updatedAt }` for the Mac/fallback archive race. */
   archiveOriginCache: "archiveOriginCache",
   /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
@@ -90,6 +92,7 @@ export async function loadSettings(): Promise<Settings> {
     KEYS.blockedSites,
     KEYS.archiveUrl,
     KEYS.fallbackArchiveUrl,
+    KEYS.fallbackArchiveMigrated,
     KEYS.readerPassword,
     KEYS.model,
     KEYS.autoRebuild,
@@ -97,12 +100,19 @@ export async function loadSettings(): Promise<Settings> {
   ]);
   const model = s[KEYS.model] as string | undefined;
   const storedFallback = s[KEYS.fallbackArchiveUrl];
-  const fallback = migrateFallbackArchiveUrl(typeof storedFallback === "string" ? storedFallback : undefined);
-  if (fallback.changed) {
+  const storedVersion = s[KEYS.fallbackArchiveMigrated];
+  const fallback = migrateFallbackArchiveUrl(
+    typeof storedFallback === "string" ? storedFallback : undefined,
+    typeof storedVersion === "number" ? storedVersion : undefined,
+  );
+  if (fallback.changed || fallback.recordVersion) {
     try {
-      await saveSetting("fallbackArchiveUrl", fallback.url);
+      const patch: Record<string, unknown> = {};
+      if (fallback.recordVersion) patch[KEYS.fallbackArchiveMigrated] = FALLBACK_ARCHIVE_MIGRATION_VERSION;
+      if (fallback.changed) patch[KEYS.fallbackArchiveUrl] = fallback.url;
+      await browser.storage.local.set(patch);
     } catch {
-      /* The read below still uses the new address. */
+      /* The read below still uses the migrated address. */
     }
   }
   return {

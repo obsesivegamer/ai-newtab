@@ -1,10 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
 import {
   DEFAULT_FALLBACK_ARCHIVE_URL,
-  RETIRED_FALLBACK_ARCHIVE_URL,
+  FALLBACK_ARCHIVE_MIGRATION_VERSION,
+  RETIRED_FALLBACK_ARCHIVE_URLS,
   migrateFallbackArchiveUrl,
 } from "../apps/extension/lib/archive-auth";
 import { KEYS, loadSettings } from "../apps/extension/lib/storage";
+
+const READER = "http://dell-plx-reader:8081";
+const RETIRED = "http://boxj:8081";
+const INTERMEDIATE = "http://dell-plx:8081";
 
 const store = new Map<string, unknown>();
 let writes = 0;
@@ -37,51 +42,120 @@ afterEach(() => {
   delete (globalThis as { browser?: unknown }).browser;
 });
 
-test("the offline reader defaults to dell-plx", () => {
-  expect(DEFAULT_FALLBACK_ARCHIVE_URL).toBe("http://dell-plx:8081");
-  expect(RETIRED_FALLBACK_ARCHIVE_URL).toBe("http://boxj:8081");
+function installBrowser() {
+  (globalThis as unknown as { browser: typeof mockBrowser }).browser = mockBrowser;
+}
+
+test("the offline reader defaults to dell-plx-reader", () => {
+  expect(DEFAULT_FALLBACK_ARCHIVE_URL).toBe(READER);
+  expect(RETIRED_FALLBACK_ARCHIVE_URLS).toEqual([RETIRED, INTERMEDIATE]);
+  expect(FALLBACK_ARCHIVE_MIGRATION_VERSION).toBe(1);
 });
 
-test("a stored boxj default migrates to dell-plx and any other fallback stays", async () => {
-  expect(migrateFallbackArchiveUrl(undefined)).toEqual({ url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: false });
-  expect(migrateFallbackArchiveUrl("")).toEqual({ url: "", changed: false });
-  expect(migrateFallbackArchiveUrl("http://archive.example:9090")).toEqual({
+test("retired defaults migrate once and every other fallback stays", () => {
+  expect(migrateFallbackArchiveUrl(undefined, undefined)).toEqual({
+    url: READER,
+    changed: false,
+    recordVersion: true,
+  });
+  expect(migrateFallbackArchiveUrl("", undefined)).toEqual({ url: "", changed: false, recordVersion: true });
+  expect(migrateFallbackArchiveUrl("http://archive.example:9090", undefined)).toEqual({
     url: "http://archive.example:9090",
     changed: false,
+    recordVersion: true,
   });
-  expect(migrateFallbackArchiveUrl("http://boxj:8081/")).toEqual({ url: "http://boxj:8081/", changed: false });
-  expect(migrateFallbackArchiveUrl(RETIRED_FALLBACK_ARCHIVE_URL)).toEqual({
-    url: DEFAULT_FALLBACK_ARCHIVE_URL,
+  expect(migrateFallbackArchiveUrl("https://boxj:8081", undefined)).toEqual({
+    url: "https://boxj:8081",
+    changed: false,
+    recordVersion: true,
+  });
+  expect(migrateFallbackArchiveUrl("http://boxj:8081/", undefined)).toEqual({
+    url: "http://boxj:8081/",
+    changed: false,
+    recordVersion: true,
+  });
+  expect(migrateFallbackArchiveUrl(RETIRED, undefined)).toEqual({ url: READER, changed: true, recordVersion: true });
+  expect(migrateFallbackArchiveUrl(INTERMEDIATE, undefined)).toEqual({
+    url: READER,
     changed: true,
+    recordVersion: true,
   });
+  expect(migrateFallbackArchiveUrl(RETIRED, FALLBACK_ARCHIVE_MIGRATION_VERSION)).toEqual({
+    url: RETIRED,
+    changed: false,
+    recordVersion: false,
+  });
+  expect(migrateFallbackArchiveUrl(INTERMEDIATE, FALLBACK_ARCHIVE_MIGRATION_VERSION)).toEqual({
+    url: INTERMEDIATE,
+    changed: false,
+    recordVersion: false,
+  });
+});
 
-  (globalThis as unknown as { browser: typeof mockBrowser }).browser = mockBrowser;
+test("a stored retired default is rewritten once and the migration is recorded", async () => {
+  installBrowser();
 
-  store.set(KEYS.fallbackArchiveUrl, RETIRED_FALLBACK_ARCHIVE_URL);
-  const migrated = await loadSettings();
-  expect(migrated.fallbackArchiveUrl).toBe("http://dell-plx:8081");
-  expect(store.get(KEYS.fallbackArchiveUrl)).toBe("http://dell-plx:8081");
-  expect(writes).toBe(1);
+  for (const retired of [RETIRED, INTERMEDIATE]) {
+    store.clear();
+    writes = 0;
+    store.set(KEYS.fallbackArchiveUrl, retired);
+    const migrated = await loadSettings();
+    expect(migrated.fallbackArchiveUrl).toBe(READER);
+    expect(store.get(KEYS.fallbackArchiveUrl)).toBe(READER);
+    expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+    expect(writes).toBe(1);
 
-  writes = 0;
-  const again = await loadSettings();
-  expect(again.fallbackArchiveUrl).toBe("http://dell-plx:8081");
-  expect(writes).toBe(0);
+    writes = 0;
+    const again = await loadSettings();
+    expect(again.fallbackArchiveUrl).toBe(READER);
+    expect(writes).toBe(0);
+  }
+});
 
+test("the migration flag keeps a later choice of a retired address", async () => {
+  installBrowser();
   store.set(KEYS.fallbackArchiveUrl, "http://archive.example:9090");
   const custom = await loadSettings();
   expect(custom.fallbackArchiveUrl).toBe("http://archive.example:9090");
   expect(store.get(KEYS.fallbackArchiveUrl)).toBe("http://archive.example:9090");
-  expect(writes).toBe(0);
+  expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+  expect(writes).toBe(1);
 
-  store.set(KEYS.fallbackArchiveUrl, "");
-  const off = await loadSettings();
-  expect(off.fallbackArchiveUrl).toBe("");
-  expect(writes).toBe(0);
+  for (const chosen of [RETIRED, INTERMEDIATE]) {
+    writes = 0;
+    store.set(KEYS.fallbackArchiveUrl, chosen);
+    const kept = await loadSettings();
+    expect(kept.fallbackArchiveUrl).toBe(chosen);
+    expect(store.get(KEYS.fallbackArchiveUrl)).toBe(chosen);
+    expect(writes).toBe(0);
+  }
+});
 
-  store.delete(KEYS.fallbackArchiveUrl);
+test("near-misses, an empty address, and a missing address are not rewritten", async () => {
+  installBrowser();
+
+  for (const kept of ["https://boxj:8081", "http://boxj:8081/", ""]) {
+    store.clear();
+    writes = 0;
+    store.set(KEYS.fallbackArchiveUrl, kept);
+    const loaded = await loadSettings();
+    expect(loaded.fallbackArchiveUrl).toBe(kept);
+    expect(store.get(KEYS.fallbackArchiveUrl)).toBe(kept);
+    expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+    expect(writes).toBe(1);
+
+    writes = 0;
+    store.set(KEYS.fallbackArchiveUrl, RETIRED);
+    const later = await loadSettings();
+    expect(later.fallbackArchiveUrl).toBe(RETIRED);
+    expect(writes).toBe(0);
+  }
+
+  store.clear();
+  writes = 0;
   const fresh = await loadSettings();
-  expect(fresh.fallbackArchiveUrl).toBe("http://dell-plx:8081");
+  expect(fresh.fallbackArchiveUrl).toBe(READER);
   expect(store.has(KEYS.fallbackArchiveUrl)).toBe(false);
-  expect(writes).toBe(0);
+  expect(store.get(KEYS.fallbackArchiveMigrated)).toBe(FALLBACK_ARCHIVE_MIGRATION_VERSION);
+  expect(writes).toBe(1);
 });

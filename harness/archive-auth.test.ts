@@ -3,7 +3,7 @@ import { createArchiveBridge } from "../apps/extension/lib/archive";
 import { READER_BASIC_USER } from "../apps/extension/lib/archive-auth";
 
 const MAC = "http://127.0.0.1:8080";
-const BOX = "http://dell-plx:8081";
+const FALLBACK = "http://dell-plx-reader:8081";
 const PASSWORD = "secret";
 
 interface Seen {
@@ -63,7 +63,7 @@ function installFetch() {
 
 test("a Mac archive request carries no Authorization header", async () => {
   const seen = installFetch();
-  const auth = { macBase: MAC, fallbackBase: BOX, password: PASSWORD };
+  const auth = { macBase: MAC, fallbackBase: FALLBACK, password: PASSWORD };
 
   await createArchiveBridge(MAC, auth).listArticles({ sinceDays: 1, limit: 1 });
 
@@ -73,15 +73,15 @@ test("a Mac archive request carries no Authorization header", async () => {
   expect(seen[0].redirect).toBeUndefined();
 
   seen.length = 0;
-  await createArchiveBridge(BOX, auth).listArticles({ sinceDays: 1, limit: 1 });
-  expect(seen[0].url.startsWith(`${BOX}/api/snapshots`)).toBe(true);
+  await createArchiveBridge(FALLBACK, auth).listArticles({ sinceDays: 1, limit: 1 });
+  expect(seen[0].url.startsWith(`${FALLBACK}/api/snapshots`)).toBe(true);
   expect(seen[0].authorization?.startsWith("Basic ")).toBe(true);
   expect(atob(seen[0].authorization!.slice("Basic ".length))).toBe(`${READER_BASIC_USER}:${PASSWORD}`);
   expect(seen[0].redirect).toBe("error");
 
   // The Mac origin wins even if someone points both addresses at it.
   seen.length = 0;
-  await createArchiveBridge(BOX, { macBase: BOX, fallbackBase: BOX, password: PASSWORD }).listArticles({
+  await createArchiveBridge(FALLBACK, { macBase: FALLBACK, fallbackBase: FALLBACK, password: PASSWORD }).listArticles({
     sinceDays: 1,
     limit: 1,
   });

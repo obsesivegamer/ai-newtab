@@ -218,16 +218,16 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
   if (opts.cache.upUntil !== null && t < opts.cache.upUntil) return one("mac", mac);
   if (fallback && opts.cache.downUntil !== null && t < opts.cache.downUntil) return one("fallback", fallback);
   if (!fallback) return one("mac", mac);
-  const box: string = fallback;
+  const fallbackBase: string = fallback;
 
-  const boxUrl = join(box, opts.path);
+  const fallbackUrl = join(fallbackBase, opts.path);
   return new Promise((resolve, reject) => {
     let settled = false;
     let headersSeen = false;
-    let boxStarted = false;
+    let fallbackStarted = false;
     let macResult: FetchResult | null = null;
-    let boxResult: FetchResult | null = null;
-    let boxAbort: AbortController | null = null;
+    let fallbackResult: FetchResult | null = null;
+    let fallbackAbort: AbortController | null = null;
     let headerTimer: ReturnType<typeof setTimeout> | undefined;
 
     const clearHeaderTimer = () => {
@@ -252,47 +252,48 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
       stopCaller();
       reject(err);
     };
-    const abortBox = () => boxAbort?.abort();
+    const abortFallback = () => fallbackAbort?.abort();
     onCallerAbort = () => {
       // The Mac may already have failed and the fallback fetch may ignore the
       // signal. Cancel still has to reject; waiting on that fetch would hang.
-      abortBox();
+      abortFallback();
       if (!settled) finishErr(describe({ kind: "aborted" }, macUrl));
     };
 
-    const startBox = () => {
-      if (boxStarted || settled) return;
-      boxStarted = true;
-      boxAbort = new AbortController();
-      void runFetch(boxUrl, opts.timeoutMs, fetchImpl, auth, opts.signal, boxAbort.signal).then(
-        handleBox,
-        () => handleBox({ kind: "network" }),
+    const startFallback = () => {
+      if (fallbackStarted || settled) return;
+      fallbackStarted = true;
+      fallbackAbort = new AbortController();
+      void runFetch(fallbackUrl, opts.timeoutMs, fetchImpl, auth, opts.signal, fallbackAbort.signal).then(
+        handleFallback,
+        () => handleFallback({ kind: "network" }),
       );
     };
 
     const failIfBothDone = () => {
       if (settled || !macResult || isTerminalAnswer(macResult)) return;
-      if (!boxStarted) {
-        startBox();
+      if (!fallbackStarted) {
+        startFallback();
         return;
       }
       // A usable fallback already resolved. An aborted one is finished too, so a
       // Mac that has already failed rejects here instead of waiting for a body.
-      if (!boxResult || boxResult.kind === "usable") return;
-      if (boxResult.kind === "aborted" && opts.signal?.aborted) {
-        finishErr(describe(boxResult, boxUrl));
+      if (!fallbackResult || fallbackResult.kind === "usable") return;
+      if (fallbackResult.kind === "aborted" && opts.signal?.aborted) {
+        finishErr(describe(fallbackResult, fallbackUrl));
         return;
       }
-      const error = boxResult.kind === "status" ? describe(boxResult, boxUrl) : describe(macResult, macUrl);
+      const error =
+        fallbackResult.kind === "status" ? describe(fallbackResult, fallbackUrl) : describe(macResult, macUrl);
       finishErr(error);
     };
 
-    function handleBox(result: FetchResult) {
-      boxResult = result;
+    function handleFallback(result: FetchResult) {
+      fallbackResult = result;
       if (result.kind === "usable") {
         // The Mac request is left running. A later usable body refreshes the cache
         // and must not replace the list this resolution already handed back.
-        if (!settled) finishOk({ origin: "fallback", base: box, json: result.json });
+        if (!settled) finishOk({ origin: "fallback", base: fallbackBase, json: result.json });
         return;
       }
       if (!settled) failIfBothDone();
@@ -301,14 +302,14 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
     function handleMac(result: FetchResult) {
       clearHeaderTimer();
       if (result.kind === "aborted") {
-        abortBox();
+        abortFallback();
         if (!settled) finishErr(describe(result, macUrl));
         return;
       }
       if (result.kind === "usable") {
         markUp();
         if (!settled) {
-          abortBox();
+          abortFallback();
           finishOk({ origin: "mac", base: mac, json: result.json });
         }
         return;
@@ -317,7 +318,7 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
       macResult = result;
       if (settled) return;
       if (isTerminalAnswer(result)) {
-        abortBox();
+        abortFallback();
         finishErr(describe(result, macUrl));
         return;
       }
@@ -331,7 +332,7 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
     opts.signal?.addEventListener("abort", onCallerAbort);
 
     headerTimer = setTimeout(() => {
-      if (!headersSeen && !settled) startBox();
+      if (!headersSeen && !settled) startFallback();
     }, FALLBACK_DELAY_MS);
 
     void runFetch(macUrl, opts.timeoutMs, fetchImpl, auth, opts.signal, undefined, () => {

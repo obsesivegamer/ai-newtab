@@ -1,20 +1,45 @@
 import { normalizeArchiveUrl } from "@homepage/agent-core";
 
 /** Read-only amber-reader. Used when the Mac archive doesn't answer. */
-export const DEFAULT_FALLBACK_ARCHIVE_URL = "http://dell-plx:8081";
-
-/** The previous default. A stored copy of this exact address is rewritten to the current default. */
-export const RETIRED_FALLBACK_ARCHIVE_URL = "http://boxj:8081";
+export const DEFAULT_FALLBACK_ARCHIVE_URL = "http://dell-plx-reader:8081";
 
 /**
- * The fallback address to use for `stored`. Missing means the current default.
- * The retired default moves to the current one. Any other value, including ""
- * (failover off), stays.
+ * Exact retired defaults. Each is rewritten once, to the current default.
+ * `http://dell-plx:8081` was an unreleased intermediate default.
  */
-export function migrateFallbackArchiveUrl(stored: string | undefined): { url: string; changed: boolean } {
-  if (stored === RETIRED_FALLBACK_ARCHIVE_URL) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: true };
-  if (stored === undefined) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: false };
-  return { url: stored, changed: false };
+export const RETIRED_FALLBACK_ARCHIVE_URLS = ["http://boxj:8081", "http://dell-plx:8081"] as const;
+
+/** Stored once this fallback-host migration has run, so a later choice of a retired address is kept. */
+export const FALLBACK_ARCHIVE_MIGRATION_VERSION = 1;
+
+export interface FallbackArchiveMigration {
+  url: string;
+  /** The stored address itself must be replaced. */
+  changed: boolean;
+  /** The migration version is not stored yet and must be written. */
+  recordVersion: boolean;
+}
+
+/**
+ * The fallback address to use. Missing means the current default and is not a
+ * stored change. The first time this runs, an exact retired default moves to
+ * the current one and the migration version is recorded. After that version is
+ * stored, those addresses stay, including when someone chooses one on purpose.
+ * Any other value, including "" (failover off), stays.
+ */
+export function migrateFallbackArchiveUrl(
+  stored: string | undefined,
+  migratedVersion: number | undefined,
+): FallbackArchiveMigration {
+  const done =
+    typeof migratedVersion === "number" &&
+    Number.isFinite(migratedVersion) &&
+    migratedVersion >= FALLBACK_ARCHIVE_MIGRATION_VERSION;
+  const url = stored === undefined ? DEFAULT_FALLBACK_ARCHIVE_URL : stored;
+  if (done) return { url, changed: false, recordVersion: false };
+  const retired = stored !== undefined && (RETIRED_FALLBACK_ARCHIVE_URLS as readonly string[]).includes(stored);
+  if (retired) return { url: DEFAULT_FALLBACK_ARCHIVE_URL, changed: true, recordVersion: true };
+  return { url, changed: false, recordVersion: true };
 }
 
 /** HTTP Basic user amber-reader expects. The password is the reader's. */

@@ -478,10 +478,12 @@ agent leads with it. The host supplies an `ArchiveBridge` (`types.ts`), passed t
 `runHomepageBuild` as `archive`; the extension builds it in `lib/archive.ts` from
 the `archiveUrl` setting (default `http://127.0.0.1:8080`, empty disables it).
 Reads try that Mac first, then the offline reader at `fallbackArchiveUrl`
-(default `http://dell-plx:8081`, empty turns failover off). A stored
-`http://boxj:8081` is migrated to the current default; any other saved address
-stays. The harness builds an equivalent Mac bridge from `AMBER_URL`. Without a bridge the
-archive tools answer with an error result and the build runs on history alone.
+(default `http://dell-plx-reader:8081`, empty turns failover off). A stored
+`http://boxj:8081` or `http://dell-plx:8081` (retired defaults; the second was
+an unreleased intermediate) is rewritten once to the current default, and that
+migration is recorded so choosing either address later is kept. Any other saved
+address stays. The harness builds an equivalent Mac bridge from `AMBER_URL`.
+Without a bridge the archive tools answer with an error result and the build runs on history alone.
 
 | Tool | Does |
 |---|---|
