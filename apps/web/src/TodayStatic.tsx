@@ -7,6 +7,7 @@ import { HomepagePreview } from "@newtab/components/HomepagePreview";
 import {
   ASKED_MAC,
   REBUILD_EXPIRED,
+  REBUILD_ROUTE_MISSING,
   REBUILD_WAIT_TIMED_OUT,
   TODAY_POLL_LIMIT_MS,
   TODAY_POLL_MS,
@@ -32,8 +33,8 @@ const READER_APP_URL = `${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`;
 /**
  * Today on the phone: the page the extension built and handed to Amber, shown as it is.
  * No key and no model here. Refresh asks the Mac once the page is about an hour old.
- * "Rebuild on Mac" always asks. The preview only mounts in a secure context
- * (Sandpack needs `crypto.subtle`).
+ * "Rebuild on Mac" asks unless a newer page is already on the reader. The preview
+ * only mounts in a secure context (Sandpack needs `crypto.subtle`).
  */
 export function TodayStatic({ origin, active }: { origin: string; active: boolean }) {
   const [state, setState] = useState<State>({ status: "loading" });
@@ -119,6 +120,8 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
       if (posted.status === "missing") {
         rebuildUnsupported.current = true;
         setCanRebuild(false);
+        setFailure(REBUILD_ROUTE_MISSING);
+        setNotice("failed");
         return;
       }
       if (posted.status === "error") {
@@ -161,12 +164,12 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
         }
         const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
         applyOk(result);
+        if (advanced) {
+          setNotice("updated");
+          return;
+        }
         const now = Date.now();
         if (mode === "if-stale") {
-          if (advanced) {
-            setNotice("updated");
-            return;
-          }
           if (!timestampParses(result.homepage.timestamp)) {
             setNotice("unreadable");
             return;
@@ -175,9 +178,16 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
             setNotice("uptodate");
             return;
           }
-          if (rebuildUnsupported.current || !shouldAskRebuild(result.homepage.timestamp, now)) return;
+          if (rebuildUnsupported.current || !shouldAskRebuild(result.homepage.timestamp, now)) {
+            if (rebuildUnsupported.current) {
+              setFailure(REBUILD_ROUTE_MISSING);
+              setNotice("failed");
+            }
+            return;
+          }
         } else if (rebuildUnsupported.current) {
-          if (advanced) setNotice("updated");
+          setFailure(REBUILD_ROUTE_MISSING);
+          setNotice("failed");
           return;
         }
         await askMac(result, previous);

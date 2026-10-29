@@ -1,5 +1,5 @@
 import { anySignal, normalizeArchiveUrl } from "@homepage/agent-core";
-import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
+import { archiveGetInit, noteMissingReaderPassword, type ArchiveAuth } from "./archive-auth";
 
 /** After a Mac win, later reads call only the Mac. */
 export const MAC_UP_MS = 2 * 60 * 1000;
@@ -169,6 +169,7 @@ function isTerminalAnswer(result: FetchResult): result is { kind: "status"; stat
  * if the Mac wins. A Mac 401 or 404 is the answer: the fallback is not used.
  * A Mac body that arrives after the fallback has already won refreshes the cache
  * and is not returned. The caller keeps the list it already has.
+ * A configured reader with no password is not called.
  */
 export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
   const now = opts.now ?? Date.now;
@@ -189,7 +190,11 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
   if (!macBase) throw new Error("Invalid archive URL");
   // A fresh binding, so the closures below see `string` rather than a narrowed `string | null`.
   const mac: string = macBase;
-  const fallback = opts.fallbackBase?.trim() ? normalizeArchiveUrl(opts.fallbackBase) : null;
+  let fallback = opts.fallbackBase?.trim() ? normalizeArchiveUrl(opts.fallbackBase) : null;
+  if (fallback && !opts.password.trim()) {
+    noteMissingReaderPassword();
+    fallback = null;
+  }
   const auth: ArchiveAuth = { macBase: mac, fallbackBase: fallback ?? "", password: opts.password };
   const macUrl = join(mac, opts.path);
 

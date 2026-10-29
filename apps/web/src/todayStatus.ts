@@ -12,6 +12,8 @@ export const MAC_REBUILD_REQUIREMENTS =
 export const ASKED_MAC = `Asked your Mac to rebuild. ${MAC_REBUILD_REQUIREMENTS}`;
 export const REBUILD_WAIT_TIMED_OUT = `No new page arrived. ${MAC_REBUILD_REQUIREMENTS}`;
 export const REBUILD_EXPIRED = "The last rebuild request expired before a new page arrived.";
+/** Why Rebuild on Mac disappears after the reader answers 404. */
+export const REBUILD_ROUTE_MISSING = "This reader has no rebuild route, so that button is hidden.";
 export const UNREADABLE_BUILD_TIME =
   "This page has no readable build time, so Refresh can't tell whether to ask for a rebuild.";
 

@@ -7,7 +7,7 @@ import {
   type HomepageModel,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
-import { DEFAULT_FALLBACK_ARCHIVE_URL } from "@/lib/archive-auth";
+import { archiveGetInit, DEFAULT_FALLBACK_ARCHIVE_URL, type ArchiveAuth } from "@/lib/archive-auth";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
 import { fetchRemoteSources, isShareableArchiveHost, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
@@ -31,11 +31,29 @@ const AMBER_DOWN = "Amber isn't running — start it (its run script or launchd 
 
 const NOT_AN_ADDRESS = "That doesn't look like a web address. Try http://127.0.0.1:8080";
 
+/**
+ * Auth for a connection test. The Mac address never gets the reader password.
+ * An address that is the offline reader does, when a password is set.
+ */
+function authForAddress(base: string, fallback: string, password: string): ArchiveAuth {
+  const fallbackBase = fallback.trim() === "" ? "" : (normalizeArchiveUrl(fallback) ?? "");
+  let targetsReader = false;
+  try {
+    targetsReader = Boolean(fallbackBase) && new URL(base).origin === new URL(fallbackBase).origin;
+  } catch {
+    targetsReader = false;
+  }
+  return { macBase: targetsReader ? "" : base, fallbackBase, password };
+}
+
 /** One cheap read of the archive's list endpoint, turned into a sentence a person can act on. */
-async function testArchive(base: string): Promise<ArchiveCheck> {
+async function testArchive(base: string, auth: ArchiveAuth): Promise<ArchiveCheck> {
+  const url = `${base}/api/snapshots?since_days=365&limit=1`;
+  const gated = archiveGetInit(url, auth);
   let response: Response;
   try {
-    response = await fetch(`${base}/api/snapshots?since_days=365&limit=1`, {
+    response = await fetch(url, {
+      ...gated,
       signal: AbortSignal.timeout(5_000),
     });
   } catch {
@@ -110,6 +128,10 @@ export function SettingsModal({
   const [fallbackUrl, setFallbackUrl] = useState(DEFAULT_FALLBACK_ARCHIVE_URL);
   const [readerPassword, setReaderPassword] = useState("");
   const [archiveLoaded, setArchiveLoaded] = useState(false);
+  /** What was last loaded or written, so closing can tell a draft from a saved password. */
+  const savedArchive = useRef(DEFAULT_ARCHIVE_URL);
+  const savedFallback = useRef(DEFAULT_FALLBACK_ARCHIVE_URL);
+  const savedPassword = useRef("");
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
   /** Bumped whenever the field changes, a test starts, or the modal goes away; a late test result is ignored. */
   const archiveRequest = useRef(0);
@@ -152,6 +174,9 @@ export function SettingsModal({
     let cancelled = false;
     void loadSettings().then((s) => {
       if (cancelled) return;
+      savedArchive.current = s.archiveUrl;
+      savedFallback.current = s.fallbackArchiveUrl;
+      savedPassword.current = s.readerPassword;
       setArchiveUrl(s.archiveUrl);
       setFallbackUrl(s.fallbackArchiveUrl);
       setReaderPassword(s.readerPassword);
@@ -191,13 +216,42 @@ export function SettingsModal({
     // Once, when the address has loaded: later edits to the field don't re-read.
   }, [archiveLoaded]);
 
+  const formDirty = (): boolean => {
+    if (draft !== initialPrompt) return true;
+    if (normalizeBlockList(blockedDraft.split("\n")).join("\n") !== normalizeBlockList(blockedSites).join("\n")) {
+      return true;
+    }
+    if (sourcesDirty) return true;
+    if (!archiveLoaded) return false;
+    return (
+      archiveUrl !== savedArchive.current ||
+      fallbackUrl !== savedFallback.current ||
+      readerPassword !== savedPassword.current
+    );
+  };
+  const dirtyRef = useRef(false);
+  dirtyRef.current = formDirty();
+  const saveRef = useRef<(rebuild: boolean) => Promise<void>>(async () => {});
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  const requestClose = () => {
+    if (dirtyRef.current) {
+      if (window.confirm("You have unsaved changes. Save them before closing?")) {
+        void saveRef.current(false);
+        return;
+      }
+    }
+    closeRef.current();
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   /** The address as it should be saved: "" (archive off), a clean base URL, or null if it can't be one. */
   const archiveValue = (): string | null => (archiveUrl.trim() === "" ? "" : normalizeArchiveUrl(archiveUrl));
@@ -225,12 +279,15 @@ export function SettingsModal({
       await saveSetting("archiveUrl", value);
       await saveSetting("fallbackArchiveUrl", fallback);
       await saveSetting("readerPassword", readerPassword);
+      savedArchive.current = value;
+      savedFallback.current = fallback;
+      savedPassword.current = readerPassword;
     }
     return true;
   };
 
-  // Like the prompt box, the address is a draft: it is written only when a test
-  // succeeds or "Save & rebuild" is clicked, never by Cancel.
+  // A successful test writes the Mac address and the reader password (and a valid
+  // fallback). Esc and Cancel ask before dropping anything still unsaved.
   const runArchiveTest = async () => {
     const value = archiveValue();
     const request = ++archiveRequest.current;
@@ -246,12 +303,21 @@ export function SettingsModal({
       return;
     }
     setArchiveCheck({ state: "testing" });
-    const result = await testArchive(value);
+    const fallback = fallbackValue();
+    const result = await testArchive(value, authForAddress(value, fallback ?? "", readerPassword));
     if (request !== archiveRequest.current) return;
     if (result.state === "ok") {
       await saveSetting("archiveUrl", value);
+      savedArchive.current = value;
+      if (fallback !== null) {
+        await saveSetting("fallbackArchiveUrl", fallback);
+        savedFallback.current = fallback;
+      }
+      await saveSetting("readerPassword", readerPassword);
+      savedPassword.current = readerPassword;
       if (request !== archiveRequest.current) return;
       setArchiveUrl(value);
+      if (fallback !== null) setFallbackUrl(fallback);
     }
     setArchiveCheck(result);
   };
@@ -276,6 +342,7 @@ export function SettingsModal({
     }
     onSave(draft, blockedNow, rebuild && rebuildMeaningful);
   };
+  saveRef.current = save;
 
   const statusClass =
     archiveCheck.state === "ok" ? "ok" : archiveCheck.state === "error" ? "error" : "";
@@ -343,7 +410,7 @@ export function SettingsModal({
   };
 
   return (
-    <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && requestClose()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header className="modal-head">
           <h2 id="settings-title" className="modal-title">
@@ -352,7 +419,7 @@ export function SettingsModal({
           <button
             type="button"
             className="icon-btn"
-            onClick={onClose}
+            onClick={requestClose}
             title="Close"
             aria-label="Close settings"
           >
@@ -492,7 +559,7 @@ export function SettingsModal({
             </label>
             <p id="fallback-help" className="set-hint">
               When the Mac archive doesn't answer, saved articles are read from here instead. Leave
-              empty to turn that off. Saved when you click Save.
+              empty to turn that off. Saved when a test succeeds or you click Save.
             </p>
             <input
               id="set-fallback"
@@ -514,7 +581,7 @@ export function SettingsModal({
             </label>
             <p id="reader-password-help" className="set-hint">
               Sent only to the offline reader, as the password for the user “amber”. Never sent to
-              the Mac archive.
+              the Mac archive. Saved when a test succeeds or you click Save.
             </p>
             <input
               id="set-reader-password"
@@ -629,7 +696,7 @@ export function SettingsModal({
         </div>
 
         <footer className="modal-foot">
-          <button type="button" className="ghost-btn" onClick={onClose}>
+          <button type="button" className="ghost-btn" onClick={requestClose}>
             Cancel
           </button>
           {rebuildMeaningful ? (

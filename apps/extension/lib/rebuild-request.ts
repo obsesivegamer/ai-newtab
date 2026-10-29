@@ -9,8 +9,8 @@ import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 export const REBUILD_POLL_MIN_MS = 50_000;
 
 /**
- * The reader check gives up quickly. It runs beside the scheduled rebuild, so a
- * reader that never answers must not hold that rebuild up.
+ * The reader check gives up quickly. The scheduled rebuild has already been
+ * decided, and a reader that never answers must not sit on the worker.
  */
 export const REBUILD_POLL_TIMEOUT_MS = 2_500;
 
@@ -72,7 +72,7 @@ export async function fetchRebuildRequest(
   macUrl: string,
 ): Promise<RebuildRequestFetch> {
   const base = normalizeArchiveUrl(readerUrl);
-  if (!base || !password) return { status: "none" };
+  if (!base || !password.trim()) return { status: "none" };
   const url = `${base}/api/homepage/rebuild-request`;
   const auth: ArchiveAuth = { macBase: macUrl, fallbackBase: base, password };
   const gated = archiveGetInit(url, auth);
@@ -89,22 +89,12 @@ export async function fetchRebuildRequest(
 }
 
 export function canPollRebuildRequest(input: {
-  running: boolean;
   readerConfigured: boolean;
   hasApiKey: boolean;
   autoRebuild: boolean;
   authRejected: boolean;
 }): boolean {
-  return !input.running && input.readerConfigured && input.hasApiKey && input.autoRebuild && !input.authRejected;
-}
-
-export function shouldPollRebuildRequest(
-  input: {
-    now: number;
-    lastPollAt: number;
-  } & Parameters<typeof canPollRebuildRequest>[0],
-): boolean {
-  return canPollRebuildRequest(input) && input.now - input.lastPollAt >= REBUILD_POLL_MIN_MS;
+  return input.readerConfigured && input.hasApiKey && input.autoRebuild && !input.authRejected;
 }
 
 /**
@@ -157,6 +147,11 @@ export function rememberRebuildRequestId(handled: readonly string[], id: string)
   const next = handled.filter((item) => item !== id);
   next.push(id);
   return next.slice(-HANDLED_REBUILD_CAP);
+}
+
+/** Drop one id so a failed build can see that request again. */
+export function forgetRebuildRequestId(handled: readonly string[], id: string): string[] {
+  return handled.filter((item) => item !== id);
 }
 
 /**

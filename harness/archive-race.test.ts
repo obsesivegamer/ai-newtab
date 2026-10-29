@@ -22,7 +22,12 @@ declare global {
   };
 }
 import { LIST_TIMEOUT_MS, TEXT_TIMEOUT_MS, parseSnapshotList } from "../apps/extension/lib/archive";
-import { DEFAULT_FALLBACK_ARCHIVE_URL, READER_BASIC_USER, basicAuthorization } from "../apps/extension/lib/archive-auth";
+import {
+  DEFAULT_FALLBACK_ARCHIVE_URL,
+  READER_BASIC_USER,
+  READER_PASSWORD_MISSING,
+  basicAuthorization,
+} from "../apps/extension/lib/archive-auth";
 import { loadReadingArticles, loadReadingList } from "../apps/extension/lib/archive-reading";
 import {
   FALLBACK_DELAY_MS,
@@ -612,4 +617,39 @@ test("the five-minute Mac-down window expires back into a cold race", async () =
   expect(calls.map((call) => call.url)).toEqual([`${MAC}${LIST_PATH}`]);
   expect(cache.upUntil).toBe(Date.now() + MAC_UP_MS);
   expect(cache.downUntil).toBeNull();
+});
+
+test("a reader with no password is never called, and the notice is warned once", async () => {
+  const warnings: string[] = [];
+  const previous = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((arg) => String(arg)).join(" "));
+  };
+  const calls = install(() => jsonResponse(listBody("From mac")));
+  const read = (password: string, cache = createOriginCache()) =>
+    raceArchiveJson({
+      macBase: MAC,
+      fallbackBase: FALLBACK,
+      password,
+      path: LIST_PATH,
+      timeoutMs: LIST_TIMEOUT_MS,
+      cache,
+      fetchImpl: globalThis.fetch,
+    });
+  try {
+    const first = await read("  ");
+    expect(first.origin).toBe("mac");
+    const down = createOriginCache();
+    down.downUntil = Date.now() + 60_000;
+    const second = await read("", down);
+    expect(second.origin).toBe("mac");
+    expect(second.base).toBe(MAC);
+  } finally {
+    console.warn = previous;
+  }
+  expect(calls.some((call) => call.url.startsWith(FALLBACK))).toBe(false);
+  expect(calls.every((call) => call.url.startsWith(MAC))).toBe(true);
+  expect(calls.every((call) => call.authorization === null)).toBe(true);
+  expect(warnings.filter((line) => line === READER_PASSWORD_MISSING)).toHaveLength(1);
+  expect(warnings.join("\n").includes("Basic")).toBe(false);
 });

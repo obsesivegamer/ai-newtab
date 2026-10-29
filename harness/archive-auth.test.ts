@@ -88,3 +88,23 @@ test("a Mac archive request carries no Authorization header", async () => {
   expect(seen[0].authorization).toBeNull();
   expect(seen[0].redirect).toBeUndefined();
 });
+
+test("an empty reader password adds no Authorization header", async () => {
+  const seen = installFetch();
+  await createArchiveBridge(FALLBACK, { macBase: MAC, fallbackBase: FALLBACK, password: "" }).listArticles({
+    sinceDays: 1,
+    limit: 1,
+  });
+  expect(seen).toHaveLength(1);
+  expect(seen[0].url.startsWith(`${FALLBACK}/api/snapshots`)).toBe(true);
+  expect(seen[0].authorization).toBeNull();
+  expect(seen[0].redirect).toBeUndefined();
+
+  seen.length = 0;
+  await createArchiveBridge(FALLBACK, { macBase: MAC, fallbackBase: FALLBACK, password: "  " }).listArticles({
+    sinceDays: 1,
+    limit: 1,
+  });
+  expect(seen[0].authorization).toBeNull();
+  expect(seen[0].redirect).toBeUndefined();
+});

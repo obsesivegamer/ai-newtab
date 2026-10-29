@@ -1,18 +1,20 @@
 import { afterEach, expect, test } from "bun:test";
 import { READER_BASIC_USER, basicAuthorization } from "../apps/extension/lib/archive-auth";
 import { publishBuiltHomepage, pushReaderHomepage } from "../apps/extension/lib/phone-sync";
-import { fetchHomepage, fetchRemoteSources, rebuildRequestError, requestHomepageRebuild } from "../apps/extension/lib/phone-sync";
+import { fetchHomepage, fetchRemoteSources, publishSources, pushHomepage, rebuildRequestError, requestHomepageRebuild } from "../apps/extension/lib/phone-sync";
+import { KEYS } from "../apps/extension/lib/storage";
 import {
   READER_AUTH_MESSAGE,
   REBUILD_POLL_MIN_MS,
   REBUILD_POLL_TIMEOUT_MS,
   fetchRebuildRequest,
   passwordFingerprint,
+  canPollRebuildRequest,
+  forgetRebuildRequestId,
   persistedReaderAuthNotice,
   readerAuthNotice,
   rebuildTickAction,
   rememberRebuildRequestId,
-  shouldPollRebuildRequest,
   type RebuildRequest,
   type RebuildRequestFetch,
 } from "../apps/extension/lib/rebuild-request";
@@ -112,6 +114,7 @@ test("a rebuild starts once per unseen unfulfilled id, and never from the clocks
   expect(rebuildTickAction({ running: false, request: ready({ cooldown: true }), handledIds: [] })).toBe("skip");
   expect(rebuildTickAction({ running: true, request: ready({ id: "req-2" }), handledIds: seen })).toBe("remember");
   expect(rememberRebuildRequestId(seen, "req-2")).toEqual(["req-1", "req-2"]);
+  expect(forgetRebuildRequestId(["req-1", "req-2"], "req-1")).toEqual(["req-2"]);
   const many = Array.from({ length: 40 }, (_, i) => `id-${i}`);
   expect(rememberRebuildRequestId(many, "id-new")).toHaveLength(32);
   expect(rememberRebuildRequestId(many, "id-new").at(-1)).toBe("id-new");
@@ -129,9 +132,6 @@ test("a missing, failed, or rejected rebuild request does not start a build", ()
 });
 
 const poll = {
-  running: false,
-  now: 1_000_000,
-  lastPollAt: 0,
   readerConfigured: true,
   hasApiKey: true,
   autoRebuild: true,
@@ -141,13 +141,11 @@ const poll = {
 test("the reader is polled about once a minute, and only with a key, auto-rebuild, and a good password", () => {
   expect(REBUILD_POLL_MIN_MS).toBe(50_000);
   expect(REBUILD_POLL_TIMEOUT_MS).toBeLessThanOrEqual(3_000);
-  expect(shouldPollRebuildRequest({ ...poll, running: true })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, readerConfigured: false })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, hasApiKey: false })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, autoRebuild: false })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, authRejected: true })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, lastPollAt: poll.now - REBUILD_POLL_MIN_MS + 1 })).toBe(false);
-  expect(shouldPollRebuildRequest({ ...poll, lastPollAt: poll.now - REBUILD_POLL_MIN_MS })).toBe(true);
+  expect(canPollRebuildRequest(poll)).toBe(true);
+  expect(canPollRebuildRequest({ ...poll, readerConfigured: false })).toBe(false);
+  expect(canPollRebuildRequest({ ...poll, hasApiKey: false })).toBe(false);
+  expect(canPollRebuildRequest({ ...poll, autoRebuild: false })).toBe(false);
+  expect(canPollRebuildRequest({ ...poll, authRejected: true })).toBe(false);
 });
 
 test("a rejected password keeps its banner after the in-memory notice is gone", async () => {
@@ -293,4 +291,78 @@ test("the reader marks sources read-only, and a 405 is the same", async () => {
 
   installFetch(() => json(405, { detail: "read only" }));
   expect(await fetchRemoteSources(READER)).toEqual({ status: "read_only" });
+});
+
+test("a 200 that is not a rebuild request is not reported as a status, and a bad address is not silence", async () => {
+  installFetch(() => json(200, { ok: true }));
+  expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError(200) });
+  expect(rebuildRequestError(200)).not.toContain("answered 200");
+  expect(await requestHomepageRebuild("not a url")).toEqual({
+    status: "error",
+    message: "That isn't a reader address.",
+  });
+});
+
+test("homepage, sources, and the homepage PUT send Basic only when the URL is the reader", async () => {
+  const store = new Map<string, unknown>();
+  store.set(KEYS.archiveUrl, MAC);
+  store.set(KEYS.fallbackArchiveUrl, READER);
+  store.set(KEYS.readerPassword, PASSWORD);
+  store.set(KEYS.fallbackArchiveMigrated, 2);
+  const mockBrowser = {
+    storage: {
+      local: {
+        async get(keys?: string | string[] | null): Promise<Record<string, unknown>> {
+          const names = keys == null ? [...store.keys()] : typeof keys === "string" ? [keys] : keys;
+          const out: Record<string, unknown> = {};
+          for (const name of names) if (store.has(name)) out[name] = store.get(name);
+          return out;
+        },
+        async set(items: Record<string, unknown>): Promise<void> {
+          for (const [key, value] of Object.entries(items)) store.set(key, value);
+        },
+        async remove(keys: string | string[]): Promise<void> {
+          for (const key of typeof keys === "string" ? [keys] : keys) store.delete(key);
+        },
+      },
+    },
+  };
+  (globalThis as unknown as { browser: typeof mockBrowser }).browser = mockBrowser;
+  watchWarnings();
+  const source = { id: "nyt", name: "NYT", feedUrls: ["https://example.com/rss"], enabled: true };
+  const homepage = { code: "export default function App(){return null}", timestamp: BUILT };
+  try {
+    const seen = installFetch(() =>
+      json(200, { code: homepage.code, timestamp: BUILT, sources: [source], updated_at: REQUESTED, count: 1 }),
+    );
+    await fetchHomepage(READER);
+    await fetchRemoteSources(READER);
+    await publishSources(READER, [source]);
+    await pushHomepage(READER, homepage);
+    for (const call of seen) {
+      expect(call.url.startsWith(READER)).toBe(true);
+      expect(call.authorization).toBe(BASIC);
+      expect(call.redirect).toBe("error");
+    }
+    seen.length = 0;
+    await fetchHomepage(MAC);
+    await fetchRemoteSources(MAC);
+    await publishSources(MAC, [source]);
+    await pushHomepage(MAC, homepage);
+    for (const call of seen) {
+      expect(call.url.startsWith(MAC)).toBe(true);
+      expect(call.authorization).toBeNull();
+      expect(call.redirect).toBeUndefined();
+    }
+    store.set(KEYS.readerPassword, "");
+    seen.length = 0;
+    await fetchHomepage(READER);
+    await fetchRemoteSources(READER);
+    expect(seen).toHaveLength(2);
+    expect(seen.every((call) => call.authorization === null && call.redirect === undefined)).toBe(true);
+    expect(warnings.join("\n").includes(PASSWORD)).toBe(false);
+    expect(/authorization/i.test(warnings.join("\n"))).toBe(false);
+  } finally {
+    delete (globalThis as { browser?: unknown }).browser;
+  }
 });

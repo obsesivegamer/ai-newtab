@@ -3,7 +3,7 @@ import { IS_WEB } from "@/lib/platform";
 import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 import { parseRebuildRequest, type RebuildRequest } from "./rebuild-request";
 import { saveSources } from "./sources";
-import { KEYS } from "./storage";
+import { KEYS, loadSettings } from "./storage";
 
 /**
  * The extension and the phone/web version share two things through Amber (same
@@ -142,11 +142,34 @@ export async function saveSourcesStamp(stamp: string | null | undefined): Promis
   await browser.storage.local.set({ [KEYS.sourcesSyncStamp]: stamp });
 }
 
+/**
+ * Basic auth for one reader URL, loaded from settings. The phone is served by
+ * the reader, so it sends no Basic header. A missing store sends none either.
+ * An empty password sends none. The header is never logged.
+ */
+async function readerRequestInit(url: string): Promise<RequestInit> {
+  if (IS_WEB) return {};
+  try {
+    const settings = await loadSettings();
+    return archiveGetInit(url, {
+      macBase: settings.archiveUrl,
+      fallbackBase: settings.fallbackArchiveUrl,
+      password: settings.readerPassword,
+    });
+  } catch {
+    return {};
+  }
+}
+
 async function putJson(url: string, body: unknown): Promise<void> {
+  const gated = await readerRequestInit(url);
+  const headers = new Headers(gated.headers);
+  headers.set("Content-Type", "application/json");
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
+    redirect: gated.redirect,
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Amber answered ${response.status}`);
@@ -191,7 +214,7 @@ export async function pushReaderHomepage(
   macUrl: string,
 ): Promise<void> {
   const base = shareTarget(readerUrl);
-  if (!base || !password || (macUrl && sameOrigin(base, macUrl))) return;
+  if (!base || !password.trim() || (macUrl && sameOrigin(base, macUrl))) return;
   const url = `${base}/api/homepage`;
   const auth: ArchiveAuth = { macBase: macUrl, fallbackBase: base, password };
   const gated = archiveGetInit(url, auth);
@@ -233,9 +256,13 @@ export type RebuildPost =
   | { status: "missing" }
   | { status: "error"; message: string };
 
-/** What the phone shows when the rebuild POST fails. A missing status means the reader never answered. */
+/**
+ * What the phone shows when the rebuild POST fails. A missing status means the
+ * reader never answered. A 200 here is a body that did not contain a request.
+ */
 export function rebuildRequestError(status?: number): string {
   if (status === undefined) return "The reader didn't answer.";
+  if (status === 200) return "The reader answered, but the rebuild request couldn't be read.";
   return `Couldn't ask your Mac to rebuild. The reader answered ${status}.`;
 }
 
@@ -248,7 +275,7 @@ export function rebuildRequestError(status?: number): string {
  */
 export async function requestHomepageRebuild(origin: string, signal?: AbortSignal): Promise<RebuildPost> {
   const base = normalizeArchiveUrl(origin);
-  if (!base) return { status: "error", message: rebuildRequestError() };
+  if (!base) return { status: "error", message: "That isn't a reader address." };
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
     const response = await fetch(`${base}/api/homepage/rebuild-request`, {
@@ -290,10 +317,16 @@ export async function publishSources(
           ? stampCache
           : await loadSourcesStamp();
     if (!stamp && opts.ifUpdatedAt === undefined && amberHasNoSources) stamp = "";
-    const response = await fetch(`${base}/api/sources`, {
+    const url = `${base}/api/sources`;
+    // A keepalive push has to be issued in this turn. Loading settings would wait.
+    const gated = opts.keepalive ? {} : await readerRequestInit(url);
+    const headers = new Headers(gated.headers);
+    headers.set("Content-Type", "application/json");
+    const response = await fetch(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ sources: sources.map(toSource), ...(typeof stamp === "string" ? { if_updated_at: stamp } : {}) }),
+      redirect: gated.redirect,
       keepalive: opts.keepalive || undefined,
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
@@ -331,7 +364,10 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
   let response: Response;
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
-    response = await fetch(`${base}/api/homepage`, {
+    const url = `${base}/api/homepage`;
+    const gated = await readerRequestInit(url);
+    response = await fetch(url, {
+      ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
   } catch (err) {
@@ -372,7 +408,10 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
 export async function fetchRemoteSources(base: string, signal?: AbortSignal): Promise<RemoteSourcesResult> {
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
-    const response = await fetch(`${base}/api/sources`, {
+    const url = `${base}/api/sources`;
+    const gated = await readerRequestInit(url);
+    const response = await fetch(url, {
+      ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
     if (response.status === 404) {

@@ -51,6 +51,21 @@ export function migrateFallbackArchiveUrl(
 /** HTTP Basic user amber-reader expects. The password is the reader's. */
 export const READER_BASIC_USER = "amber";
 
+/** Shown once when a reader is configured and no password is stored. The password is not included. */
+export const READER_PASSWORD_MISSING = "Reader password not set";
+
+let missingPasswordNoted = false;
+
+/**
+ * Warn once per page or worker. Later reads in that realm stay quiet.
+ * The password and the Authorization header are not part of the line.
+ */
+export function noteMissingReaderPassword(): void {
+  if (missingPasswordNoted) return;
+  missingPasswordNoted = true;
+  console.warn(READER_PASSWORD_MISSING);
+}
+
 /**
  * Which archive a request may authenticate to. `macBase` is the configured Mac
  * archive; requests to that origin never carry Authorization, even if it is also
@@ -84,7 +99,7 @@ function originOf(base: string): string | null {
  * origin never does.
  */
 export function authorizationFor(url: string, auth: ArchiveAuth | undefined): string | undefined {
-  if (!auth?.fallbackBase) return undefined;
+  if (!auth?.fallbackBase || !auth.password.trim()) return undefined;
   const target = originOf(url);
   const fallback = originOf(auth.fallbackBase);
   const mac = originOf(auth.macBase);

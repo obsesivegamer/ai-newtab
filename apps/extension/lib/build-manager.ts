@@ -14,12 +14,13 @@ import {
   type PageMsg,
 } from "./protocol";
 import { publishBuiltHomepage } from "./phone-sync";
-import { fallbackBaseOf } from "./archive-auth";
+import { fallbackBaseOf, noteMissingReaderPassword, READER_PASSWORD_MISSING } from "./archive-auth";
 import {
   READER_AUTH_MESSAGE,
   REBUILD_POLL_MIN_MS,
   canPollRebuildRequest,
   fetchRebuildRequest,
+  forgetRebuildRequestId,
   normalizeHandledRebuildIds,
   passwordFingerprint,
   persistedReaderAuthNotice,
@@ -38,6 +39,8 @@ type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[
  * net that reattaches after an unexpected kill.
  */
 const KEEPALIVE_INTERVAL_MS = 20_000;
+/** One retry, after a short pause, when the Anthropic SDK reports a connection error. */
+const CONNECTION_RETRY_MS = 500;
 
 /** Storage snapshots are throttled so narration deltas don't flood chrome.storage. */
 const SNAPSHOT_THROTTLE_MS = 2_000;
@@ -70,6 +73,8 @@ export class BuildManager {
   /** Epoch ms of the last reader rebuild-request poll. The alarm is about a minute. */
   private lastRebuildPollAt = 0;
   private authRestore: Promise<void> = Promise.resolve();
+  /** Request ids this build stored. A failure puts them back; a success keeps them. */
+  private claimedRequestIds: string[] = [];
 
   constructor() {
     void this.restoreReaderAuthNotice();
@@ -159,7 +164,7 @@ export class BuildManager {
       }
 
       if (!pollDue) {
-        this.running = false;
+        if (!this.building) this.running = false;
         return;
       }
 
@@ -168,7 +173,7 @@ export class BuildManager {
         void this.startBuild({ resume: false, claimed: true });
         return;
       }
-      this.running = false;
+      if (!this.building) this.running = false;
     } catch (err) {
       if (!this.building) this.running = false;
       console.warn(
@@ -194,6 +199,13 @@ export class BuildManager {
     const run = this.authRestore
       .then(async () => {
         const settings = await loadSettings();
+        const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
+        if (reader && !settings.readerPassword.trim()) {
+          noteMissingReaderPassword();
+          if (this.state.notice !== READER_PASSWORD_MISSING) this.onNotice(READER_PASSWORD_MISSING);
+          return;
+        }
+        if (this.state.notice === READER_PASSWORD_MISSING) this.onNotice(null);
         const rejected = await extensionStore.get<string>(KEYS.readerAuthRejected);
         const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
         const next = persistedReaderAuthNotice(rejected, fingerprint, this.state.notice);
@@ -235,12 +247,9 @@ export class BuildManager {
     ]);
     const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
     const authRejected = readerAuthStillRejected(rejected, fingerprint);
-    // `running: false` here is the poll's own gate. The tick already holds
-    // `this.running`; that claim must not look like a build that forbids polling.
     if (
       !reader ||
       !canPollRebuildRequest({
-        running: false,
         readerConfigured: configured,
         hasApiKey: Boolean(settings.apiKey),
         autoRebuild: settings.autoRebuild,
@@ -267,11 +276,21 @@ export class BuildManager {
     const handled = normalizeHandledRebuildIds(handledRaw);
     const action = rebuildTickAction({ running: this.building, request, handledIds: handled });
     if (action === "skip" || request.status !== "ready") return false;
+    if (!this.claimedRequestIds.includes(request.request.id)) this.claimedRequestIds.push(request.request.id);
     await extensionStore.set(
       KEYS.handledRebuildRequestIds,
       rememberRebuildRequestId(handled, request.request.id),
     );
     return action === "start";
+  }
+
+  /** A failed build did not fulfill these requests, so the next tick may try again. */
+  private async forgetClaimedRequests(): Promise<void> {
+    const ids = this.claimedRequestIds;
+    if (ids.length === 0) return;
+    const handled = normalizeHandledRebuildIds(await extensionStore.get<unknown>(KEYS.handledRebuildRequestIds));
+    const next = ids.reduce((list, id) => forgetRebuildRequestId(list, id), handled);
+    await extensionStore.set(KEYS.handledRebuildRequestIds, next);
   }
 
   /**
@@ -310,9 +329,11 @@ export class BuildManager {
   // ---- the build -----------------------------------------------------------
 
   async startBuild(opts: { resume?: boolean; claimed?: boolean } = {}) {
-    if (this.running && !opts.claimed) {
-      console.log("[BuildManager] startBuild ignored — a build is already running");
-      return; // single-flight: a second start just attaches.
+    // Block on a build that has entered. The tick's provisional claim, held while
+    // it asks the reader, must not swallow a Build click.
+    if (this.building) {
+      if (!opts.claimed) console.log("[BuildManager] startBuild ignored — a build is already running");
+      return;
     }
     // Claim the slot before the first await: the startup tick, the onStartup
     // listener and an alarm can all call this in the same turn. `claimed` means
@@ -324,12 +345,14 @@ export class BuildManager {
     try {
       settings = await loadSettings();
     } catch (err) {
+      await this.releaseClaimedRequests();
       this.running = false;
       this.building = false;
       throw err;
     }
     const { apiKey, systemPrompt, model, archiveUrl } = settings;
     if (!apiKey) {
+      await this.releaseClaimedRequests();
       this.running = false;
       this.building = false;
       // Manual builds are gated behind the key-setup screen and auto-builds
@@ -356,7 +379,8 @@ export class BuildManager {
       console.warn("[BuildManager] couldn't read the sources list; building without live feeds", err);
     }
 
-    this.controller = new AbortController();
+    const controller = new AbortController();
+    this.controller = controller;
     this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup", notice: this.state.notice };
     this.broadcast({ kind: "snapshot", state: this.state });
     this.startKeepalive();
@@ -371,41 +395,52 @@ export class BuildManager {
         ? await extensionStore.get<string>(KEYS.activeSessionId)
         : undefined;
 
-      const result = await runHomepageBuild({
-        client,
-        bridge: browserBridge,
-        // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
-        archive: archiveBase
-          ? createFailoverArchiveBridge(archiveBase, {
-              macBase: archiveBase,
-              fallbackBase: settings.fallbackArchiveUrl,
-              password: settings.readerPassword,
-            })
-          : undefined,
-        feeds,
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        store: extensionStore,
-        userSystemPrompt: systemPrompt,
-        // The archive's own host is never a page the agent may scrape: its index
-        // lists every saved article, including ones from blocked sites. Both the
-        // address this build started with and the one in Settings now are blocked,
-        // so changing the setting mid-build can't expose the one in use.
-        blockedSites: async () => {
-          const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
-          const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
-            url ? (archiveHostOf(url) ?? []) : [],
-          );
-          return [...blockedSites, ...hosts];
-        },
-        model,
-        resumeSessionId,
-        signal: this.controller.signal,
-        callbacks: {
-          onPhase: (phase, detail) => this.onPhase(phase, detail),
-          onText: (chunk) => this.onText(chunk),
-          onLog: (line) => this.onLog(line),
-        },
-      });
+      const attempt = () =>
+        runHomepageBuild({
+          client,
+          bridge: browserBridge,
+          // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
+          archive: archiveBase
+            ? createFailoverArchiveBridge(archiveBase, {
+                macBase: archiveBase,
+                fallbackBase: settings.fallbackArchiveUrl,
+                password: settings.readerPassword,
+              })
+            : undefined,
+          feeds,
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          store: extensionStore,
+          userSystemPrompt: systemPrompt,
+          // The archive's own host is never a page the agent may scrape: its index
+          // lists every saved article, including ones from blocked sites. Both the
+          // address this build started with and the one in Settings now are blocked,
+          // so changing the setting mid-build can't expose the one in use.
+          blockedSites: async () => {
+            const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
+            const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
+              url ? (archiveHostOf(url) ?? []) : [],
+            );
+            return [...blockedSites, ...hosts];
+          },
+          model,
+          resumeSessionId,
+          signal: controller.signal,
+          callbacks: {
+            onPhase: (phase, detail) => this.onPhase(phase, detail),
+            onText: (chunk) => this.onText(chunk),
+            onLog: (line) => this.onLog(line),
+          },
+        });
+      let result: Awaited<ReturnType<typeof runHomepageBuild>>;
+      try {
+        result = await attempt();
+      } catch (error) {
+        if (!isConnectionError(error) || controller.signal.aborted) throw error;
+        console.warn("[BuildManager] connection error; retrying once", connectionCause(error) || "no cause");
+        await new Promise((resolve) => setTimeout(resolve, CONNECTION_RETRY_MS));
+        if (controller.signal.aborted) throw error;
+        result = await attempt();
+      }
 
       // Persist the raw TSX; the page transpiles it for preview.
       const homepage = await saveHomepage(result.code);
@@ -425,17 +460,34 @@ export class BuildManager {
       console.log("[BuildManager] build done", { bytes: result.code.length, source: result.source });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const aborted = this.controller?.signal.aborted === true || (error instanceof Error && error.name === "AbortError");
+      if (!aborted) await this.forgetClaimedRequests();
       this.state = { ...this.state, running: false, phase: "error", error: message };
       this.broadcast({ kind: "error", message });
       await this.mirror(true);
       this.notifyFailure(message);
-      console.error("[BuildManager] build failed", error);
+      const cause = connectionCause(error);
+      console.error("[BuildManager] build failed", cause ? `${message} (${cause})` : message);
     } finally {
+      this.claimedRequestIds = [];
       this.running = false;
       this.building = false;
       this.controller = null;
       this.stopKeepalive();
     }
+  }
+
+  /** Forget a request this build stored, then drop the in-memory mark. */
+  private async releaseClaimedRequests(): Promise<void> {
+    try {
+      await this.forgetClaimedRequests();
+    } catch (err) {
+      console.warn(
+        "[BuildManager] couldn't clear the rebuild request",
+        err instanceof Error ? err.message : "request failed",
+      );
+    }
+    this.claimedRequestIds = [];
   }
 
   cancel() {
@@ -535,4 +587,17 @@ export class BuildManager {
       // notifications permission missing or API unavailable — nothing else to do.
     }
   }
+}
+
+function isConnectionError(error: unknown): boolean {
+  return error instanceof Error && error.message === "Connection error.";
+}
+
+/** A short cause string. The error object itself can carry request headers, so it is not logged. */
+function connectionCause(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const cause = error.cause;
+  if (cause instanceof Error) return cause.message;
+  if (typeof cause === "string") return cause;
+  return "";
 }

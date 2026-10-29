@@ -10,6 +10,7 @@ import { rebuildRequestError } from "../apps/extension/lib/phone-sync";
 import {
   ASKED_MAC,
   REBUILD_EXPIRED,
+  REBUILD_ROUTE_MISSING,
   REBUILD_WAIT_TIMED_OUT,
   TODAY_POLL_LIMIT_MS,
   TODAY_POLL_MS,
@@ -475,6 +476,34 @@ test("a missing rebuild endpoint stays hidden and is not asked again", async () 
   expect(view.host.textContent).not.toContain("Up to date");
   expect(seen.filter((call) => call.method === "POST")).toHaveLength(firstPosts);
   expect(view.host.textContent).not.toContain("Rebuild on Mac");
+  expect(view.host.textContent).toContain(REBUILD_ROUTE_MISSING);
+  view.unmount();
+});
+
+test("Rebuild on Mac skips the request when a newer page is already there", async () => {
+  const older = new Date(Date.now() - 2 * HOUR).toISOString();
+  homepage = {
+    code: "export default function App(){ return <p>Old</p> }",
+    timestamp: older,
+  };
+  followupHomepage = {
+    code: "export default function App(){ return <p>New</p> }",
+    timestamp: new Date().toISOString(),
+  };
+  followupAfter = 1;
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  const rebuild = view.host.querySelectorAll("button")[1];
+  expect(rebuild?.textContent).toBe("Rebuild on Mac");
+  const postsBefore = seen.filter((call) => call.method === "POST").length;
+  await act(async () => {
+    rebuild?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  expect(seen.filter((call) => call.method === "POST")).toHaveLength(postsBefore);
+  expect(view.host.textContent).toContain("Updated");
+  expect(view.host.textContent).not.toContain(ASKED_MAC);
   view.unmount();
 });
 
