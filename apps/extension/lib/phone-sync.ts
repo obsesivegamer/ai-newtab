@@ -28,6 +28,8 @@ export interface SharedHomepage {
   timestamp: string;
   /** When the reader last copied this page from the Mac, if the response said. */
   syncedAt?: string;
+  /** The reader's `rebuild_request` on GET, when it included one. `expired` is read from here. */
+  rebuildRequest?: RebuildRequest;
 }
 
 export type HomepageFetch =
@@ -229,18 +231,24 @@ export async function publishBuiltHomepage(
 export type RebuildPost =
   | { status: "ok"; request: RebuildRequest }
   | { status: "missing" }
-  | { status: "error" };
+  | { status: "error"; message: string };
+
+/** What the phone shows when the rebuild POST fails. A missing status means the reader never answered. */
+export function rebuildRequestError(status?: number): string {
+  if (status === undefined) return "The reader didn't answer.";
+  return `Couldn't ask your Mac to rebuild. The reader answered ${status}.`;
+}
 
 /**
  * Ask the reader to record a rebuild request for the Mac. The phone is served
  * by that reader, so this sends the session cookie and no Basic header. The
  * body is `{}` with `Content-Type: application/json`. A 404 means this Amber
- * has no such route. A cooldown or expired object is still `"ok"`: the caller
- * decides whether it asked for new work.
+ * has no such route. A cooldown object is still `"ok"`. `expired` on a POST is
+ * not a result the phone branches on; that flag is read from GET.
  */
 export async function requestHomepageRebuild(origin: string, signal?: AbortSignal): Promise<RebuildPost> {
   const base = normalizeArchiveUrl(origin);
-  if (!base) return { status: "error" };
+  if (!base) return { status: "error", message: rebuildRequestError() };
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
     const response = await fetch(`${base}/api/homepage/rebuild-request`, {
@@ -251,11 +259,11 @@ export async function requestHomepageRebuild(origin: string, signal?: AbortSigna
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
     if (response.status === 404) return { status: "missing" };
-    if (!response.ok) return { status: "error" };
+    if (!response.ok) return { status: "error", message: rebuildRequestError(response.status) };
     const request = parseRebuildRequest(await response.json().catch(() => null));
-    return request ? { status: "ok", request } : { status: "error" };
+    return request ? { status: "ok", request } : { status: "error", message: rebuildRequestError(response.status) };
   } catch {
-    return { status: "error" };
+    return { status: "error", message: rebuildRequestError() };
   }
 }
 
@@ -342,14 +350,17 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
     return typeof detail === "string" && /no homepage/i.test(detail) ? { status: "empty" } : { status: "unsupported" };
   }
   if (!response.ok) return { status: "error", message: `Amber answered ${response.status}` };
-  const { code, timestamp, synced_at } = (body ?? {}) as {
+  const { code, timestamp, synced_at, rebuild_request } = (body ?? {}) as {
     code?: unknown;
     timestamp?: unknown;
     synced_at?: unknown;
+    rebuild_request?: unknown;
   };
   if (typeof code !== "string" || code.length === 0) return { status: "empty" };
   const homepage: SharedHomepage = { code, timestamp: typeof timestamp === "string" ? timestamp : "" };
   if (typeof synced_at === "string" && synced_at) homepage.syncedAt = synced_at;
+  const request = parseRebuildRequest(rebuild_request);
+  if (request) homepage.rebuildRequest = request;
   return { status: "ok", homepage };
 }
 

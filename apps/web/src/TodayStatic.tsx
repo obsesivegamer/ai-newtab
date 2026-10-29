@@ -10,38 +10,47 @@ import {
   REBUILD_WAIT_TIMED_OUT,
   TODAY_POLL_LIMIT_MS,
   TODAY_POLL_MS,
+  UNREADABLE_BUILD_TIME,
   builtClock,
   cooldownLabel,
+  homepageArrived,
   isFreshPage,
   oldPageNote,
   shouldAskRebuild,
   timestampAdvanced,
+  timestampParses,
   upToDateLabel,
 } from "./todayStatus";
 
 type State = { status: "loading" } | HomepageFetch;
+type OkHomepage = Extract<HomepageFetch, { status: "ok" }>;
 
-type Notice = "uptodate" | "updated" | "stale" | "cooldown" | "timeout" | "expired" | null;
+type Notice = "uptodate" | "updated" | "stale" | "cooldown" | "timeout" | "expired" | "failed" | "unreadable" | null;
+
+const READER_APP_URL = `${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`;
 
 /**
  * Today on the phone: the page the extension built and handed to Amber, shown as it is.
- * No key and no model here. A refresh can ask the Mac to rebuild, and the preview
- * only mounts in a secure context (Sandpack needs `crypto.subtle`).
+ * No key and no model here. Refresh asks the Mac once the page is about an hour old.
+ * "Rebuild on Mac" always asks. The preview only mounts in a secure context
+ * (Sandpack needs `crypto.subtle`).
  */
 export function TodayStatic({ origin, active }: { origin: string; active: boolean }) {
   const [state, setState] = useState<State>({ status: "loading" });
   const [code, setCode] = useState<string | null>(null);
   const [loadedAt, setLoadedAt] = useState(0);
   const [notice, setNotice] = useState<Notice>(null);
+  const [failure, setFailure] = useState<string | null>(null);
   const [asked, setAsked] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [canRebuild, setCanRebuild] = useState(true);
   const [watch, setWatch] = useState<{ baseline: string; until: number } | null>(null);
   const showingGood = useRef(false);
   const shownTimestamp = useRef<string | null>(null);
   const rebuildUnsupported = useRef(false);
   const checkingRef = useRef(false);
 
-  const applyOk = useCallback((result: Extract<HomepageFetch, { status: "ok" }>) => {
+  const applyOk = useCallback((result: OkHomepage) => {
     setLoadedAt(Date.now());
     showingGood.current = true;
     shownTimestamp.current = result.homepage.timestamp;
@@ -81,58 +90,104 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
     [origin],
   );
 
-  const refresh = useCallback(async () => {
-    if (checkingRef.current) return;
-    checkingRef.current = true;
-    setChecking(true);
-    setNotice(null);
-    setAsked(false);
-    setWatch(null);
-    const previous = shownTimestamp.current;
-    try {
-      const result = await fetchHomepage(origin);
-      if (result.status !== "ok") {
-        if (showingGood.current) setNotice("stale");
-        else {
-          setNotice(null);
-          setLoadedAt(Date.now());
-          setState(result);
-        }
-        return;
-      }
-      const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
-      applyOk(result);
-      const now = Date.now();
-      if (advanced) {
+  const showIfNewer = useCallback(
+    async (shown: OkHomepage, previous: string | null) => {
+      const again = await fetchHomepage(origin);
+      const page = again.status === "ok" ? again : shown;
+      if (again.status === "ok") applyOk(again);
+      const baseline = previous ?? shown.homepage.timestamp;
+      if (again.status === "ok" && homepageArrived(baseline, page.homepage.timestamp)) {
         setNotice("updated");
         return;
       }
-      if (isFreshPage(result.homepage.timestamp, now)) {
-        setNotice("uptodate");
+      if (page.homepage.rebuildRequest?.expired) {
+        setNotice("expired");
         return;
       }
-      if (rebuildUnsupported.current || !shouldAskRebuild(result.homepage.timestamp, now)) return;
+      if (!timestampParses(page.homepage.timestamp)) {
+        setNotice("unreadable");
+        return;
+      }
+      if (!oldPageNote(page.homepage.timestamp, page.homepage.syncedAt, Date.now())) setNotice("cooldown");
+    },
+    [applyOk, origin],
+  );
+
+  const askMac = useCallback(
+    async (page: OkHomepage, previous: string | null) => {
       const posted = await requestHomepageRebuild(origin);
       if (posted.status === "missing") {
         rebuildUnsupported.current = true;
+        setCanRebuild(false);
         return;
       }
-      if (posted.status !== "ok") return;
-      if (posted.request.cooldown) {
-        if (!oldPageNote(result.homepage.timestamp, result.homepage.syncedAt, Date.now())) setNotice("cooldown");
+      if (posted.status === "error") {
+        setFailure(posted.message);
+        setNotice("failed");
         return;
       }
-      if (posted.request.expired || posted.request.fulfilledAt) {
-        if (posted.request.expired) setNotice("expired");
+      // `expired` is not a POST result. A fulfilled or cooling-down request is
+      // already done: look once more, and don't start the ten-minute wait.
+      if (posted.request.cooldown || posted.request.fulfilledAt) {
+        await showIfNewer(page, previous);
         return;
       }
       setAsked(true);
-      setWatch({ baseline: result.homepage.timestamp, until: Date.now() + TODAY_POLL_LIMIT_MS });
-    } finally {
-      checkingRef.current = false;
-      setChecking(false);
-    }
-  }, [applyOk, origin]);
+      setWatch({ baseline: page.homepage.timestamp, until: Date.now() + TODAY_POLL_LIMIT_MS });
+    },
+    [origin, showIfNewer],
+  );
+
+  const run = useCallback(
+    async (mode: "if-stale" | "always") => {
+      if (checkingRef.current) return;
+      checkingRef.current = true;
+      setChecking(true);
+      setNotice(null);
+      setFailure(null);
+      setAsked(false);
+      setWatch(null);
+      const previous = shownTimestamp.current;
+      try {
+        const result = await fetchHomepage(origin);
+        if (result.status !== "ok") {
+          if (showingGood.current) setNotice("stale");
+          else {
+            setNotice(null);
+            setLoadedAt(Date.now());
+            setState(result);
+          }
+          return;
+        }
+        const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
+        applyOk(result);
+        const now = Date.now();
+        if (mode === "if-stale") {
+          if (advanced) {
+            setNotice("updated");
+            return;
+          }
+          if (!timestampParses(result.homepage.timestamp)) {
+            setNotice("unreadable");
+            return;
+          }
+          if (isFreshPage(result.homepage.timestamp, now)) {
+            setNotice("uptodate");
+            return;
+          }
+          if (rebuildUnsupported.current || !shouldAskRebuild(result.homepage.timestamp, now)) return;
+        } else if (rebuildUnsupported.current) {
+          if (advanced) setNotice("updated");
+          return;
+        }
+        await askMac(result, previous);
+      } finally {
+        checkingRef.current = false;
+        setChecking(false);
+      }
+    },
+    [applyOk, askMac, origin],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -164,11 +219,19 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
       }
       void fetchHomepage(origin).then((result) => {
         if (cancelled || result.status !== "ok") return;
-        if (!timestampAdvanced(watch.baseline, result.homepage.timestamp)) return;
-        applyOk(result);
-        setNotice("updated");
-        setAsked(false);
-        setWatch(null);
+        if (homepageArrived(watch.baseline, result.homepage.timestamp)) {
+          applyOk(result);
+          setNotice("updated");
+          setAsked(false);
+          setWatch(null);
+          return;
+        }
+        if (result.homepage.rebuildRequest?.expired) {
+          applyOk(result);
+          setNotice("expired");
+          setAsked(false);
+          setWatch(null);
+        }
       });
     }, TODAY_POLL_MS);
     return () => {
@@ -197,14 +260,25 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
                 ? REBUILD_WAIT_TIMED_OUT
                 : notice === "expired"
                   ? REBUILD_EXPIRED
-                  : null;
+                  : notice === "failed"
+                    ? failure
+                    : notice === "unreadable"
+                      ? UNREADABLE_BUILD_TIME
+                      : null;
     return (
       <>
         <div className="today-strip">
           <span className="meta today-built">{label ? `Built ${label} on your Mac` : "Built on your Mac"}</span>
-          <button type="button" className="ghost-btn small" onClick={() => void refresh()} disabled={checking}>
-            {checking ? "Checking…" : "Refresh"}
-          </button>
+          <span className="today-actions">
+            <button type="button" className="ghost-btn small" onClick={() => void run("if-stale")} disabled={checking}>
+              {checking ? "Checking…" : "Refresh"}
+            </button>
+            {canRebuild && (
+              <button type="button" className="ghost-btn small" onClick={() => void run("always")} disabled={checking}>
+                {checking ? "Checking…" : "Rebuild on Mac"}
+              </button>
+            )}
+          </span>
         </div>
         {checking && (
           <p className="meta today-note" role="status">
@@ -238,7 +312,7 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
               This page is not a secure context, so the preview can’t run. Open the reader over HTTPS.
             </p>
             <p className="gate-body">
-              <a href={`${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`}>{`${DEFAULT_FALLBACK_ARCHIVE_URL}/app/`}</a>
+              <a href={READER_APP_URL}>{READER_APP_URL}</a>
             </p>
           </div>
         )}

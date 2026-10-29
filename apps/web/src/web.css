@@ -252,6 +252,11 @@ html.web .tab {
   min-height: 44px;
   border-bottom: 1px solid var(--border);
 }
+.today-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
 .today-strip .ghost-btn:disabled {
   opacity: 0.55;
 }

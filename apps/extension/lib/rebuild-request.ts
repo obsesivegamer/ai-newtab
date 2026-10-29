@@ -3,10 +3,10 @@ import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
 
 /**
  * How often the worker may ask the reader whether the phone wants a rebuild.
- * The heartbeat alarm is already about a minute; this stops a second tick in
- * the same minute from asking again.
+ * The heartbeat alarm is one minute and can fire a little early; 50s lets each
+ * alarm through, and a second tick sooner than that does not ask again.
  */
-export const REBUILD_POLL_MIN_MS = 60_000;
+export const REBUILD_POLL_MIN_MS = 50_000;
 
 /**
  * The reader check gives up quickly. It runs beside the scheduled rebuild, so a
@@ -88,19 +88,37 @@ export async function fetchRebuildRequest(
   }
 }
 
-export function shouldPollRebuildRequest(input: {
+export function canPollRebuildRequest(input: {
   running: boolean;
-  now: number;
-  lastPollAt: number;
   readerConfigured: boolean;
   hasApiKey: boolean;
   autoRebuild: boolean;
   authRejected: boolean;
 }): boolean {
-  if (input.running || !input.readerConfigured || !input.hasApiKey || !input.autoRebuild || input.authRejected) {
-    return false;
-  }
-  return input.now - input.lastPollAt >= REBUILD_POLL_MIN_MS;
+  return !input.running && input.readerConfigured && input.hasApiKey && input.autoRebuild && !input.authRejected;
+}
+
+export function shouldPollRebuildRequest(
+  input: {
+    now: number;
+    lastPollAt: number;
+  } & Parameters<typeof canPollRebuildRequest>[0],
+): boolean {
+  return canPollRebuildRequest(input) && input.now - input.lastPollAt >= REBUILD_POLL_MIN_MS;
+}
+
+/**
+ * The notice to keep while a 401 has paused polling. A worker restart begins
+ * with no in-memory notice; the stored fingerprint is what puts the banner back.
+ * A changed password drops it. Any other notice is left alone.
+ */
+export function persistedReaderAuthNotice(
+  storedFingerprint: string | undefined,
+  fingerprint: string,
+  current: string | null,
+): string | null {
+  if (readerAuthStillRejected(storedFingerprint, fingerprint)) return READER_AUTH_MESSAGE;
+  return current === READER_AUTH_MESSAGE ? null : current;
 }
 
 /** True when this password is the one the reader already rejected. */

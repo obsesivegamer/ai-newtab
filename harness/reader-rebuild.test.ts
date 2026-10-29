@@ -1,13 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
 import { READER_BASIC_USER, basicAuthorization } from "../apps/extension/lib/archive-auth";
 import { publishBuiltHomepage, pushReaderHomepage } from "../apps/extension/lib/phone-sync";
-import { fetchRemoteSources, requestHomepageRebuild } from "../apps/extension/lib/phone-sync";
+import { fetchHomepage, fetchRemoteSources, rebuildRequestError, requestHomepageRebuild } from "../apps/extension/lib/phone-sync";
 import {
   READER_AUTH_MESSAGE,
   REBUILD_POLL_MIN_MS,
   REBUILD_POLL_TIMEOUT_MS,
   fetchRebuildRequest,
   passwordFingerprint,
+  persistedReaderAuthNotice,
   readerAuthNotice,
   rebuildTickAction,
   rememberRebuildRequestId,
@@ -138,7 +139,7 @@ const poll = {
 };
 
 test("the reader is polled about once a minute, and only with a key, auto-rebuild, and a good password", () => {
-  expect(REBUILD_POLL_MIN_MS).toBe(60_000);
+  expect(REBUILD_POLL_MIN_MS).toBe(50_000);
   expect(REBUILD_POLL_TIMEOUT_MS).toBeLessThanOrEqual(3_000);
   expect(shouldPollRebuildRequest({ ...poll, running: true })).toBe(false);
   expect(shouldPollRebuildRequest({ ...poll, readerConfigured: false })).toBe(false);
@@ -147,6 +148,15 @@ test("the reader is polled about once a minute, and only with a key, auto-rebuil
   expect(shouldPollRebuildRequest({ ...poll, authRejected: true })).toBe(false);
   expect(shouldPollRebuildRequest({ ...poll, lastPollAt: poll.now - REBUILD_POLL_MIN_MS + 1 })).toBe(false);
   expect(shouldPollRebuildRequest({ ...poll, lastPollAt: poll.now - REBUILD_POLL_MIN_MS })).toBe(true);
+});
+
+test("a rejected password keeps its banner after the in-memory notice is gone", async () => {
+  const fingerprint = await passwordFingerprint(PASSWORD);
+  expect(persistedReaderAuthNotice(fingerprint, fingerprint, null)).toBe(READER_AUTH_MESSAGE);
+  expect(persistedReaderAuthNotice(fingerprint, fingerprint, READER_AUTH_MESSAGE)).toBe(READER_AUTH_MESSAGE);
+  expect(persistedReaderAuthNotice(fingerprint, "other", READER_AUTH_MESSAGE)).toBeNull();
+  expect(persistedReaderAuthNotice(undefined, fingerprint, null)).toBeNull();
+  expect(persistedReaderAuthNotice(undefined, fingerprint, "Something else")).toBe("Something else");
 });
 
 test("a wrong reader password is reported once and then left alone", async () => {
@@ -237,6 +247,36 @@ test("a phone rebuild POST sends JSON and keeps cooldown and expiry", async () =
     contentType: "application/json",
     body: "{}",
     authorization: null,
+  });
+});
+
+test("a failed rebuild POST names the status, and silence says the reader didn't answer", async () => {
+  installFetch(() => json(500, { detail: "nope" }));
+  expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError(500) });
+  restore?.();
+  installFetch(() => json(415, { detail: "type" }));
+  expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError(415) });
+  restore?.();
+  installFetch(() => {
+    throw new TypeError("offline");
+  });
+  expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError() });
+  expect(rebuildRequestError()).not.toContain(PASSWORD);
+  expect(rebuildRequestError(500)).toContain("500");
+});
+
+test("GET /api/homepage keeps rebuild_request so expired can be read from a GET", async () => {
+  installFetch(() =>
+    json(200, {
+      code: "export default function App(){return null}",
+      timestamp: BUILT,
+      rebuild_request: { requested_at: REQUESTED, id: "req-9", fulfilled_at: null, expired: true },
+    }),
+  );
+  const result = await fetchHomepage(READER);
+  expect(result).toMatchObject({
+    status: "ok",
+    homepage: { rebuildRequest: { id: "req-9", expired: true, fulfilledAt: null } },
   });
 });
 

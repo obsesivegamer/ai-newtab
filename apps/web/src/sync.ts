@@ -1,6 +1,6 @@
 import type { FeedSource } from "@homepage/agent-core";
 import { fetchRemoteSources, loadSourcesStamp, publishSources, saveSourcesStamp } from "@/lib/phone-sync";
-import { saveSources } from "@/lib/sources";
+import { loadSources, saveSources } from "@/lib/sources";
 
 /**
  * Sources are shared with the extension through Amber (`/api/sources`). On load the
@@ -30,6 +30,21 @@ const accessListeners = new Set<AccessListener>();
 let sourcesReadOnly = false;
 /** The last list known to match the server, so a refused edit can be put back. */
 let committedSources: FeedSource[] | null = null;
+/**
+ * Resolves once `committedSources` holds the pre-edit list. A push waits for
+ * this, so a 405 can revert even when the first read never produced a list.
+ */
+let baselineReady: Promise<void> = Promise.resolve();
+
+/** Snapshot the stored list before an edit overwrites it, when no server list is known yet. */
+function rememberCommittedList(): Promise<void> {
+  if (committedSources !== null) return Promise.resolve();
+  const pendingRead = loadSources().then((current) => {
+    if (committedSources === null) committedSources = current;
+  });
+  baselineReady = pendingRead;
+  return pendingRead;
+}
 
 /** Called whenever the list was replaced by the one Amber holds (not for the boot read, which precedes the UI). */
 export function onSourcesAdopted(listener: Listener): () => void {
@@ -111,6 +126,7 @@ function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
   const run = async (ifUpdatedAt?: null) => {
     unanswered++;
     try {
+      await baselineReady;
       const result = await publishSources(origin, sources, { keepalive, ifUpdatedAt });
       const latest = mine === pushSeq;
       if (result.status === "conflict" && latest) announce(result.sources, "conflict");
@@ -147,12 +163,17 @@ function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
 /** Save a person's edit locally, then send it to Amber once edits have paused. A read-only reader keeps the list it already has. */
 export function saveAndPushSources(origin: string, sources: FeedSource[]): Promise<void> {
   if (sourcesReadOnly) return Promise.resolve();
+  // A timed-out first read leaves `committedSources` empty. Remember the stored
+  // list before this edit replaces it, so a 405 with no body can put it back.
+  const remembered = rememberCommittedList();
   clearTimeout(timer);
   pending = { origin, sources };
   timer = setTimeout(() => flushSourcePush(), PUSH_DELAY_MS);
-  return saveSources(sources).then(() => {
-    if (sourcesReadOnly && committedSources) return saveSources(committedSources);
-  });
+  return remembered.then(() =>
+    saveSources(sources).then(() => {
+      if (sourcesReadOnly && committedSources) return saveSources(committedSources);
+    }),
+  );
 }
 
 /**

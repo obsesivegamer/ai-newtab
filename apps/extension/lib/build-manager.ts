@@ -17,14 +17,16 @@ import { publishBuiltHomepage } from "./phone-sync";
 import { fallbackBaseOf } from "./archive-auth";
 import {
   READER_AUTH_MESSAGE,
+  REBUILD_POLL_MIN_MS,
+  canPollRebuildRequest,
   fetchRebuildRequest,
   normalizeHandledRebuildIds,
   passwordFingerprint,
+  persistedReaderAuthNotice,
   readerAuthNotice,
   readerAuthStillRejected,
   rebuildTickAction,
   rememberRebuildRequestId,
-  shouldPollRebuildRequest,
 } from "./rebuild-request";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
@@ -55,12 +57,23 @@ export class BuildManager {
   private state: BuildState = { ...INITIAL_BUILD_STATE };
   private readonly ports = new Set<Port>();
   private controller: AbortController | null = null;
+  /**
+   * Single-flight claim. Set synchronously at the start of a tick, before any
+   * await, and held until a build starts or the tick decides not to build.
+   */
   private running = false;
+  /** True once `startBuild` has entered. A phone id seen meanwhile is remembered, not built again. */
+  private building = false;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotAt = 0;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Epoch ms of the last reader rebuild-request poll. The alarm is already ~1 min. */
+  /** Epoch ms of the last reader rebuild-request poll. The alarm is about a minute. */
   private lastRebuildPollAt = 0;
+  private authRestore: Promise<void> = Promise.resolve();
+
+  constructor() {
+    void this.restoreReaderAuthNotice();
+  }
 
   // ---- port lifecycle ------------------------------------------------------
 
@@ -73,7 +86,11 @@ export class BuildManager {
   private onPageMessage(port: Port, msg: PageMsg) {
     switch (msg.kind) {
       case "subscribe":
-        this.send(port, { kind: "snapshot", state: this.state });
+        // The snapshot has to include a 401 banner restored from storage. Sending
+        // the empty in-memory state first would wipe the banner on every reconnect.
+        void this.restoreReaderAuthNotice().then(() => {
+          this.send(port, { kind: "snapshot", state: this.state });
+        });
         break;
       case "startBuild":
         void this.startBuild({ resume: msg.resume });
@@ -108,35 +125,107 @@ export class BuildManager {
   async tick() {
     if (this.running) {
       // A run is live but the worker may have just woken; make sure the
-      // self-keepalive is ticking so the active turn stays warm.
-      this.startKeepalive();
+      // self-keepalive is ticking so the active turn stays warm. Keep noting
+      // phone requests so the id is claimed and the next tick does not start
+      // a second build.
+      if (this.building) {
+        this.startKeepalive();
+        if (this.notePhoneRequest()) this.watchPhoneRequest();
+      }
       return;
     }
 
-    const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
-    if (sessionId) {
-      void this.startBuild({ resume: true });
-      return;
-    }
+    const pollDue = this.notePhoneRequest();
+    // Claim the build before any await. A second tick in this minute, and the
+    // scheduled check racing the reader poll, then share one build.
+    this.running = true;
+    void this.restoreReaderAuthNotice();
 
-    // The reader check has its own short timeout and must not hold up the schedule.
+    try {
+      const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
+      if (sessionId) {
+        void this.startBuild({ resume: true, claimed: true });
+        if (pollDue) this.watchPhoneRequest();
+        return;
+      }
+
+      // The schedule runs to completion before the reader is asked. A phone
+      // request due on the same tick is remembered onto that build.
+      const scheduled = await this.maybeAutoRebuild();
+      if (scheduled) {
+        void this.startBuild({ resume: false, claimed: true });
+        if (pollDue) this.watchPhoneRequest();
+        return;
+      }
+
+      if (!pollDue) {
+        this.running = false;
+        return;
+      }
+
+      const startPhone = await this.maybeRequestedRebuild();
+      if (startPhone) {
+        void this.startBuild({ resume: false, claimed: true });
+        return;
+      }
+      this.running = false;
+    } catch (err) {
+      if (!this.building) this.running = false;
+      console.warn(
+        "[BuildManager] tick failed",
+        err instanceof Error ? err.message : "request failed",
+      );
+    }
+  }
+
+  /**
+   * Reserve the reader poll if it is due. The reservation is synchronous, before
+   * any await, so two ticks cannot both ask. Returns whether this tick should poll.
+   */
+  private notePhoneRequest(): boolean {
+    const now = Date.now();
+    if (now - this.lastRebuildPollAt < REBUILD_POLL_MIN_MS) return false;
+    this.lastRebuildPollAt = now;
+    return true;
+  }
+
+  /** Put a stored 401 banner back. Polling stays paused, so nothing else would show it again. */
+  private restoreReaderAuthNotice(): Promise<void> {
+    const run = this.authRestore
+      .then(async () => {
+        const settings = await loadSettings();
+        const rejected = await extensionStore.get<string>(KEYS.readerAuthRejected);
+        const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
+        const next = persistedReaderAuthNotice(rejected, fingerprint, this.state.notice);
+        if (next !== this.state.notice) this.onNotice(next);
+      })
+      .catch((err) => {
+        console.warn(
+          "[BuildManager] couldn't restore the reader notice",
+          err instanceof Error ? err.message : "request failed",
+        );
+      });
+    this.authRestore = run;
+    return run;
+  }
+
+  private watchPhoneRequest() {
     void this.maybeRequestedRebuild().catch((err) => {
       console.warn(
         "[BuildManager] rebuild request check failed",
         err instanceof Error ? err.message : "request failed",
       );
     });
-    await this.maybeAutoRebuild();
   }
 
   /**
-   * A phone refresh can ask the reader for a rebuild. Ask at most once a minute,
-   * and only with a reader address, a password, an API key, and auto-rebuild on.
-   * One unseen id whose `fulfilled_at` is null starts one build. A wrong password
-   * is reported once, then left alone until the password changes.
+   * A phone refresh can ask the reader for a rebuild. The minute gate was already
+   * claimed by `tick`. One unseen id whose `fulfilled_at` is null starts one
+   * build, unless a build is already entering, in which case the id is only
+   * remembered. A wrong password is stored once; the banner stays until the
+   * password changes and a later GET succeeds.
    */
-  private async maybeRequestedRebuild(): Promise<void> {
-    const now = Date.now();
+  private async maybeRequestedRebuild(): Promise<boolean> {
     const settings = await loadSettings();
     const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
     const configured = Boolean(reader && settings.readerPassword);
@@ -146,21 +235,20 @@ export class BuildManager {
     ]);
     const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
     const authRejected = readerAuthStillRejected(rejected, fingerprint);
+    // `running: false` here is the poll's own gate. The tick already holds
+    // `this.running`; that claim must not look like a build that forbids polling.
     if (
       !reader ||
-      !shouldPollRebuildRequest({
-        running: this.running,
-        now,
-        lastPollAt: this.lastRebuildPollAt,
+      !canPollRebuildRequest({
+        running: false,
         readerConfigured: configured,
         hasApiKey: Boolean(settings.apiKey),
         autoRebuild: settings.autoRebuild,
         authRejected,
       })
     ) {
-      return;
+      return false;
     }
-    this.lastRebuildPollAt = now;
     const request = await fetchRebuildRequest(reader, settings.readerPassword, settings.archiveUrl);
     if (request.status === "unauthorized") {
       const line = readerAuthNotice(authRejected);
@@ -170,24 +258,28 @@ export class BuildManager {
         this.onLog(line);
         this.onNotice(line);
       }
-      return;
+      return false;
     }
     if (rejected && (request.status === "ready" || request.status === "none")) {
       await extensionStore.remove(KEYS.readerAuthRejected);
       if (this.state.notice === READER_AUTH_MESSAGE) this.onNotice(null);
     }
     const handled = normalizeHandledRebuildIds(handledRaw);
-    const action = rebuildTickAction({ running: this.running, request, handledIds: handled });
-    if (action === "skip" || request.status !== "ready") return;
+    const action = rebuildTickAction({ running: this.building, request, handledIds: handled });
+    if (action === "skip" || request.status !== "ready") return false;
     await extensionStore.set(
       KEYS.handledRebuildRequestIds,
       rememberRebuildRequestId(handled, request.request.id),
     );
-    if (action === "start") void this.startBuild({ resume: false });
+    return action === "start";
   }
 
-  /** Whether opening the day's first tab should already show a fresh homepage. */
-  private async maybeAutoRebuild() {
+  /**
+   * Whether this tick should start the scheduled rebuild. The tick has already
+   * claimed `this.running`; that is not a build in progress, so `isRunning` stays
+   * false. Returns after the attempt is stamped, and the caller starts the build.
+   */
+  private async maybeAutoRebuild(): Promise<boolean> {
     const [settings, homepage, lastAttempt] = await Promise.all([
       loadSettings(),
       loadHomepage(),
@@ -199,43 +291,47 @@ export class BuildManager {
       !shouldAutoRebuild({
         enabled: settings.autoRebuild,
         hasApiKey: Boolean(settings.apiKey),
-        isRunning: this.running,
+        isRunning: false,
         lastBuildTimestamp: homepage?.timestamp,
         lastAutoAttemptTimestamp: lastAttempt,
         intervalMs: rebuildIntervalMs(settings.rebuildIntervalHours),
         now,
       })
     ) {
-      return;
+      return false;
     }
 
     // Stamp the attempt before starting so a second wake (or a cancel/failure)
-    // doesn't re-trigger it within the interval.
+    // doesn't re-trigger it within the interval. The claim is already held.
     await extensionStore.set(KEYS.lastAutoBuildAttempt, now.toISOString());
-    void this.startBuild({ resume: false });
+    return true;
   }
 
   // ---- the build -----------------------------------------------------------
 
-  async startBuild(opts: { resume?: boolean } = {}) {
-    if (this.running) {
+  async startBuild(opts: { resume?: boolean; claimed?: boolean } = {}) {
+    if (this.running && !opts.claimed) {
       console.log("[BuildManager] startBuild ignored — a build is already running");
       return; // single-flight: a second start just attaches.
     }
     // Claim the slot before the first await: the startup tick, the onStartup
-    // listener and an alarm can all call this in the same turn.
+    // listener and an alarm can all call this in the same turn. `claimed` means
+    // the tick already set `running` and this call is the one build.
     this.running = true;
+    this.building = true;
 
     let settings: Awaited<ReturnType<typeof loadSettings>>;
     try {
       settings = await loadSettings();
     } catch (err) {
       this.running = false;
+      this.building = false;
       throw err;
     }
     const { apiKey, systemPrompt, model, archiveUrl } = settings;
     if (!apiKey) {
       this.running = false;
+      this.building = false;
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
       console.warn("[BuildManager] startBuild aborted — no API key in storage");
@@ -336,6 +432,7 @@ export class BuildManager {
       console.error("[BuildManager] build failed", error);
     } finally {
       this.running = false;
+      this.building = false;
       this.controller = null;
       this.stopKeepalive();
     }
