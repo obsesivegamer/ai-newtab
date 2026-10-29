@@ -5,11 +5,12 @@ import {
   type ArchiveArticleMeta,
   type ArchiveBridge,
 } from "@homepage/agent-core";
+import { archiveRequestHeaders, type ArchiveAuth } from "./archive-auth";
 
 export const DEFAULT_ARCHIVE_URL = "http://127.0.0.1:8080";
 
-const LIST_TIMEOUT_MS = 10_000;
-const TEXT_TIMEOUT_MS = 20_000;
+export const LIST_TIMEOUT_MS = 10_000;
+export const TEXT_TIMEOUT_MS = 20_000;
 
 interface ApiSnapshot {
   id: string;
@@ -112,9 +113,12 @@ function toMeta(base: string, s: ApiSnapshot): ArchiveArticleMeta {
   };
 }
 
-async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+async function getJson<T>(url: string, timeoutMs: number, signal?: AbortSignal, headers?: HeadersInit): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
-  const response = await fetch(url, { signal: signal ? anySignal([timeout, signal]) : timeout });
+  const response = await fetch(url, {
+    signal: signal ? anySignal([timeout, signal]) : timeout,
+    ...(headers ? { headers } : {}),
+  });
   if (!response.ok) throw new Error(`archive responded ${response.status} for ${url}`);
   return (await response.json()) as T;
 }
@@ -135,7 +139,7 @@ export type CancellableArchiveBridge = Omit<ArchiveBridge, "getArticles"> & {
  * queue), so both see the same shape. This bridge is still the only loopback
  * client: gifts are another read of the same Amber, not a new way to reach it.
  */
-export function createArchiveBridge(archiveUrl: string): CancellableArchiveBridge {
+export function createArchiveBridge(archiveUrl: string, auth?: ArchiveAuth): CancellableArchiveBridge {
   const normalized = normalizeArchiveUrl(archiveUrl);
   // Rejected from the methods, not here, so callers that build the bridge inside an
   // effect get a rejected promise they already handle rather than a throw.
@@ -143,13 +147,12 @@ export function createArchiveBridge(archiveUrl: string): CancellableArchiveBridg
     if (normalized === null) throw new Error("Invalid archive URL");
     return normalized;
   };
+  const headersFor = (url: string) => archiveRequestHeaders(url, auth);
   return {
     async listArticles({ sinceDays, limit }) {
       const base = need();
-      const list = await getJson<ApiList>(
-        `${base}/api/snapshots?since_days=${sinceDays}&limit=${limit}`,
-        LIST_TIMEOUT_MS,
-      );
+      const url = `${base}/api/snapshots?since_days=${sinceDays}&limit=${limit}`;
+      const list = await getJson<ApiList>(url, LIST_TIMEOUT_MS, undefined, headersFor(url));
       return {
         totalUsable: list.total_usable,
         sources: list.sources,
@@ -164,11 +167,8 @@ export function createArchiveBridge(archiveUrl: string): CancellableArchiveBridg
       await Promise.all(
         ids.map(async (id) => {
           try {
-            const body = await getJson<ApiText>(
-              `${base}/api/snapshots/${encodeURIComponent(id)}/text`,
-              TEXT_TIMEOUT_MS,
-              signal,
-            );
+            const url = `${base}/api/snapshots/${encodeURIComponent(id)}/text`;
+            const body = await getJson<ApiText>(url, TEXT_TIMEOUT_MS, signal, headersFor(url));
             articles.push({ ...toMeta(base, body), text: body.text });
           } catch (err) {
             failed.push({ id, reason: String(err) });
@@ -180,7 +180,8 @@ export function createArchiveBridge(archiveUrl: string): CancellableArchiveBridg
 
     async listCandidates({ signal } = {}) {
       const base = need();
-      const list = await getJson<{ candidates?: ApiCandidate[] }>(`${base}/api/candidates`, LIST_TIMEOUT_MS, signal);
+      const url = `${base}/api/candidates`;
+      const list = await getJson<{ candidates?: ApiCandidate[] }>(url, LIST_TIMEOUT_MS, signal, headersFor(url));
       if (!Array.isArray(list.candidates)) return [];
       return list.candidates.flatMap((row) => {
         const candidate = toCandidate(row);

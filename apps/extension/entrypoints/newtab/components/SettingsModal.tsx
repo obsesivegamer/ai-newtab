@@ -7,6 +7,7 @@ import {
   type HomepageModel,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
+import { DEFAULT_FALLBACK_ARCHIVE_URL } from "@/lib/archive-auth";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
 import { fetchRemoteSources, isShareableArchiveHost, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
@@ -106,6 +107,8 @@ export function SettingsModal({
     (draft !== initialPrompt ||
       normalizeBlockList(blockedDraft.split("\n")).join("\n") !== normalizeBlockList(blockedSites).join("\n"));
   const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
+  const [fallbackUrl, setFallbackUrl] = useState(DEFAULT_FALLBACK_ARCHIVE_URL);
+  const [readerPassword, setReaderPassword] = useState("");
   const [archiveLoaded, setArchiveLoaded] = useState(false);
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
   /** Bumped whenever the field changes, a test starts, or the modal goes away; a late test result is ignored. */
@@ -150,6 +153,8 @@ export function SettingsModal({
     void loadSettings().then((s) => {
       if (cancelled) return;
       setArchiveUrl(s.archiveUrl);
+      setFallbackUrl(s.fallbackArchiveUrl);
+      setReaderPassword(s.readerPassword);
       setArchiveLoaded(true);
     });
     return () => {
@@ -196,6 +201,33 @@ export function SettingsModal({
 
   /** The address as it should be saved: "" (archive off), a clean base URL, or null if it can't be one. */
   const archiveValue = (): string | null => (archiveUrl.trim() === "" ? "" : normalizeArchiveUrl(archiveUrl));
+  /** "" turns the fallback off. null means the draft is not an address. */
+  const fallbackValue = (): string | null => (fallbackUrl.trim() === "" ? "" : normalizeArchiveUrl(fallbackUrl));
+
+  /** Writes the Mac address, the fallback address, and the reader password. False when a draft is not an address. */
+  const persistArchive = async (): Promise<boolean> => {
+    const value = archiveValue();
+    const fallback = fallbackValue();
+    if (value === null) {
+      archiveRequest.current++;
+      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
+      return false;
+    }
+    if (fallback === null) {
+      archiveRequest.current++;
+      setArchiveCheck({
+        state: "error",
+        message: "That doesn't look like a web address. Try http://boxj:8081",
+      });
+      return false;
+    }
+    if (archiveLoaded) {
+      await saveSetting("archiveUrl", value);
+      await saveSetting("fallbackArchiveUrl", fallback);
+      await saveSetting("readerPassword", readerPassword);
+    }
+    return true;
+  };
 
   // Like the prompt box, the address is a draft: it is written only when a test
   // succeeds or "Save & rebuild" is clicked, never by Cancel.
@@ -226,14 +258,9 @@ export function SettingsModal({
 
   const save = async (rebuild: boolean) => {
     const value = archiveValue();
-    if (value === null) {
-      archiveRequest.current++;
-      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
-      return;
-    }
+    if (!(await persistArchive())) return;
     archiveRequest.current++;
-    // Written before the rebuild starts, so the build reads the new address.
-    if (archiveLoaded) await saveSetting("archiveUrl", value);
+    // The archive fields are already written, so the build reads the new address.
     const blockedNow = normalizeBlockList(blockedDraft.split("\n"));
     if (sources && sourcesDirty) await saveSources(sources);
     // The phone/web version reads the same list from Amber. Best-effort and never awaited. Sources on
@@ -460,6 +487,46 @@ export function SettingsModal({
                   : ""}
               </span>
             </div>
+            <label className="set-title follow" htmlFor="set-fallback">
+              Offline reader
+            </label>
+            <p id="fallback-help" className="set-hint">
+              When the Mac archive doesn't answer, saved articles are read from here instead. Leave
+              empty to turn that off. Saved when you click Save.
+            </p>
+            <input
+              id="set-fallback"
+              type="url"
+              className="field mono"
+              value={fallbackUrl}
+              disabled={!archiveLoaded}
+              onChange={(e) => {
+                archiveRequest.current++;
+                setFallbackUrl(e.target.value);
+                setArchiveCheck({ state: "idle" });
+              }}
+              placeholder={DEFAULT_FALLBACK_ARCHIVE_URL}
+              aria-describedby="fallback-help"
+              spellCheck={false}
+            />
+            <label className="set-title follow" htmlFor="set-reader-password">
+              Reader password
+            </label>
+            <p id="reader-password-help" className="set-hint">
+              Sent only to the offline reader, as the password for the user “amber”. Never sent to
+              the Mac archive.
+            </p>
+            <input
+              id="set-reader-password"
+              type="password"
+              className="field mono"
+              value={readerPassword}
+              disabled={!archiveLoaded}
+              onChange={(e) => setReaderPassword(e.target.value)}
+              aria-describedby="reader-password-help"
+              autoComplete="off"
+              spellCheck={false}
+            />
           </section>
 
           <section className="set">

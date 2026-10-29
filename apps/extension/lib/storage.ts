@@ -7,6 +7,7 @@ import {
   type KVStore,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "./archive";
+import { DEFAULT_FALLBACK_ARCHIVE_URL } from "./archive-auth";
 
 /**
  * Everything the extension persists, in one place. All of it lives in
@@ -20,6 +21,10 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
+  /** Read-only amber-reader base. Empty string turns the fallback off. Default `http://boxj:8081`. */
+  fallbackArchiveUrl: "fallbackArchiveUrl",
+  /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
+  readerPassword: "readerPassword",
   /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
   sources: "sources",
   /** Amber's `updated_at` for the sources list as this device last saw it; sent back as `if_updated_at`. See lib/phone-sync.ts. */
@@ -52,6 +57,10 @@ export interface Settings {
   blockedSites: string[];
   /** Base URL of the Amber archive. Empty string turns the archive off. */
   archiveUrl: string;
+  /** Base URL of the read-only fallback reader. Empty string turns failover off. */
+  fallbackArchiveUrl: string;
+  /** Reader password. Sent only to `fallbackArchiveUrl`. */
+  readerPassword: string;
   model: HomepageModel;
   /** Unset means on — auto-rebuild is opt-out. */
   autoRebuild: boolean;
@@ -78,6 +87,8 @@ export async function loadSettings(): Promise<Settings> {
     KEYS.systemPrompt,
     KEYS.blockedSites,
     KEYS.archiveUrl,
+    KEYS.fallbackArchiveUrl,
+    KEYS.readerPassword,
     KEYS.model,
     KEYS.autoRebuild,
     KEYS.rebuildIntervalHours,
@@ -88,6 +99,8 @@ export async function loadSettings(): Promise<Settings> {
     systemPrompt: (s[KEYS.systemPrompt] as string | undefined) ?? "",
     blockedSites: (s[KEYS.blockedSites] as string[] | undefined) ?? [...DEFAULT_BLOCKED_SITES],
     archiveUrl: (s[KEYS.archiveUrl] as string | undefined) ?? DEFAULT_ARCHIVE_URL,
+    fallbackArchiveUrl: (s[KEYS.fallbackArchiveUrl] as string | undefined) ?? DEFAULT_FALLBACK_ARCHIVE_URL,
+    readerPassword: (s[KEYS.readerPassword] as string | undefined) ?? "",
     // Fall back if a stored model is no longer offered.
     model: MODEL_CHOICES.find((m) => m.id === model)?.id ?? DEFAULT_MODEL,
     autoRebuild: s[KEYS.autoRebuild] !== false,
@@ -95,7 +108,18 @@ export async function loadSettings(): Promise<Settings> {
   };
 }
 
-export async function saveSetting<K extends "apiKey" | "systemPrompt" | "blockedSites" | "archiveUrl" | "model" | "autoRebuild" | "rebuildIntervalHours">(
+export async function saveSetting<
+  K extends
+    | "apiKey"
+    | "systemPrompt"
+    | "blockedSites"
+    | "archiveUrl"
+    | "fallbackArchiveUrl"
+    | "readerPassword"
+    | "model"
+    | "autoRebuild"
+    | "rebuildIntervalHours"
+>(
   key: K,
   value: Settings[K],
 ): Promise<void> {
