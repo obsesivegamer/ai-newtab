@@ -1335,6 +1335,9 @@ textarea.field {
   text-transform: uppercase;
   color: var(--muted);
 }
+.set-title.follow {
+  margin-top: 22px;
+}
 .set-hint {
   margin: 8px 0 0;
   font-size: 13.5px;

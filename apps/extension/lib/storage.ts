@@ -7,6 +7,7 @@ import {
   type KVStore,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "./archive";
+import { FALLBACK_ARCHIVE_MIGRATION_VERSION, migrateFallbackArchiveUrl } from "./archive-auth";
 
 /**
  * Everything the extension persists, in one place. All of it lives in
@@ -20,6 +21,14 @@ export const KEYS = {
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
   archiveUrl: "archiveUrl",
+  /** Read-only amber-reader base. Empty string turns the fallback off. Default `https://dell-plx-reader.tailf9612a.ts.net`. */
+  fallbackArchiveUrl: "fallbackArchiveUrl",
+  /** Password for HTTP Basic (user "amber") on the fallback origin only. Never sent to the Mac. */
+  readerPassword: "readerPassword",
+  /** Version of the one-time fallback-host migration already applied (a number). */
+  fallbackArchiveMigrated: "fallbackArchiveMigrated",
+  /** `{ upUntil, downUntil, updatedAt }` for the Mac/fallback archive race. */
+  archiveOriginCache: "archiveOriginCache",
   /** The user's catalog of news sources (`FeedSource[]`); see lib/sources.ts. */
   sources: "sources",
   /** Amber's `updated_at` for the sources list as this device last saw it; sent back as `if_updated_at`. See lib/phone-sync.ts. */
@@ -32,6 +41,12 @@ export const KEYS = {
   autoRebuild: "autoRebuild",
   /** ISO timestamp of the last auto-build *attempted* (success or not). */
   lastAutoBuildAttempt: "lastAutoBuildAttempt",
+  /** Rebuild-request ids this profile already started or claimed, oldest first. */
+  handledRebuildRequestIds: "handledRebuildRequestIds",
+  /** Ids a failed build already put back once. A second failure leaves the id handled, so one tap is at most two paid builds. */
+  retriedRebuildRequestIds: "retriedRebuildRequestIds",
+  /** Fingerprint of the reader password the reader last rejected. Polling waits until the password changes. */
+  readerAuthRejected: "readerAuthRejected",
   rebuildIntervalHours: "autoRebuildIntervalHours",
   /** Throttled mirror of the live build state, for tabs that open while the worker sleeps. */
   buildSnapshot: "buildSnapshot",
@@ -52,6 +67,10 @@ export interface Settings {
   blockedSites: string[];
   /** Base URL of the Amber archive. Empty string turns the archive off. */
   archiveUrl: string;
+  /** Base URL of the read-only fallback reader. Empty string turns failover off. */
+  fallbackArchiveUrl: string;
+  /** Reader password. Sent only to `fallbackArchiveUrl`. */
+  readerPassword: string;
   model: HomepageModel;
   /** Unset means on — auto-rebuild is opt-out. */
   autoRebuild: boolean;
@@ -78,16 +97,37 @@ export async function loadSettings(): Promise<Settings> {
     KEYS.systemPrompt,
     KEYS.blockedSites,
     KEYS.archiveUrl,
+    KEYS.fallbackArchiveUrl,
+    KEYS.fallbackArchiveMigrated,
+    KEYS.readerPassword,
     KEYS.model,
     KEYS.autoRebuild,
     KEYS.rebuildIntervalHours,
   ]);
   const model = s[KEYS.model] as string | undefined;
+  const storedFallback = s[KEYS.fallbackArchiveUrl];
+  const storedVersion = s[KEYS.fallbackArchiveMigrated];
+  const fallback = migrateFallbackArchiveUrl(
+    typeof storedFallback === "string" ? storedFallback : undefined,
+    typeof storedVersion === "number" ? storedVersion : undefined,
+  );
+  if (fallback.changed || fallback.recordVersion) {
+    try {
+      const patch: Record<string, unknown> = {};
+      if (fallback.recordVersion) patch[KEYS.fallbackArchiveMigrated] = FALLBACK_ARCHIVE_MIGRATION_VERSION;
+      if (fallback.changed) patch[KEYS.fallbackArchiveUrl] = fallback.url;
+      await browser.storage.local.set(patch);
+    } catch {
+      /* The read below still uses the migrated address. */
+    }
+  }
   return {
     apiKey: (s[KEYS.apiKey] as string | undefined) ?? null,
     systemPrompt: (s[KEYS.systemPrompt] as string | undefined) ?? "",
     blockedSites: (s[KEYS.blockedSites] as string[] | undefined) ?? [...DEFAULT_BLOCKED_SITES],
     archiveUrl: (s[KEYS.archiveUrl] as string | undefined) ?? DEFAULT_ARCHIVE_URL,
+    fallbackArchiveUrl: fallback.url,
+    readerPassword: (s[KEYS.readerPassword] as string | undefined) ?? "",
     // Fall back if a stored model is no longer offered.
     model: MODEL_CHOICES.find((m) => m.id === model)?.id ?? DEFAULT_MODEL,
     autoRebuild: s[KEYS.autoRebuild] !== false,
@@ -95,7 +135,18 @@ export async function loadSettings(): Promise<Settings> {
   };
 }
 
-export async function saveSetting<K extends "apiKey" | "systemPrompt" | "blockedSites" | "archiveUrl" | "model" | "autoRebuild" | "rebuildIntervalHours">(
+export async function saveSetting<
+  K extends
+    | "apiKey"
+    | "systemPrompt"
+    | "blockedSites"
+    | "archiveUrl"
+    | "fallbackArchiveUrl"
+    | "readerPassword"
+    | "model"
+    | "autoRebuild"
+    | "rebuildIntervalHours"
+>(
   key: K,
   value: Settings[K],
 ): Promise<void> {

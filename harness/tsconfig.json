@@ -12,7 +12,8 @@
     "skipLibCheck": true,
     "baseUrl": "..",
     "paths": {
-      "@/*": ["apps/extension/*"]
+      "@/*": ["apps/extension/*"],
+      "@newtab/*": ["apps/extension/entrypoints/newtab/*"]
     }
   },
   "include": ["*.ts", "*.tsx"]

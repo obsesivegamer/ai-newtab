@@ -1,6 +1,6 @@
 import type { FeedSource } from "@homepage/agent-core";
 import { fetchRemoteSources, loadSourcesStamp, publishSources, saveSourcesStamp } from "@/lib/phone-sync";
-import { saveSources } from "@/lib/sources";
+import { loadSources, saveSources } from "@/lib/sources";
 
 /**
  * Sources are shared with the extension through Amber (`/api/sources`). On load the
@@ -15,9 +15,36 @@ import { saveSources } from "@/lib/sources";
  */
 
 export type AdoptReason = "conflict" | "refresh";
+export type SourcesAccess = "pending" | "writable" | "read_only" | "unknown";
 type Listener = (sources: FeedSource[], reason: AdoptReason) => void;
+type AccessListener = (access: "writable" | "read_only") => void;
 
 const listeners = new Set<Listener>();
+const accessListeners = new Set<AccessListener>();
+
+/**
+ * The reader serves sources but does not accept edits. Set when a read says
+ * `read_only` or a write is refused with 405, and cleared only by a later
+ * writable read.
+ */
+let sourcesReadOnly = false;
+/** The last list known to match the server, so a refused edit can be put back. */
+let committedSources: FeedSource[] | null = null;
+/**
+ * Resolves once `committedSources` holds the pre-edit list. A push waits for
+ * this, so a 405 can revert even when the first read never produced a list.
+ */
+let baselineReady: Promise<void> = Promise.resolve();
+
+/** Snapshot the stored list before an edit overwrites it, when no server list is known yet. */
+function rememberCommittedList(): Promise<void> {
+  if (committedSources !== null) return Promise.resolve();
+  const pendingRead = loadSources().then((current) => {
+    if (committedSources === null) committedSources = current;
+  });
+  baselineReady = pendingRead;
+  return pendingRead;
+}
 
 /** Called whenever the list was replaced by the one Amber holds (not for the boot read, which precedes the UI). */
 export function onSourcesAdopted(listener: Listener): () => void {
@@ -27,15 +54,50 @@ export function onSourcesAdopted(listener: Listener): () => void {
   };
 }
 
+/** Called when a read or a refused write says whether this Amber accepts source edits. */
+export function onSourcesAccess(listener: AccessListener): () => void {
+  accessListeners.add(listener);
+  return () => {
+    accessListeners.delete(listener);
+  };
+}
+
+export function sourcesAreReadOnly(): boolean {
+  return sourcesReadOnly;
+}
+
 function announce(sources: FeedSource[], reason: AdoptReason): void {
   for (const listener of listeners) listener(sources, reason);
+}
+
+function announceAccess(access: "writable" | "read_only"): void {
+  for (const listener of accessListeners) listener(access);
+}
+
+function dropPendingEdits(): void {
+  clearTimeout(timer);
+  pending = null;
+}
+
+function lockSources(list?: FeedSource[]): void {
+  sourcesReadOnly = true;
+  dropPendingEdits();
+  if (list) committedSources = list;
+  announceAccess("read_only");
+  if (list) announce(list, "refresh");
 }
 
 /** Adopt Amber's list as this device's list. Returns whether one was found; a failed read changes nothing. */
 export async function adoptRemoteSources(origin: string, signal?: AbortSignal): Promise<boolean> {
   await loadSourcesStamp();
   const remote = await fetchRemoteSources(origin, signal);
-  if (!remote) return false;
+  if (remote.status === "unavailable") return false;
+  if (remote.status === "read_only") {
+    sourcesReadOnly = true;
+    return false;
+  }
+  if (remote.readOnly) sourcesReadOnly = true;
+  committedSources = remote.sources;
   await saveSources(remote.sources);
   await saveSourcesStamp(remote.updatedAt);
   return true;
@@ -64,13 +126,25 @@ function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
   const run = async (ifUpdatedAt?: null) => {
     unanswered++;
     try {
+      await baselineReady;
       const result = await publishSources(origin, sources, { keepalive, ifUpdatedAt });
       const latest = mine === pushSeq;
       if (result.status === "conflict" && latest) announce(result.sources, "conflict");
+      if (result.status === "read_only") {
+        const revert = result.sources ?? committedSources;
+        if (revert) {
+          await saveSources(revert);
+          committedSources = revert;
+        }
+        lockSources(revert ?? undefined);
+      }
       // A conflict answered after a later push was sent has already stored the other device's list
       // locally; the later push (which wins on Amber) must leave the local list equal to what it sent.
       // A write from another device inside that window is knowingly overwritten.
-      if (result.status === "ok" && latest && pending === null) await saveSources(sources);
+      if (result.status === "ok" && latest && pending === null) {
+        await saveSources(sources);
+        committedSources = sources;
+      }
     } finally {
       unanswered--;
     }
@@ -86,12 +160,20 @@ function send(origin: string, sources: FeedSource[], keepalive: boolean): void {
   inflight = inflight.then(() => run(), () => run());
 }
 
-/** Save a person's edit locally, then send it to Amber once edits have paused. */
+/** Save a person's edit locally, then send it to Amber once edits have paused. A read-only reader keeps the list it already has. */
 export function saveAndPushSources(origin: string, sources: FeedSource[]): Promise<void> {
+  if (sourcesReadOnly) return Promise.resolve();
+  // A timed-out first read leaves `committedSources` empty. Remember the stored
+  // list before this edit replaces it, so a 405 with no body can put it back.
+  const remembered = rememberCommittedList();
   clearTimeout(timer);
   pending = { origin, sources };
   timer = setTimeout(() => flushSourcePush(), PUSH_DELAY_MS);
-  return saveSources(sources);
+  return remembered.then(() =>
+    saveSources(sources).then(() => {
+      if (sourcesReadOnly && committedSources) return saveSources(committedSources);
+    }),
+  );
 }
 
 /**
@@ -102,6 +184,7 @@ export function flushSourcePush(keepalive = false): void {
   clearTimeout(timer);
   const edit = pending;
   pending = null;
+  if (sourcesReadOnly) return;
   if (edit) send(edit.origin, edit.sources, keepalive);
 }
 
@@ -111,16 +194,32 @@ export function flushSourcePush(keepalive = false): void {
  * while the read was in flight keeps priority (its push will meet Amber's 409 if it is stale).
  * Best-effort: any failure leaves everything as it was.
  */
-export async function refreshRemoteSources(origin: string): Promise<void> {
-  if (probing) return;
-  flushSourcePush();
+export async function refreshRemoteSources(origin: string): Promise<SourcesAccess> {
+  if (sourcesReadOnly) dropPendingEdits();
+  if (probing) return sourcesReadOnly ? "read_only" : "unknown";
+  if (!sourcesReadOnly) flushSourcePush();
   await inflight;
   const remote = await fetchRemoteSources(origin, AbortSignal.timeout(4_000));
-  if (!remote?.updatedAt || probing || pending) return;
-  if (remote.updatedAt === (await loadSourcesStamp())) return;
+  if (remote.status === "unavailable") return sourcesReadOnly ? "read_only" : "unknown";
+  if (remote.status === "read_only") {
+    lockSources(committedSources ?? undefined);
+    return "read_only";
+  }
+  if (remote.readOnly) {
+    await saveSources(remote.sources);
+    await saveSourcesStamp(remote.updatedAt);
+    lockSources(remote.sources);
+    return "read_only";
+  }
+  sourcesReadOnly = false;
+  announceAccess("writable");
+  committedSources = remote.sources;
+  if (!remote.updatedAt || probing || pending) return "writable";
+  if (remote.updatedAt === (await loadSourcesStamp())) return "writable";
   await saveSources(remote.sources);
   await saveSourcesStamp(remote.updatedAt);
   announce(remote.sources, "refresh");
+  return "writable";
 }
 
 /** Flush a pending edit when the page is hidden or closed, and re-read Amber's list when it is shown again. */
