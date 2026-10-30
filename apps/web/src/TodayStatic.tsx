@@ -164,11 +164,12 @@ export function TodayStatic({ origin, active }: { origin: string; active: boolea
         }
         const advanced = previous !== null && timestampAdvanced(previous, result.homepage.timestamp);
         applyOk(result);
-        if (advanced) {
+        const now = Date.now();
+        // A newer page that is still an hour old or more does not answer the request.
+        if (advanced && !shouldAskRebuild(result.homepage.timestamp, now)) {
           setNotice("updated");
           return;
         }
-        const now = Date.now();
         if (mode === "if-stale") {
           if (!timestampParses(result.homepage.timestamp)) {
             setNotice("unreadable");

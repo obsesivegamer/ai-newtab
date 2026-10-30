@@ -297,6 +297,12 @@ test("a 200 that is not a rebuild request is not reported as a status, and a bad
   installFetch(() => json(200, { ok: true }));
   expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError(200) });
   expect(rebuildRequestError(200)).not.toContain("answered 200");
+  // Any 2xx with no request in the body is the same unreadable-body case.
+  restore?.();
+  installFetch(() => json(201, { ok: true }));
+  expect(await requestHomepageRebuild(READER)).toEqual({ status: "error", message: rebuildRequestError(201) });
+  expect(rebuildRequestError(204)).toBe(rebuildRequestError(200));
+  expect(rebuildRequestError()).toStartWith("Couldn't ask your Mac to rebuild.");
   expect(await requestHomepageRebuild("not a url")).toEqual({
     status: "error",
     message: "That isn't a reader address.",
@@ -356,10 +362,24 @@ test("homepage, sources, and the homepage PUT send Basic only when the URL is th
     }
     store.set(KEYS.readerPassword, "");
     seen.length = 0;
-    await fetchHomepage(READER);
-    await fetchRemoteSources(READER);
+    // A blank password means the reader is not called at all: it would answer 401 and
+    // Chrome would put up its own login dialog.
+    expect(await fetchHomepage(READER)).toMatchObject({ status: "error" });
+    expect(await fetchRemoteSources(READER)).toEqual({ status: "unavailable" });
+    expect(await publishSources(READER, [source])).toEqual({ status: "skipped" });
+    await pushHomepage(READER, homepage);
+    expect(seen).toHaveLength(0);
+    // The Mac origin never needed the password.
+    await fetchHomepage(MAC);
+    await fetchRemoteSources(MAC);
     expect(seen).toHaveLength(2);
+    expect(seen.every((call) => call.url.startsWith(MAC))).toBe(true);
     expect(seen.every((call) => call.authorization === null && call.redirect === undefined)).toBe(true);
+    // Whitespace is blank too.
+    store.set(KEYS.readerPassword, "   ");
+    seen.length = 0;
+    await fetchHomepage(READER);
+    expect(seen).toHaveLength(0);
     expect(warnings.join("\n").includes(PASSWORD)).toBe(false);
     expect(/authorization/i.test(warnings.join("\n"))).toBe(false);
   } finally {

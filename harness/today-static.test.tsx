@@ -507,6 +507,29 @@ test("Rebuild on Mac skips the request when a newer page is already there", asyn
   view.unmount();
 });
 
+test("Rebuild on Mac still asks when the newer page is itself stale", async () => {
+  homepage = {
+    code: "export default function App(){ return <p>Old</p> }",
+    timestamp: new Date(Date.now() - 5 * HOUR).toISOString(),
+  };
+  followupHomepage = {
+    code: "export default function App(){ return <p>Newer</p> }",
+    timestamp: new Date(Date.now() - 3 * HOUR).toISOString(),
+  };
+  followupAfter = 1;
+  installFetch();
+  installDom(false);
+  const view = await render(<TodayStatic origin={ORIGIN} active />);
+  const rebuild = view.host.querySelectorAll("button")[1];
+  await act(async () => {
+    rebuild?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  expect(seen.filter((call) => call.method === "POST")).toHaveLength(1);
+  expect(view.host.textContent).toContain(ASKED_MAC);
+  view.unmount();
+});
+
 test("Rebuild on Mac asks even when the page is fresh", async () => {
   homepage = {
     code: "export default function App(){ return <p>New</p> }",

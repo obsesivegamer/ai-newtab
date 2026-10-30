@@ -43,6 +43,8 @@ export const KEYS = {
   lastAutoBuildAttempt: "lastAutoBuildAttempt",
   /** Rebuild-request ids this profile already started or claimed, oldest first. */
   handledRebuildRequestIds: "handledRebuildRequestIds",
+  /** Ids a failed build already put back once. A second failure leaves the id handled, so one tap is at most two paid builds. */
+  retriedRebuildRequestIds: "retriedRebuildRequestIds",
   /** Fingerprint of the reader password the reader last rejected. Polling waits until the password changes. */
   readerAuthRejected: "readerAuthRejected",
   rebuildIntervalHours: "autoRebuildIntervalHours",

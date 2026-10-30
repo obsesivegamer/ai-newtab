@@ -1,6 +1,6 @@
 import { anySignal, normalizeArchiveUrl, type FeedSource } from "@homepage/agent-core";
 import { IS_WEB } from "@/lib/platform";
-import { archiveGetInit, type ArchiveAuth } from "./archive-auth";
+import { archiveGetInit, isReaderUrl, READER_PASSWORD_MISSING, type ArchiveAuth } from "./archive-auth";
 import { parseRebuildRequest, type RebuildRequest } from "./rebuild-request";
 import { saveSources } from "./sources";
 import { KEYS, loadSettings } from "./storage";
@@ -145,17 +145,21 @@ export async function saveSourcesStamp(stamp: string | null | undefined): Promis
 /**
  * Basic auth for one reader URL, loaded from settings. The phone is served by
  * the reader, so it sends no Basic header. A missing store sends none either.
- * An empty password sends none. The header is never logged.
+ * `"unavailable"`: the URL is the reader and no password is set, so the request
+ * is not made (the reader would answer 401 and Chrome would ask for a login).
+ * The header is never logged.
  */
-async function readerRequestInit(url: string): Promise<RequestInit> {
+async function readerRequestInit(url: string): Promise<RequestInit | "unavailable"> {
   if (IS_WEB) return {};
   try {
     const settings = await loadSettings();
-    return archiveGetInit(url, {
+    const auth: ArchiveAuth = {
       macBase: settings.archiveUrl,
       fallbackBase: settings.fallbackArchiveUrl,
       password: settings.readerPassword,
-    });
+    };
+    if (!auth.password.trim() && isReaderUrl(url, auth)) return "unavailable";
+    return archiveGetInit(url, auth);
   } catch {
     return {};
   }
@@ -163,6 +167,7 @@ async function readerRequestInit(url: string): Promise<RequestInit> {
 
 async function putJson(url: string, body: unknown): Promise<void> {
   const gated = await readerRequestInit(url);
+  if (gated === "unavailable") return;
   const headers = new Headers(gated.headers);
   headers.set("Content-Type", "application/json");
   const response = await fetch(url, {
@@ -258,11 +263,11 @@ export type RebuildPost =
 
 /**
  * What the phone shows when the rebuild POST fails. A missing status means the
- * reader never answered. A 200 here is a body that did not contain a request.
+ * reader never answered. A 2xx here is a body that did not contain a request.
  */
 export function rebuildRequestError(status?: number): string {
-  if (status === undefined) return "The reader didn't answer.";
-  if (status === 200) return "The reader answered, but the rebuild request couldn't be read.";
+  if (status === undefined) return "Couldn't ask your Mac to rebuild. The reader didn't answer.";
+  if (status >= 200 && status < 300) return "The reader answered, but the rebuild request couldn't be read.";
   return `Couldn't ask your Mac to rebuild. The reader answered ${status}.`;
 }
 
@@ -320,6 +325,7 @@ export async function publishSources(
     const url = `${base}/api/sources`;
     // A keepalive push has to be issued in this turn. Loading settings would wait.
     const gated = opts.keepalive ? {} : await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "skipped" };
     const headers = new Headers(gated.headers);
     headers.set("Content-Type", "application/json");
     const response = await fetch(url, {
@@ -366,6 +372,7 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
     const url = `${base}/api/homepage`;
     const gated = await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "error", message: READER_PASSWORD_MISSING };
     response = await fetch(url, {
       ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,
@@ -410,6 +417,7 @@ export async function fetchRemoteSources(base: string, signal?: AbortSignal): Pr
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
     const url = `${base}/api/sources`;
     const gated = await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "unavailable" };
     const response = await fetch(url, {
       ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,

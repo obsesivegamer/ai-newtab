@@ -31,19 +31,23 @@ const AMBER_DOWN = "Amber isn't running — start it (its run script or launchd 
 
 const NOT_AN_ADDRESS = "That doesn't look like a web address. Try http://127.0.0.1:8080";
 
+const IS_THE_READER = "That's the offline reader. Put it in the reader field.";
+
+/** Whether two addresses are the same origin. Anything that isn't an address is not. */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Auth for a connection test. The Mac address never gets the reader password.
- * An address that is the offline reader does, when a password is set.
+ * The same auth a real read uses: the Mac address never gets the reader
+ * password, so the Mac field must not hold the reader's address.
  */
 function authForAddress(base: string, fallback: string, password: string): ArchiveAuth {
-  const fallbackBase = fallback.trim() === "" ? "" : (normalizeArchiveUrl(fallback) ?? "");
-  let targetsReader = false;
-  try {
-    targetsReader = Boolean(fallbackBase) && new URL(base).origin === new URL(fallbackBase).origin;
-  } catch {
-    targetsReader = false;
-  }
-  return { macBase: targetsReader ? "" : base, fallbackBase, password };
+  return { macBase: base, fallbackBase: fallback.trim() === "" ? "" : (normalizeArchiveUrl(fallback) ?? ""), password };
 }
 
 /** One cheap read of the archive's list endpoint, turned into a sentence a person can act on. */
@@ -231,19 +235,24 @@ export function SettingsModal({
   };
   const dirtyRef = useRef(false);
   dirtyRef.current = formDirty();
-  const saveRef = useRef<(rebuild: boolean) => Promise<void>>(async () => {});
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
 
   const requestClose = () => {
-    if (dirtyRef.current) {
-      if (window.confirm("You have unsaved changes. Save them before closing?")) {
-        void saveRef.current(false);
-        return;
-      }
-    }
+    if (dirtyRef.current && !window.confirm("Discard unsaved changes?")) return;
     closeRef.current();
   };
+
+  // Closing the tab or reloading drops the draft too, so the browser asks first.
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!dirtyRef.current) return;
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -287,7 +296,7 @@ export function SettingsModal({
   };
 
   // A successful test writes the Mac address and the reader password (and a valid
-  // fallback). Esc and Cancel ask before dropping anything still unsaved.
+  // fallback). Esc and Cancel ask before dropping anything still unsaved (OK discards, Cancel keeps the form open).
   const runArchiveTest = async () => {
     const value = archiveValue();
     const request = ++archiveRequest.current;
@@ -302,8 +311,12 @@ export function SettingsModal({
       });
       return;
     }
-    setArchiveCheck({ state: "testing" });
     const fallback = fallbackValue();
+    if (fallback && sameOrigin(value, fallback)) {
+      setArchiveCheck({ state: "error", message: IS_THE_READER });
+      return;
+    }
+    setArchiveCheck({ state: "testing" });
     const result = await testArchive(value, authForAddress(value, fallback ?? "", readerPassword));
     if (request !== archiveRequest.current) return;
     if (result.state === "ok") {
@@ -342,7 +355,6 @@ export function SettingsModal({
     }
     onSave(draft, blockedNow, rebuild && rebuildMeaningful);
   };
-  saveRef.current = save;
 
   const statusClass =
     archiveCheck.state === "ok" ? "ok" : archiveCheck.state === "error" ? "error" : "";

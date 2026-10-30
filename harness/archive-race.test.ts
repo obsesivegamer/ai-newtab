@@ -19,6 +19,28 @@ declare global {
         maxResults: number;
       }): Promise<Array<{ url?: string; title?: string; lastVisitTime?: number; visitCount?: number }>>;
     };
+    // Pulled in because build-manager.test.ts imports the worker, which names these.
+    runtime: {
+      onConnect: {
+        addListener(
+          callback: (port: {
+            onMessage: { addListener(listener: (message: unknown) => void): void };
+            onDisconnect: { addListener(listener: () => void): void };
+            postMessage(message: unknown): void;
+          }) => void,
+        ): void;
+      };
+      getPlatformInfo(): Promise<unknown>;
+      getURL(path: string): string;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    notifications: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    windows: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tabs: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    scripting: any;
   };
 }
 import { LIST_TIMEOUT_MS, TEXT_TIMEOUT_MS, parseSnapshotList } from "../apps/extension/lib/archive";
@@ -29,6 +51,8 @@ import {
   basicAuthorization,
 } from "../apps/extension/lib/archive-auth";
 import { loadReadingArticles, loadReadingList } from "../apps/extension/lib/archive-reading";
+import { passwordFingerprint } from "../apps/extension/lib/rebuild-request";
+import { KEYS } from "../apps/extension/lib/storage";
 import {
   FALLBACK_DELAY_MS,
   MAC_DOWN_MS,
@@ -652,4 +676,95 @@ test("a reader with no password is never called, and the notice is warned once",
   expect(calls.every((call) => call.authorization === null)).toBe(true);
   expect(warnings.filter((line) => line === READER_PASSWORD_MISSING)).toHaveLength(1);
   expect(warnings.join("\n").includes("Basic")).toBe(false);
+});
+
+test("a reader that already rejected this password is not called, even when the Mac is slow or down", async () => {
+  const calls = install((url, init) =>
+    url.startsWith(MAC) ? hang(init?.signal ?? undefined) : jsonResponse(listBody("From reader")),
+  );
+  const read = (cache: OriginCache) =>
+    raceArchiveJson({
+      macBase: MAC,
+      fallbackBase: FALLBACK,
+      password: PASSWORD,
+      readerRejected: true,
+      path: LIST_PATH,
+      timeoutMs: LIST_TIMEOUT_MS,
+      cache,
+      fetchImpl: globalThis.fetch,
+    });
+  const slow = read(createOriginCache());
+  const outcome = slow.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  jest.advanceTimersByTime(FALLBACK_DELAY_MS + LIST_TIMEOUT_MS);
+  await flush();
+  expect(await outcome).toBe("rejected");
+
+  const down = createOriginCache();
+  down.downUntil = Date.now() + 60_000;
+  const second = read(down);
+  const secondOutcome = second.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  jest.advanceTimersByTime(LIST_TIMEOUT_MS);
+  await flush();
+  expect(await secondOutcome).toBe("rejected");
+
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls.every((call) => call.url.startsWith(MAC) && call.authorization === null)).toBe(true);
+});
+
+test("the reading list skips the reader while the stored 401 matches the saved password", async () => {
+  const store = new Map<string, unknown>();
+  const target = globalThis as unknown as { browser?: unknown };
+  const previousBrowser = target.browser;
+  target.browser = {
+    storage: {
+      local: {
+        async get(keys?: string | string[] | null): Promise<Record<string, unknown>> {
+          const names = keys == null ? [...store.keys()] : typeof keys === "string" ? [keys] : keys;
+          const out: Record<string, unknown> = {};
+          for (const name of names) if (store.has(name)) out[name] = store.get(name);
+          return out;
+        },
+        async set(items: Record<string, unknown>): Promise<void> {
+          for (const [key, value] of Object.entries(items)) store.set(key, value);
+        },
+        async remove(): Promise<void> {},
+      },
+    },
+  };
+  // Real timers: the fingerprint's digest needs a real turn of the event loop. The Mac
+  // answers 500 at once, so the reader is the next call, when it is allowed.
+  jest.useRealTimers();
+  const calls = install((url) =>
+    url.startsWith(MAC) ? new Response("no", { status: 500 }) : jsonResponse(listBody("From reader")),
+  );
+  const auth = { macBase: MAC, fallbackBase: FALLBACK, password: PASSWORD };
+  const list = (password: string) =>
+    loadReadingList({
+      macBase: MAC,
+      sinceDays: 1,
+      limit: 1,
+      auth: { ...auth, password },
+      cache: createOriginCache(),
+    });
+  try {
+    store.set(KEYS.readerAuthRejected, await passwordFingerprint(PASSWORD));
+
+    // A different password is a fresh chance: the reader answers.
+    expect((await list("another")).originBase).toBe(FALLBACK);
+    expect(calls.some((call) => call.url.startsWith(FALLBACK))).toBe(true);
+
+    // The rejected password never reaches the reader.
+    calls.length = 0;
+    await expect(list(PASSWORD)).rejects.toThrow("500");
+    expect(calls.some((call) => call.url.startsWith(FALLBACK))).toBe(false);
+  } finally {
+    target.browser = previousBrowser;
+    jest.useFakeTimers();
+  }
 });

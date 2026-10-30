@@ -31,6 +31,11 @@ export interface RaceOptions {
   /** Null, empty, or not an address: call only the Mac. */
   fallbackBase: string | null;
   password: string;
+  /**
+   * The reader already rejected this exact password (a stored fingerprint matches).
+   * The reader is not called until the password changes; the Mac is the only origin.
+   */
+  readerRejected?: boolean;
   /** Path beginning with `/`, appended to whichever base wins. */
   path: string;
   /** Mac limit (and the fallback's own limit, starting when the fallback starts). */
@@ -169,7 +174,7 @@ function isTerminalAnswer(result: FetchResult): result is { kind: "status"; stat
  * if the Mac wins. A Mac 401 or 404 is the answer: the fallback is not used.
  * A Mac body that arrives after the fallback has already won refreshes the cache
  * and is not returned. The caller keeps the list it already has.
- * A configured reader with no password is not called.
+ * A configured reader with no password, or one that rejected this password, is not called.
  */
 export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
   const now = opts.now ?? Date.now;
@@ -195,6 +200,8 @@ export async function raceArchiveJson(opts: RaceOptions): Promise<RaceSuccess> {
     noteMissingReaderPassword();
     fallback = null;
   }
+  // A wrong password only earns a 401 and a browser login prompt. Leave the reader alone.
+  if (fallback && opts.readerRejected) fallback = null;
   const auth: ArchiveAuth = { macBase: mac, fallbackBase: fallback ?? "", password: opts.password };
   const macUrl = join(mac, opts.path);
 

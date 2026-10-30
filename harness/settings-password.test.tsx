@@ -237,7 +237,7 @@ test("a successful Mac test stores the reader password and does not send it to t
   view.unmount();
 });
 
-test("testing the reader address sends Basic and stores the password", async () => {
+test("the Mac field holding the reader address is refused, and nothing is sent", async () => {
   seed(READER);
   installBrowser();
   installFetch();
@@ -253,26 +253,29 @@ test("testing the reader address sends Basic and stores the password", async () 
     testButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   });
   await flush();
-  expect(store.get(KEYS.readerPassword) === PASSWORD).toBe(true);
-  const snapshots = seen.filter((call) => call.url.includes("/api/snapshots"));
-  expect(snapshots).toHaveLength(1);
-  expect(snapshots[0].url.startsWith(READER)).toBe(true);
-  expect(snapshots[0].authorization === BASIC).toBe(true);
-  expect(snapshots[0].redirect).toBe("error");
+  // Real reads never send the password to the Mac field's origin, so Test must not either.
+  expect(view.host.textContent).toContain("That's the offline reader. Put it in the reader field.");
+  expect(seen.filter((call) => call.url.includes("/api/snapshots"))).toHaveLength(0);
+  expect(store.get(KEYS.readerPassword) ?? "").toBe("");
   expect(warnings.join("\n").includes(PASSWORD)).toBe(false);
   view.unmount();
 });
 
-test("Escape and Cancel ask before dropping an unsaved reader password", async () => {
+test("Escape and Cancel ask to discard, and Cancel in the prompt keeps the form open", async () => {
   seed(MAC);
   installBrowser();
   installFetch();
   installDom();
   let closed = 0;
   let saved = 0;
-  window.confirm = () => false;
-  const discarded = await render(modal(() => { closed += 1; }, () => { saved += 1; }));
-  const password = discarded.host.querySelector("#set-reader-password") as HTMLInputElement;
+  const asked: string[] = [];
+  let answer = false;
+  window.confirm = (message?: string) => {
+    asked.push(String(message));
+    return answer;
+  };
+  const stays = await render(modal(() => { closed += 1; }, () => { saved += 1; }));
+  const password = stays.host.querySelector("#set-reader-password") as HTMLInputElement;
   await act(async () => {
     typeInto(password, PASSWORD);
   });
@@ -280,25 +283,49 @@ test("Escape and Cancel ask before dropping an unsaved reader password", async (
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   });
   await flush();
-  expect(closed).toBe(1);
+  expect(asked).toEqual(["Discard unsaved changes?"]);
+  expect(closed).toBe(0);
   expect(saved).toBe(0);
   expect(store.get(KEYS.readerPassword) ?? "").toBe("");
-  discarded.unmount();
+  stays.unmount();
 
-  closed = 0;
-  window.confirm = () => true;
-  const kept = await render(modal(() => { closed += 1; }, () => { saved += 1; }));
-  const again = kept.host.querySelector("#set-reader-password") as HTMLInputElement;
+  answer = true;
+  const drops = await render(modal(() => { closed += 1; }, () => { saved += 1; }));
+  const again = drops.host.querySelector("#set-reader-password") as HTMLInputElement;
   await act(async () => {
     typeInto(again, PASSWORD);
   });
-  const cancel = Array.from(kept.host.querySelectorAll("button")).find((button) => button.textContent === "Cancel");
+  const cancel = Array.from(drops.host.querySelectorAll("button")).find((button) => button.textContent === "Cancel");
   await act(async () => {
     cancel?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   });
   await flush();
-  expect(saved).toBe(1);
-  expect(store.get(KEYS.readerPassword) === PASSWORD).toBe(true);
-  expect(closed).toBe(0);
-  kept.unmount();
+  expect(closed).toBe(1);
+  expect(saved).toBe(0);
+  expect(store.get(KEYS.readerPassword) ?? "").toBe("");
+  drops.unmount();
+});
+
+test("closing the tab with unsaved changes triggers the browser's own prompt", async () => {
+  seed(MAC);
+  installBrowser();
+  installFetch();
+  installDom();
+  const view = await render(modal(() => {}, () => {}));
+  const clean = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(clean);
+  expect(clean.defaultPrevented).toBe(false);
+
+  const password = view.host.querySelector("#set-reader-password") as HTMLInputElement;
+  await act(async () => {
+    typeInto(password, PASSWORD);
+  });
+  const dirty = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(dirty);
+  expect(dirty.defaultPrevented).toBe(true);
+
+  view.unmount();
+  const gone = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(gone);
+  expect(gone.defaultPrevented).toBe(false);
 });

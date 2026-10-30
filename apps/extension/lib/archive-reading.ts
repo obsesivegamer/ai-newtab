@@ -9,6 +9,7 @@ import {
 } from "./archive";
 import { fallbackBaseOf, type ArchiveAuth } from "./archive-auth";
 import { createOriginCache, raceArchiveJson, type OriginCache, type RaceSuccess } from "./archive-race";
+import { passwordFingerprint, readerAuthStillRejected } from "./rebuild-request";
 import { KEYS, loadSettings } from "./storage";
 
 /**
@@ -53,6 +54,22 @@ export async function archiveAuthFor(macBase: string): Promise<ArchiveAuth> {
   return { macBase, fallbackBase: settings.fallbackArchiveUrl, password: settings.readerPassword };
 }
 
+/**
+ * True while the stored 401 fingerprint matches this password: the reader already
+ * said no to it, and another call would only earn a browser login prompt.
+ */
+async function readerRejected(password: string): Promise<boolean> {
+  if (!password.trim()) return false;
+  try {
+    const bag = await browser.storage.local.get(KEYS.readerAuthRejected);
+    const stored = bag[KEYS.readerAuthRejected];
+    if (typeof stored !== "string" || !stored) return false;
+    return readerAuthStillRejected(stored, await passwordFingerprint(password));
+  } catch {
+    return false;
+  }
+}
+
 export interface ReadingList {
   totalUsable: number;
   sources: Array<{ site: string; count: number; latest: string }>;
@@ -80,6 +97,7 @@ export async function loadReadingList(args: {
     macBase,
     fallbackBase: fallbackBaseOf(auth.fallbackBase),
     password: auth.password,
+    readerRejected: await readerRejected(auth.password),
     path: `/api/snapshots?since_days=${args.sinceDays}&limit=${args.limit}`,
     timeoutMs: LIST_TIMEOUT_MS,
     signal: args.signal,
@@ -121,6 +139,7 @@ export async function loadReadingArticles(args: {
   let originBase: string | null = null;
   const cache = args.cache ?? sharedCache;
   if (!args.cache) await refreshSharedCache();
+  const rejected = await readerRejected(auth.password);
   for (const id of args.ids) {
     if (args.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
     if (originBase) {
@@ -134,6 +153,7 @@ export async function loadReadingArticles(args: {
         macBase,
         fallbackBase: fallbackBaseOf(auth.fallbackBase),
         password: auth.password,
+        readerRejected: rejected,
         path: `/api/snapshots/${encodeURIComponent(id)}/text`,
         timeoutMs: TEXT_TIMEOUT_MS,
         signal: args.signal,

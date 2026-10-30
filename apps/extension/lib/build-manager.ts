@@ -39,8 +39,8 @@ type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[
  * net that reattaches after an unexpected kill.
  */
 const KEEPALIVE_INTERVAL_MS = 20_000;
-/** One retry, after a short pause, when the Anthropic SDK reports a connection error. */
-const CONNECTION_RETRY_MS = 500;
+/** The SDK retries a connection error or a 5xx inside one request, so a failed call never restarts the build from turn 1. */
+const ANTHROPIC_MAX_RETRIES = 3;
 
 /** Storage snapshots are throttled so narration deltas don't flood chrome.storage. */
 const SNAPSHOT_THROTTLE_MS = 2_000;
@@ -73,10 +73,11 @@ export class BuildManager {
   /** Epoch ms of the last reader rebuild-request poll. The alarm is about a minute. */
   private lastRebuildPollAt = 0;
   private authRestore: Promise<void> = Promise.resolve();
-  /** Request ids this build stored. A failure puts them back; a success keeps them. */
+  /** Request ids this build stored. A first failure puts each back once; a success keeps them. */
   private claimedRequestIds: string[] = [];
 
-  constructor() {
+  /** `runBuild` is the agent loop. Tests pass a stub; the worker uses the real one. */
+  constructor(private readonly runBuild: typeof runHomepageBuild = runHomepageBuild) {
     void this.restoreReaderAuthNotice();
   }
 
@@ -222,7 +223,7 @@ export class BuildManager {
   }
 
   private watchPhoneRequest() {
-    void this.maybeRequestedRebuild().catch((err) => {
+    void this.maybeRequestedRebuild({ watch: true }).catch((err) => {
       console.warn(
         "[BuildManager] rebuild request check failed",
         err instanceof Error ? err.message : "request failed",
@@ -235,12 +236,14 @@ export class BuildManager {
    * claimed by `tick`. One unseen id whose `fulfilled_at` is null starts one
    * build, unless a build is already entering, in which case the id is only
    * remembered. A wrong password is stored once; the banner stays until the
-   * password changes and a later GET succeeds.
+   * password changes and a later GET succeeds. On the watch path (a build already
+   * claimed this tick) nothing starts here, so an id that would "start" is left
+   * unstored for the next tick instead of being marked handled and lost.
    */
-  private async maybeRequestedRebuild(): Promise<boolean> {
+  private async maybeRequestedRebuild(opts: { watch?: boolean } = {}): Promise<boolean> {
     const settings = await loadSettings();
     const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
-    const configured = Boolean(reader && settings.readerPassword);
+    const configured = Boolean(reader && settings.readerPassword.trim());
     const [handledRaw, rejected] = await Promise.all([
       extensionStore.get<unknown>(KEYS.handledRebuildRequestIds),
       extensionStore.get<string>(KEYS.readerAuthRejected),
@@ -276,6 +279,7 @@ export class BuildManager {
     const handled = normalizeHandledRebuildIds(handledRaw);
     const action = rebuildTickAction({ running: this.building, request, handledIds: handled });
     if (action === "skip" || request.status !== "ready") return false;
+    if (opts.watch && action === "start") return false;
     if (!this.claimedRequestIds.includes(request.request.id)) this.claimedRequestIds.push(request.request.id);
     await extensionStore.set(
       KEYS.handledRebuildRequestIds,
@@ -284,13 +288,27 @@ export class BuildManager {
     return action === "start";
   }
 
-  /** A failed build did not fulfill these requests, so the next tick may try again. */
+  /**
+   * A failed build did not fulfill these requests, so the next tick may try each
+   * once more. An id that was already put back once stays handled: the scheduled
+   * path never retries a failure either, and each try is a paid build.
+   */
   private async forgetClaimedRequests(): Promise<void> {
     const ids = this.claimedRequestIds;
     if (ids.length === 0) return;
-    const handled = normalizeHandledRebuildIds(await extensionStore.get<unknown>(KEYS.handledRebuildRequestIds));
-    const next = ids.reduce((list, id) => forgetRebuildRequestId(list, id), handled);
-    await extensionStore.set(KEYS.handledRebuildRequestIds, next);
+    const [handledRaw, retriedRaw] = await Promise.all([
+      extensionStore.get<unknown>(KEYS.handledRebuildRequestIds),
+      extensionStore.get<unknown>(KEYS.retriedRebuildRequestIds),
+    ]);
+    let handled = normalizeHandledRebuildIds(handledRaw);
+    let retried = normalizeHandledRebuildIds(retriedRaw);
+    for (const id of ids) {
+      if (retried.includes(id)) continue;
+      handled = forgetRebuildRequestId(handled, id);
+      retried = rememberRebuildRequestId(retried, id);
+    }
+    await extensionStore.set(KEYS.retriedRebuildRequestIds, retried);
+    await extensionStore.set(KEYS.handledRebuildRequestIds, handled);
   }
 
   /**
@@ -389,58 +407,47 @@ export class BuildManager {
     try {
       // The key is the user's own, read from local storage — there is no server
       // to hide it behind. See ARCHITECTURE.md → Privacy.
-      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: ANTHROPIC_MAX_RETRIES });
 
       const resumeSessionId = opts.resume
         ? await extensionStore.get<string>(KEYS.activeSessionId)
         : undefined;
 
-      const attempt = () =>
-        runHomepageBuild({
-          client,
-          bridge: browserBridge,
-          // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
-          archive: archiveBase
-            ? createFailoverArchiveBridge(archiveBase, {
-                macBase: archiveBase,
-                fallbackBase: settings.fallbackArchiveUrl,
-                password: settings.readerPassword,
-              })
-            : undefined,
-          feeds,
-          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          store: extensionStore,
-          userSystemPrompt: systemPrompt,
-          // The archive's own host is never a page the agent may scrape: its index
-          // lists every saved article, including ones from blocked sites. Both the
-          // address this build started with and the one in Settings now are blocked,
-          // so changing the setting mid-build can't expose the one in use.
-          blockedSites: async () => {
-            const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
-            const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
-              url ? (archiveHostOf(url) ?? []) : [],
-            );
-            return [...blockedSites, ...hosts];
-          },
-          model,
-          resumeSessionId,
-          signal: controller.signal,
-          callbacks: {
-            onPhase: (phase, detail) => this.onPhase(phase, detail),
-            onText: (chunk) => this.onText(chunk),
-            onLog: (line) => this.onLog(line),
-          },
-        });
-      let result: Awaited<ReturnType<typeof runHomepageBuild>>;
-      try {
-        result = await attempt();
-      } catch (error) {
-        if (!isConnectionError(error) || controller.signal.aborted) throw error;
-        console.warn("[BuildManager] connection error; retrying once", connectionCause(error) || "no cause");
-        await new Promise((resolve) => setTimeout(resolve, CONNECTION_RETRY_MS));
-        if (controller.signal.aborted) throw error;
-        result = await attempt();
-      }
+      const result = await this.runBuild({
+        client,
+        bridge: browserBridge,
+        // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
+        archive: archiveBase
+          ? createFailoverArchiveBridge(archiveBase, {
+              macBase: archiveBase,
+              fallbackBase: settings.fallbackArchiveUrl,
+              password: settings.readerPassword,
+            })
+          : undefined,
+        feeds,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        store: extensionStore,
+        userSystemPrompt: systemPrompt,
+        // The archive's own host is never a page the agent may scrape: its index
+        // lists every saved article, including ones from blocked sites. Both the
+        // address this build started with and the one in Settings now are blocked,
+        // so changing the setting mid-build can't expose the one in use.
+        blockedSites: async () => {
+          const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
+          const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
+            url ? (archiveHostOf(url) ?? []) : [],
+          );
+          return [...blockedSites, ...hosts];
+        },
+        model,
+        resumeSessionId,
+        signal: controller.signal,
+        callbacks: {
+          onPhase: (phase, detail) => this.onPhase(phase, detail),
+          onText: (chunk) => this.onText(chunk),
+          onLog: (line) => this.onLog(line),
+        },
+      });
 
       // Persist the raw TSX; the page transpiles it for preview.
       const homepage = await saveHomepage(result.code);
@@ -461,7 +468,7 @@ export class BuildManager {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const aborted = this.controller?.signal.aborted === true || (error instanceof Error && error.name === "AbortError");
-      if (!aborted) await this.forgetClaimedRequests();
+      if (!aborted) await this.releaseClaimedRequests();
       this.state = { ...this.state, running: false, phase: "error", error: message };
       this.broadcast({ kind: "error", message });
       await this.mirror(true);
@@ -587,10 +594,6 @@ export class BuildManager {
       // notifications permission missing or API unavailable — nothing else to do.
     }
   }
-}
-
-function isConnectionError(error: unknown): boolean {
-  return error instanceof Error && error.message === "Connection error.";
 }
 
 /** A short cause string. The error object itself can carry request headers, so it is not logged. */

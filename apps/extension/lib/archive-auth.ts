@@ -52,7 +52,7 @@ export function migrateFallbackArchiveUrl(
 export const READER_BASIC_USER = "amber";
 
 /** Shown once when a reader is configured and no password is stored. The password is not included. */
-export const READER_PASSWORD_MISSING = "Reader password not set";
+export const READER_PASSWORD_MISSING = "Reader password not set. Add it in Settings, or clear the reader address.";
 
 let missingPasswordNoted = false;
 
@@ -99,12 +99,17 @@ function originOf(base: string): string | null {
  * origin never does.
  */
 export function authorizationFor(url: string, auth: ArchiveAuth | undefined): string | undefined {
-  if (!auth?.fallbackBase || !auth.password.trim()) return undefined;
+  if (!auth?.password.trim() || !isReaderUrl(url, auth)) return undefined;
+  return basicAuthorization(READER_BASIC_USER, auth.password);
+}
+
+/** True when `url` is on the reader's origin and that origin is not also the Mac's. */
+export function isReaderUrl(url: string, auth: ArchiveAuth | undefined): boolean {
+  if (!auth?.fallbackBase) return false;
   const target = originOf(url);
   const fallback = originOf(auth.fallbackBase);
   const mac = originOf(auth.macBase);
-  if (!target || !fallback || target !== fallback || target === mac) return undefined;
-  return basicAuthorization(READER_BASIC_USER, auth.password);
+  return Boolean(target && fallback && target === fallback && target !== mac);
 }
 
 /** Headers for an archive GET. Undefined when no Authorization may be sent. */
