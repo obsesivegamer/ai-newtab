@@ -1,12 +1,15 @@
 import type { FeedSource } from "@homepage/agent-core";
 import { fetchRemoteSources, loadSourcesStamp, publishSources, saveSourcesStamp } from "@/lib/phone-sync";
-import { saveSources } from "@/lib/sources";
+import { readStoredSources, saveSources } from "@/lib/sources";
+import { decideBootSources } from "./boot-sources";
 
 /**
- * Sources are shared with the extension through Amber (`/api/sources`). On load the
- * list Amber holds wins when it has one; without it the page seeds from the archive
- * like the extension does (`loadSources`). Edits are written locally at once and
- * pushed back after a short pause, so tapping a few switches sends one request.
+ * Sources are shared with the extension through Amber (`/api/sources`). On load Amber's
+ * list wins when its stamp has moved; without a list the page seeds from the archive
+ * like the extension does (`loadSources`). A matching stamp with a different local list
+ * is an edit that has not reached Amber yet, so it is pushed rather than discarded.
+ * Edits are written locally at once and pushed back after a short pause, so tapping a
+ * few switches sends one request.
  *
  * Every push says which version of Amber's list it was based on (`if_updated_at`, the
  * stamp this device last saw). If another device wrote first Amber refuses, and its list
@@ -31,11 +34,24 @@ function announce(sources: FeedSource[], reason: AdoptReason): void {
   for (const listener of listeners) listener(sources, reason);
 }
 
-/** Adopt Amber's list as this device's list. Returns whether one was found; a failed read changes nothing. */
+/**
+ * Adopt Amber's list as this device's list. Returns whether one was found; a failed read changes nothing.
+ *
+ * When Amber's stamp is still the one this device last synced, the stored list is left
+ * in place. If it differs, that edit is pushed: a reload during the push pause must not
+ * replace it with the older copy Amber still has.
+ */
 export async function adoptRemoteSources(origin: string, signal?: AbortSignal): Promise<boolean> {
-  await loadSourcesStamp();
+  const localStamp = await loadSourcesStamp();
   const remote = await fetchRemoteSources(origin, signal);
   if (!remote) return false;
+  const local = await readStoredSources();
+  const decision = decideBootSources(localStamp, remote.updatedAt, local, remote.sources);
+  if (decision === "keep") return true;
+  if (decision === "push" && local) {
+    await publishSources(origin, local);
+    return true;
+  }
   await saveSources(remote.sources);
   await saveSourcesStamp(remote.updatedAt);
   return true;
