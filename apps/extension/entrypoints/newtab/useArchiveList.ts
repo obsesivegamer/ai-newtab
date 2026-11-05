@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ArchiveArticleMeta, GetArchiveResult } from "@homepage/agent-core";
 import { createArchiveBridge } from "@/lib/archive";
+import { loadReadingList } from "@/lib/archive-reading";
+import { IS_WEB } from "@/lib/platform";
 
 export const LIBRARY_DAYS = 90;
 export const LIBRARY_LIMIT = 200;
@@ -31,8 +33,11 @@ export function classifyArchiveError(err: unknown): { kind: "down" | "no-api" | 
 /**
  * The Library's data: the last 90 days of the archive, newest first.
  * `archiveUrl` is null until settings have loaded, and "" when the archive is off.
+ * On the extension the list is read from the Mac, failing over to the offline reader.
+ * The promise resolves once: a late Mac answer refreshes the failover cache and does
+ * not replace the articles already returned.
  */
-export function useArchiveList(archiveUrl: string | null) {
+export function useArchiveList(archiveUrl: string | null, reloadToken = 0) {
   const [state, setState] = useState<ArchiveListState>({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
 
@@ -44,8 +49,10 @@ export function useArchiveList(archiveUrl: string | null) {
     }
     let cancelled = false;
     setState({ status: "loading" });
-    createArchiveBridge(archiveUrl)
-      .listArticles({ sinceDays: LIBRARY_DAYS, limit: LIBRARY_LIMIT })
+    const pending = IS_WEB
+      ? createArchiveBridge(archiveUrl).listArticles({ sinceDays: LIBRARY_DAYS, limit: LIBRARY_LIMIT })
+      : loadReadingList({ macBase: archiveUrl, sinceDays: LIBRARY_DAYS, limit: LIBRARY_LIMIT });
+    pending
       .then((result) => {
         if (cancelled) return;
         const articles = [...result.articles].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
@@ -57,7 +64,7 @@ export function useArchiveList(archiveUrl: string | null) {
     return () => {
       cancelled = true;
     };
-  }, [archiveUrl, attempt]);
+  }, [archiveUrl, attempt, reloadToken]);
 
   const reload = useCallback(() => setAttempt((n) => n + 1), []);
   return { state, reload };

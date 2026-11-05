@@ -6,6 +6,7 @@ import {
   type HomepageModel,
 } from "@homepage/agent-core";
 import { DEFAULT_REBUILD_INTERVAL_HOURS } from "@/lib/auto-rebuild";
+import { fallbackBaseOf, READER_PASSWORD_MISSING } from "@/lib/archive-auth";
 import { BUILD_STEPS } from "@/lib/protocol";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
 import { toRenderable } from "@/lib/transpile";
@@ -28,6 +29,10 @@ import { useHomepageOpen } from "./useHomepageOpen";
 /** Where the reader was opened from, which decides its back label and where focus returns. */
 type ReaderOrigin = "latest" | "library" | "today";
 const BACK_LABEL: Record<ReaderOrigin, string> = { latest: "Latest", library: "Library", today: "Today" };
+
+function passwordMissing(fallback: string, password: string): boolean {
+  return Boolean(fallbackBaseOf(fallback)) && password.trim() === "";
+}
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -53,6 +58,8 @@ export default function App() {
   const [todayMounted, setTodayMounted] = useState(false);
   /** null until settings load; "" means the archive is switched off. */
   const [archiveUrl, setArchiveUrl] = useState<string | null>(null);
+  /** A reader is configured and no password is stored. One banner, no reader requests. */
+  const [readerPasswordMissing, setReaderPasswordMissing] = useState(false);
   const [reader, setReader] = useState<{
     entry: ReaderEntry;
     list: ReaderEntry[];
@@ -69,7 +76,9 @@ export default function App() {
   /** A passing line shown when the sources list was replaced by the one Amber holds (edited on the phone). */
   const [syncNote, setSyncNote] = useState<string | null>(null);
   const clearSyncNote = useCallback(() => setSyncNote(null), []);
-  const archive = useArchiveList(archiveUrl);
+  /** Bumped when Settings closes so a new fallback address is read into the library. */
+  const [archiveReload, setArchiveReload] = useState(0);
+  const archive = useArchiveList(archiveUrl, archiveReload);
 
   useEffect(() => {
     document.title = view === "today" ? "Today" : view === "latest" ? "Latest" : "Library";
@@ -95,6 +104,7 @@ export default function App() {
         ]);
         setApiKey(settings.apiKey);
         setArchiveUrl(settings.archiveUrl);
+        setReaderPasswordMissing(passwordMissing(settings.fallbackArchiveUrl, settings.readerPassword));
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
         setModel(settings.model);
@@ -115,13 +125,16 @@ export default function App() {
       settingsWasOpen.current = true;
       return;
     }
-    if (settingsWasOpen.current) {
-      settingsWasOpen.current = false;
-      setSourcesRev((n) => n + 1);
-    }
+    const closed = settingsWasOpen.current;
+    settingsWasOpen.current = false;
     void loadSettings().then((s) => {
       setArchiveUrl(s.archiveUrl);
+      setReaderPasswordMissing(passwordMissing(s.fallbackArchiveUrl, s.readerPassword));
       setBlockedSites(s.blockedSites);
+      if (closed) {
+        setSourcesRev((n) => n + 1);
+        setArchiveReload((n) => n + 1);
+      }
     });
   }, [showSettings]);
 
@@ -226,6 +239,11 @@ export default function App() {
   }, []);
 
   const showError = state.error && dismissedError !== state.error;
+  const banner = readerPasswordMissing
+    ? READER_PASSWORD_MISSING
+    : state.notice === READER_PASSWORD_MISSING
+      ? null
+      : state.notice;
   const todayBuilding = state.running;
 
   // --- the "Today" view: the model-built homepage, unchanged in behaviour ----
@@ -335,6 +353,12 @@ export default function App() {
           </button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </header>
+
+        {banner && (
+          <div className="banner banner-row banner-slim" role="alert">
+            <span className="banner-text">{banner}</span>
+          </div>
+        )}
 
         {showTodayError && view !== "today" && (
           <div className="banner error banner-row banner-slim" role="alert">

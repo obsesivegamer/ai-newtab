@@ -7,6 +7,7 @@ import {
   type HomepageModel,
 } from "@homepage/agent-core";
 import { DEFAULT_ARCHIVE_URL } from "@/lib/archive";
+import { archiveGetInit, DEFAULT_FALLBACK_ARCHIVE_URL, type ArchiveAuth } from "@/lib/archive-auth";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
 import { probeFeed } from "@/lib/feeds";
 import { fetchRemoteSources, isShareableArchiveHost, loadSourcesStamp, publishSources } from "@/lib/phone-sync";
@@ -30,11 +31,33 @@ const AMBER_DOWN = "Amber isn't running — start it (its run script or launchd 
 
 const NOT_AN_ADDRESS = "That doesn't look like a web address. Try http://127.0.0.1:8080";
 
+const IS_THE_READER = "That's the offline reader. Put it in the reader field.";
+
+/** Whether two addresses are the same origin. Anything that isn't an address is not. */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The same auth a real read uses: the Mac address never gets the reader
+ * password, so the Mac field must not hold the reader's address.
+ */
+function authForAddress(base: string, fallback: string, password: string): ArchiveAuth {
+  return { macBase: base, fallbackBase: fallback.trim() === "" ? "" : (normalizeArchiveUrl(fallback) ?? ""), password };
+}
+
 /** One cheap read of the archive's list endpoint, turned into a sentence a person can act on. */
-async function testArchive(base: string): Promise<ArchiveCheck> {
+async function testArchive(base: string, auth: ArchiveAuth): Promise<ArchiveCheck> {
+  const url = `${base}/api/snapshots?since_days=365&limit=1`;
+  const gated = archiveGetInit(url, auth);
   let response: Response;
   try {
-    response = await fetch(`${base}/api/snapshots?since_days=365&limit=1`, {
+    response = await fetch(url, {
+      ...gated,
       signal: AbortSignal.timeout(5_000),
     });
   } catch {
@@ -106,7 +129,13 @@ export function SettingsModal({
     (draft !== initialPrompt ||
       normalizeBlockList(blockedDraft.split("\n")).join("\n") !== normalizeBlockList(blockedSites).join("\n"));
   const [archiveUrl, setArchiveUrl] = useState(DEFAULT_ARCHIVE_URL);
+  const [fallbackUrl, setFallbackUrl] = useState(DEFAULT_FALLBACK_ARCHIVE_URL);
+  const [readerPassword, setReaderPassword] = useState("");
   const [archiveLoaded, setArchiveLoaded] = useState(false);
+  /** What was last loaded or written, so closing can tell a draft from a saved password. */
+  const savedArchive = useRef(DEFAULT_ARCHIVE_URL);
+  const savedFallback = useRef(DEFAULT_FALLBACK_ARCHIVE_URL);
+  const savedPassword = useRef("");
   const [archiveCheck, setArchiveCheck] = useState<ArchiveCheck>({ state: "idle" });
   /** Bumped whenever the field changes, a test starts, or the modal goes away; a late test result is ignored. */
   const archiveRequest = useRef(0);
@@ -149,7 +178,12 @@ export function SettingsModal({
     let cancelled = false;
     void loadSettings().then((s) => {
       if (cancelled) return;
+      savedArchive.current = s.archiveUrl;
+      savedFallback.current = s.fallbackArchiveUrl;
+      savedPassword.current = s.readerPassword;
       setArchiveUrl(s.archiveUrl);
+      setFallbackUrl(s.fallbackArchiveUrl);
+      setReaderPassword(s.readerPassword);
       setArchiveLoaded(true);
     });
     return () => {
@@ -170,7 +204,7 @@ export function SettingsModal({
     const controller = new AbortController();
     void (async () => {
       const remote = await fetchRemoteSources(base, controller.signal);
-      if (!remote?.updatedAt || controller.signal.aborted) return;
+      if (remote.status !== "list" || remote.readOnly || !remote.updatedAt || controller.signal.aborted) return;
       if (remote.updatedAt === (await loadSourcesStamp())) return;
       if (controller.signal.aborted || sourcesDirtyRef.current) return;
       remoteStamp.current = remote.updatedAt;
@@ -186,19 +220,83 @@ export function SettingsModal({
     // Once, when the address has loaded: later edits to the field don't re-read.
   }, [archiveLoaded]);
 
+  const formDirty = (): boolean => {
+    if (draft !== initialPrompt) return true;
+    if (normalizeBlockList(blockedDraft.split("\n")).join("\n") !== normalizeBlockList(blockedSites).join("\n")) {
+      return true;
+    }
+    if (sourcesDirty) return true;
+    if (!archiveLoaded) return false;
+    return (
+      archiveUrl !== savedArchive.current ||
+      fallbackUrl !== savedFallback.current ||
+      readerPassword !== savedPassword.current
+    );
+  };
+  const dirtyRef = useRef(false);
+  dirtyRef.current = formDirty();
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  const requestClose = () => {
+    if (dirtyRef.current && !window.confirm("Discard unsaved changes?")) return;
+    closeRef.current();
+  };
+
+  // Closing the tab or reloading drops the draft too, so the browser asks first.
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!dirtyRef.current) return;
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   /** The address as it should be saved: "" (archive off), a clean base URL, or null if it can't be one. */
   const archiveValue = (): string | null => (archiveUrl.trim() === "" ? "" : normalizeArchiveUrl(archiveUrl));
+  /** "" turns the fallback off. null means the draft is not an address. */
+  const fallbackValue = (): string | null => (fallbackUrl.trim() === "" ? "" : normalizeArchiveUrl(fallbackUrl));
 
-  // Like the prompt box, the address is a draft: it is written only when a test
-  // succeeds or "Save & rebuild" is clicked, never by Cancel.
+  /** Writes the Mac address, the fallback address, and the reader password. False when a draft is not an address. */
+  const persistArchive = async (): Promise<boolean> => {
+    const value = archiveValue();
+    const fallback = fallbackValue();
+    if (value === null) {
+      archiveRequest.current++;
+      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
+      return false;
+    }
+    if (fallback === null) {
+      archiveRequest.current++;
+      setArchiveCheck({
+        state: "error",
+        message: `That doesn't look like a web address. Try ${DEFAULT_FALLBACK_ARCHIVE_URL}`,
+      });
+      return false;
+    }
+    if (archiveLoaded) {
+      await saveSetting("archiveUrl", value);
+      await saveSetting("fallbackArchiveUrl", fallback);
+      await saveSetting("readerPassword", readerPassword);
+      savedArchive.current = value;
+      savedFallback.current = fallback;
+      savedPassword.current = readerPassword;
+    }
+    return true;
+  };
+
+  // A successful test writes the Mac address and the reader password (and a valid
+  // fallback). Esc and Cancel ask before dropping anything still unsaved (OK discards, Cancel keeps the form open).
   const runArchiveTest = async () => {
     const value = archiveValue();
     const request = ++archiveRequest.current;
@@ -213,27 +311,35 @@ export function SettingsModal({
       });
       return;
     }
+    const fallback = fallbackValue();
+    if (fallback && sameOrigin(value, fallback)) {
+      setArchiveCheck({ state: "error", message: IS_THE_READER });
+      return;
+    }
     setArchiveCheck({ state: "testing" });
-    const result = await testArchive(value);
+    const result = await testArchive(value, authForAddress(value, fallback ?? "", readerPassword));
     if (request !== archiveRequest.current) return;
     if (result.state === "ok") {
       await saveSetting("archiveUrl", value);
+      savedArchive.current = value;
+      if (fallback !== null) {
+        await saveSetting("fallbackArchiveUrl", fallback);
+        savedFallback.current = fallback;
+      }
+      await saveSetting("readerPassword", readerPassword);
+      savedPassword.current = readerPassword;
       if (request !== archiveRequest.current) return;
       setArchiveUrl(value);
+      if (fallback !== null) setFallbackUrl(fallback);
     }
     setArchiveCheck(result);
   };
 
   const save = async (rebuild: boolean) => {
     const value = archiveValue();
-    if (value === null) {
-      archiveRequest.current++;
-      setArchiveCheck({ state: "error", message: NOT_AN_ADDRESS });
-      return;
-    }
+    if (!(await persistArchive())) return;
     archiveRequest.current++;
-    // Written before the rebuild starts, so the build reads the new address.
-    if (archiveLoaded) await saveSetting("archiveUrl", value);
+    // The archive fields are already written, so the build reads the new address.
     const blockedNow = normalizeBlockList(blockedDraft.split("\n"));
     if (sources && sourcesDirty) await saveSources(sources);
     // The phone/web version reads the same list from Amber. Best-effort and never awaited. Sources on
@@ -316,7 +422,7 @@ export function SettingsModal({
   };
 
   return (
-    <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && requestClose()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header className="modal-head">
           <h2 id="settings-title" className="modal-title">
@@ -325,7 +431,7 @@ export function SettingsModal({
           <button
             type="button"
             className="icon-btn"
-            onClick={onClose}
+            onClick={requestClose}
             title="Close"
             aria-label="Close settings"
           >
@@ -460,6 +566,46 @@ export function SettingsModal({
                   : ""}
               </span>
             </div>
+            <label className="set-title follow" htmlFor="set-fallback">
+              Offline reader
+            </label>
+            <p id="fallback-help" className="set-hint">
+              When the Mac archive doesn't answer, saved articles are read from here instead. Leave
+              empty to turn that off. Saved when a test succeeds or you click Save.
+            </p>
+            <input
+              id="set-fallback"
+              type="url"
+              className="field mono"
+              value={fallbackUrl}
+              disabled={!archiveLoaded}
+              onChange={(e) => {
+                archiveRequest.current++;
+                setFallbackUrl(e.target.value);
+                setArchiveCheck({ state: "idle" });
+              }}
+              placeholder={DEFAULT_FALLBACK_ARCHIVE_URL}
+              aria-describedby="fallback-help"
+              spellCheck={false}
+            />
+            <label className="set-title follow" htmlFor="set-reader-password">
+              Reader password
+            </label>
+            <p id="reader-password-help" className="set-hint">
+              Sent only to the offline reader, as the password for the user “amber”. Never sent to
+              the Mac archive. Saved when a test succeeds or you click Save.
+            </p>
+            <input
+              id="set-reader-password"
+              type="password"
+              className="field mono"
+              value={readerPassword}
+              disabled={!archiveLoaded}
+              onChange={(e) => setReaderPassword(e.target.value)}
+              aria-describedby="reader-password-help"
+              autoComplete="off"
+              spellCheck={false}
+            />
           </section>
 
           <section className="set">
@@ -562,7 +708,7 @@ export function SettingsModal({
         </div>
 
         <footer className="modal-foot">
-          <button type="button" className="ghost-btn" onClick={onClose}>
+          <button type="button" className="ghost-btn" onClick={requestClose}>
             Cancel
           </button>
           {rebuildMeaningful ? (

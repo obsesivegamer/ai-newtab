@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { archiveHostOf, normalizeArchiveUrl, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
-import { createArchiveBridge } from "./archive";
+import { createFailoverArchiveBridge } from "./archive-reading";
 import { createFeedBridge } from "./feeds";
 import { isSourceBlocked, loadSources } from "./sources";
 import { browserBridge } from "./browser-bridge";
@@ -13,7 +13,22 @@ import {
   type BuildState,
   type PageMsg,
 } from "./protocol";
-import { pushHomepage } from "./phone-sync";
+import { publishBuiltHomepage } from "./phone-sync";
+import { fallbackBaseOf, noteMissingReaderPassword, READER_PASSWORD_MISSING } from "./archive-auth";
+import {
+  READER_AUTH_MESSAGE,
+  REBUILD_POLL_MIN_MS,
+  canPollRebuildRequest,
+  fetchRebuildRequest,
+  forgetRebuildRequestId,
+  normalizeHandledRebuildIds,
+  passwordFingerprint,
+  persistedReaderAuthNotice,
+  readerAuthNotice,
+  readerAuthStillRejected,
+  rebuildTickAction,
+  rememberRebuildRequestId,
+} from "./rebuild-request";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -24,6 +39,8 @@ type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[
  * net that reattaches after an unexpected kill.
  */
 const KEEPALIVE_INTERVAL_MS = 20_000;
+/** The SDK retries a connection error or a 5xx inside one request, so a failed call never restarts the build from turn 1. */
+const ANTHROPIC_MAX_RETRIES = 3;
 
 /** Storage snapshots are throttled so narration deltas don't flood chrome.storage. */
 const SNAPSHOT_THROTTLE_MS = 2_000;
@@ -43,10 +60,26 @@ export class BuildManager {
   private state: BuildState = { ...INITIAL_BUILD_STATE };
   private readonly ports = new Set<Port>();
   private controller: AbortController | null = null;
+  /**
+   * Single-flight claim. Set synchronously at the start of a tick, before any
+   * await, and held until a build starts or the tick decides not to build.
+   */
   private running = false;
+  /** True once `startBuild` has entered. A phone id seen meanwhile is remembered, not built again. */
+  private building = false;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotAt = 0;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms of the last reader rebuild-request poll. The alarm is about a minute. */
+  private lastRebuildPollAt = 0;
+  private authRestore: Promise<void> = Promise.resolve();
+  /** Request ids this build stored. A first failure puts each back once; a success keeps them. */
+  private claimedRequestIds: string[] = [];
+
+  /** `runBuild` is the agent loop. Tests pass a stub; the worker uses the real one. */
+  constructor(private readonly runBuild: typeof runHomepageBuild = runHomepageBuild) {
+    void this.restoreReaderAuthNotice();
+  }
 
   // ---- port lifecycle ------------------------------------------------------
 
@@ -59,7 +92,11 @@ export class BuildManager {
   private onPageMessage(port: Port, msg: PageMsg) {
     switch (msg.kind) {
       case "subscribe":
-        this.send(port, { kind: "snapshot", state: this.state });
+        // The snapshot has to include a 401 banner restored from storage. Sending
+        // the empty in-memory state first would wipe the banner on every reconnect.
+        void this.restoreReaderAuthNotice().then(() => {
+          this.send(port, { kind: "snapshot", state: this.state });
+        });
         break;
       case "startBuild":
         void this.startBuild({ resume: msg.resume });
@@ -94,22 +131,192 @@ export class BuildManager {
   async tick() {
     if (this.running) {
       // A run is live but the worker may have just woken; make sure the
-      // self-keepalive is ticking so the active turn stays warm.
-      this.startKeepalive();
+      // self-keepalive is ticking so the active turn stays warm. Keep noting
+      // phone requests so the id is claimed and the next tick does not start
+      // a second build.
+      if (this.building) {
+        this.startKeepalive();
+        if (this.notePhoneRequest()) this.watchPhoneRequest();
+      }
       return;
     }
 
-    const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
-    if (sessionId) {
-      void this.startBuild({ resume: true });
-      return;
-    }
+    const pollDue = this.notePhoneRequest();
+    // Claim the build before any await. A second tick in this minute, and the
+    // scheduled check racing the reader poll, then share one build.
+    this.running = true;
+    void this.restoreReaderAuthNotice();
 
-    await this.maybeAutoRebuild();
+    try {
+      const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
+      if (sessionId) {
+        void this.startBuild({ resume: true, claimed: true });
+        if (pollDue) this.watchPhoneRequest();
+        return;
+      }
+
+      // The schedule runs to completion before the reader is asked. A phone
+      // request due on the same tick is remembered onto that build.
+      const scheduled = await this.maybeAutoRebuild();
+      if (scheduled) {
+        void this.startBuild({ resume: false, claimed: true });
+        if (pollDue) this.watchPhoneRequest();
+        return;
+      }
+
+      if (!pollDue) {
+        if (!this.building) this.running = false;
+        return;
+      }
+
+      const startPhone = await this.maybeRequestedRebuild();
+      if (startPhone) {
+        void this.startBuild({ resume: false, claimed: true });
+        return;
+      }
+      if (!this.building) this.running = false;
+    } catch (err) {
+      if (!this.building) this.running = false;
+      console.warn(
+        "[BuildManager] tick failed",
+        err instanceof Error ? err.message : "request failed",
+      );
+    }
   }
 
-  /** Whether opening the day's first tab should already show a fresh homepage. */
-  private async maybeAutoRebuild() {
+  /**
+   * Reserve the reader poll if it is due. The reservation is synchronous, before
+   * any await, so two ticks cannot both ask. Returns whether this tick should poll.
+   */
+  private notePhoneRequest(): boolean {
+    const now = Date.now();
+    if (now - this.lastRebuildPollAt < REBUILD_POLL_MIN_MS) return false;
+    this.lastRebuildPollAt = now;
+    return true;
+  }
+
+  /** Put a stored 401 banner back. Polling stays paused, so nothing else would show it again. */
+  private restoreReaderAuthNotice(): Promise<void> {
+    const run = this.authRestore
+      .then(async () => {
+        const settings = await loadSettings();
+        const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
+        if (reader && !settings.readerPassword.trim()) {
+          noteMissingReaderPassword();
+          if (this.state.notice !== READER_PASSWORD_MISSING) this.onNotice(READER_PASSWORD_MISSING);
+          return;
+        }
+        if (this.state.notice === READER_PASSWORD_MISSING) this.onNotice(null);
+        const rejected = await extensionStore.get<string>(KEYS.readerAuthRejected);
+        const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
+        const next = persistedReaderAuthNotice(rejected, fingerprint, this.state.notice);
+        if (next !== this.state.notice) this.onNotice(next);
+      })
+      .catch((err) => {
+        console.warn(
+          "[BuildManager] couldn't restore the reader notice",
+          err instanceof Error ? err.message : "request failed",
+        );
+      });
+    this.authRestore = run;
+    return run;
+  }
+
+  private watchPhoneRequest() {
+    void this.maybeRequestedRebuild({ watch: true }).catch((err) => {
+      console.warn(
+        "[BuildManager] rebuild request check failed",
+        err instanceof Error ? err.message : "request failed",
+      );
+    });
+  }
+
+  /**
+   * A phone refresh can ask the reader for a rebuild. The minute gate was already
+   * claimed by `tick`. One unseen id whose `fulfilled_at` is null starts one
+   * build, unless a build is already entering, in which case the id is only
+   * remembered. A wrong password is stored once; the banner stays until the
+   * password changes and a later GET succeeds. On the watch path (a build already
+   * claimed this tick) nothing starts here, so an id that would "start" is left
+   * unstored for the next tick instead of being marked handled and lost.
+   */
+  private async maybeRequestedRebuild(opts: { watch?: boolean } = {}): Promise<boolean> {
+    const settings = await loadSettings();
+    const reader = fallbackBaseOf(settings.fallbackArchiveUrl);
+    const configured = Boolean(reader && settings.readerPassword.trim());
+    const [handledRaw, rejected] = await Promise.all([
+      extensionStore.get<unknown>(KEYS.handledRebuildRequestIds),
+      extensionStore.get<string>(KEYS.readerAuthRejected),
+    ]);
+    const fingerprint = settings.readerPassword ? await passwordFingerprint(settings.readerPassword) : "";
+    const authRejected = readerAuthStillRejected(rejected, fingerprint);
+    if (
+      !reader ||
+      !canPollRebuildRequest({
+        readerConfigured: configured,
+        hasApiKey: Boolean(settings.apiKey),
+        autoRebuild: settings.autoRebuild,
+        authRejected,
+      })
+    ) {
+      return false;
+    }
+    const request = await fetchRebuildRequest(reader, settings.readerPassword, settings.archiveUrl);
+    if (request.status === "unauthorized") {
+      const line = readerAuthNotice(authRejected);
+      if (line) {
+        await extensionStore.set(KEYS.readerAuthRejected, fingerprint);
+        console.warn(`[BuildManager] ${line}`);
+        this.onLog(line);
+        this.onNotice(line);
+      }
+      return false;
+    }
+    if (rejected && (request.status === "ready" || request.status === "none")) {
+      await extensionStore.remove(KEYS.readerAuthRejected);
+      if (this.state.notice === READER_AUTH_MESSAGE) this.onNotice(null);
+    }
+    const handled = normalizeHandledRebuildIds(handledRaw);
+    const action = rebuildTickAction({ running: this.building, request, handledIds: handled });
+    if (action === "skip" || request.status !== "ready") return false;
+    if (opts.watch && action === "start") return false;
+    if (!this.claimedRequestIds.includes(request.request.id)) this.claimedRequestIds.push(request.request.id);
+    await extensionStore.set(
+      KEYS.handledRebuildRequestIds,
+      rememberRebuildRequestId(handled, request.request.id),
+    );
+    return action === "start";
+  }
+
+  /**
+   * A failed build did not fulfill these requests, so the next tick may try each
+   * once more. An id that was already put back once stays handled: the scheduled
+   * path never retries a failure either, and each try is a paid build.
+   */
+  private async forgetClaimedRequests(): Promise<void> {
+    const ids = this.claimedRequestIds;
+    if (ids.length === 0) return;
+    const [handledRaw, retriedRaw] = await Promise.all([
+      extensionStore.get<unknown>(KEYS.handledRebuildRequestIds),
+      extensionStore.get<unknown>(KEYS.retriedRebuildRequestIds),
+    ]);
+    let handled = normalizeHandledRebuildIds(handledRaw);
+    let retried = normalizeHandledRebuildIds(retriedRaw);
+    for (const id of ids) {
+      if (retried.includes(id)) continue;
+      handled = forgetRebuildRequestId(handled, id);
+      retried = rememberRebuildRequestId(retried, id);
+    }
+    await extensionStore.set(KEYS.retriedRebuildRequestIds, retried);
+    await extensionStore.set(KEYS.handledRebuildRequestIds, handled);
+  }
+
+  /**
+   * Whether this tick should start the scheduled rebuild. The tick has already
+   * claimed `this.running`; that is not a build in progress, so `isRunning` stays
+   * false. Returns after the attempt is stamped, and the caller starts the build.
+   */
+  private async maybeAutoRebuild(): Promise<boolean> {
     const [settings, homepage, lastAttempt] = await Promise.all([
       loadSettings(),
       loadHomepage(),
@@ -121,43 +328,51 @@ export class BuildManager {
       !shouldAutoRebuild({
         enabled: settings.autoRebuild,
         hasApiKey: Boolean(settings.apiKey),
-        isRunning: this.running,
+        isRunning: false,
         lastBuildTimestamp: homepage?.timestamp,
         lastAutoAttemptTimestamp: lastAttempt,
         intervalMs: rebuildIntervalMs(settings.rebuildIntervalHours),
         now,
       })
     ) {
-      return;
+      return false;
     }
 
     // Stamp the attempt before starting so a second wake (or a cancel/failure)
-    // doesn't re-trigger it within the interval.
+    // doesn't re-trigger it within the interval. The claim is already held.
     await extensionStore.set(KEYS.lastAutoBuildAttempt, now.toISOString());
-    void this.startBuild({ resume: false });
+    return true;
   }
 
   // ---- the build -----------------------------------------------------------
 
-  async startBuild(opts: { resume?: boolean } = {}) {
-    if (this.running) {
-      console.log("[BuildManager] startBuild ignored — a build is already running");
-      return; // single-flight: a second start just attaches.
+  async startBuild(opts: { resume?: boolean; claimed?: boolean } = {}) {
+    // Block on a build that has entered. The tick's provisional claim, held while
+    // it asks the reader, must not swallow a Build click.
+    if (this.building) {
+      if (!opts.claimed) console.log("[BuildManager] startBuild ignored — a build is already running");
+      return;
     }
     // Claim the slot before the first await: the startup tick, the onStartup
-    // listener and an alarm can all call this in the same turn.
+    // listener and an alarm can all call this in the same turn. `claimed` means
+    // the tick already set `running` and this call is the one build.
     this.running = true;
+    this.building = true;
 
     let settings: Awaited<ReturnType<typeof loadSettings>>;
     try {
       settings = await loadSettings();
     } catch (err) {
+      await this.releaseClaimedRequests();
       this.running = false;
+      this.building = false;
       throw err;
     }
     const { apiKey, systemPrompt, model, archiveUrl } = settings;
     if (!apiKey) {
+      await this.releaseClaimedRequests();
       this.running = false;
+      this.building = false;
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
       console.warn("[BuildManager] startBuild aborted — no API key in storage");
@@ -182,8 +397,9 @@ export class BuildManager {
       console.warn("[BuildManager] couldn't read the sources list; building without live feeds", err);
     }
 
-    this.controller = new AbortController();
-    this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
+    const controller = new AbortController();
+    this.controller = controller;
+    this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup", notice: this.state.notice };
     this.broadcast({ kind: "snapshot", state: this.state });
     this.startKeepalive();
     console.log("[BuildManager] build started", { resume: Boolean(opts.resume) });
@@ -191,17 +407,23 @@ export class BuildManager {
     try {
       // The key is the user's own, read from local storage — there is no server
       // to hide it behind. See ARCHITECTURE.md → Privacy.
-      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: ANTHROPIC_MAX_RETRIES });
 
       const resumeSessionId = opts.resume
         ? await extensionStore.get<string>(KEYS.activeSessionId)
         : undefined;
 
-      const result = await runHomepageBuild({
+      const result = await this.runBuild({
         client,
         bridge: browserBridge,
         // Empty (or unusable) URL turns the archive off; the build then runs on history alone.
-        archive: archiveBase ? createArchiveBridge(archiveBase) : undefined,
+        archive: archiveBase
+          ? createFailoverArchiveBridge(archiveBase, {
+              macBase: archiveBase,
+              fallbackBase: settings.fallbackArchiveUrl,
+              password: settings.readerPassword,
+            })
+          : undefined,
         feeds,
         timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         store: extensionStore,
@@ -211,13 +433,15 @@ export class BuildManager {
         // address this build started with and the one in Settings now are blocked,
         // so changing the setting mid-build can't expose the one in use.
         blockedSites: async () => {
-          const { blockedSites, archiveUrl: current } = await loadSettings();
-          const hosts = [archiveBase, current].flatMap((url) => (url ? archiveHostOf(url) ?? [] : []));
+          const { blockedSites, archiveUrl: current, fallbackArchiveUrl } = await loadSettings();
+          const hosts = [archiveBase, current, fallbackArchiveUrl].flatMap((url) =>
+            url ? (archiveHostOf(url) ?? []) : [],
+          );
           return [...blockedSites, ...hosts];
         },
         model,
         resumeSessionId,
-        signal: this.controller.signal,
+        signal: controller.signal,
         callbacks: {
           onPhase: (phase, detail) => this.onPhase(phase, detail),
           onText: (chunk) => this.onText(chunk),
@@ -227,10 +451,15 @@ export class BuildManager {
 
       // Persist the raw TSX; the page transpiles it for preview.
       const homepage = await saveHomepage(result.code);
-      // Also hand it to Amber so the phone/web version can show it. Best-effort: a failure is only
-      // logged and never holds up the build. Only when an archive address is configured and it is a
-      // local, private-network or tailnet host (`pushHomepage` checks); never a public address.
-      if (archiveBase) void pushHomepage(archiveBase, homepage);
+      // Hand it to the Mac archive and, separately, to the offline reader. Both are
+      // best-effort. The reader push cannot fail the Mac one, and its password never
+      // goes to the Mac. Each refuses a public address (`publishBuiltHomepage`).
+      void publishBuiltHomepage(
+        archiveBase,
+        settings.fallbackArchiveUrl,
+        settings.readerPassword,
+        homepage,
+      );
 
       this.state = { ...this.state, running: false, phase: "done" };
       this.broadcast({ kind: "done", code: result.code });
@@ -238,16 +467,34 @@ export class BuildManager {
       console.log("[BuildManager] build done", { bytes: result.code.length, source: result.source });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const aborted = this.controller?.signal.aborted === true || (error instanceof Error && error.name === "AbortError");
+      if (!aborted) await this.releaseClaimedRequests();
       this.state = { ...this.state, running: false, phase: "error", error: message };
       this.broadcast({ kind: "error", message });
       await this.mirror(true);
       this.notifyFailure(message);
-      console.error("[BuildManager] build failed", error);
+      const cause = connectionCause(error);
+      console.error("[BuildManager] build failed", cause ? `${message} (${cause})` : message);
     } finally {
+      this.claimedRequestIds = [];
       this.running = false;
+      this.building = false;
       this.controller = null;
       this.stopKeepalive();
     }
+  }
+
+  /** Forget a request this build stored, then drop the in-memory mark. */
+  private async releaseClaimedRequests(): Promise<void> {
+    try {
+      await this.forgetClaimedRequests();
+    } catch (err) {
+      console.warn(
+        "[BuildManager] couldn't clear the rebuild request",
+        err instanceof Error ? err.message : "request failed",
+      );
+    }
+    this.claimedRequestIds = [];
   }
 
   cancel() {
@@ -275,6 +522,12 @@ export class BuildManager {
     this.state = { ...this.state, logs: [...this.state.logs.slice(-LOG_RETENTION), line] };
     this.broadcast({ kind: "log", line });
     void this.mirror(false);
+  }
+
+  private onNotice(message: string | null) {
+    this.state = { ...this.state, notice: message };
+    this.broadcast({ kind: "notice", message });
+    void this.mirror(true);
   }
 
   // ---- storage mirror ------------------------------------------------------
@@ -341,4 +594,13 @@ export class BuildManager {
       // notifications permission missing or API unavailable — nothing else to do.
     }
   }
+}
+
+/** A short cause string. The error object itself can carry request headers, so it is not logged. */
+function connectionCause(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const cause = error.cause;
+  if (cause instanceof Error) return cause.message;
+  if (typeof cause === "string") return cause;
+  return "";
 }

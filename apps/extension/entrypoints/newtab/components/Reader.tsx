@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { hostOf, isAllowedUrl, type ArchiveArticle, type ArchiveArticleMeta } from "@homepage/agent-core";
-import { createArchiveBridge } from "@/lib/archive";
+import { archiveBaseFromPermalink, createArchiveBridge } from "@/lib/archive";
+import { archiveAuthFor, loadReadingArticles } from "@/lib/archive-reading";
 import { fetchFullArticle, saveCandidate, type FetchFailure, type FetchStage } from "@/lib/archive-save";
 import { importFromBrowser } from "@/lib/browser-capture";
 import { IS_WEB } from "@/lib/platform";
@@ -191,6 +192,27 @@ function middleTruncate(text: string, max: number): string {
   return `${text.slice(0, head)}…${text.slice(text.length - (max - 1 - head))}`;
 }
 
+/**
+ * Where a saved article's text is read from. A permalink pins the origin that
+ * won the list, so a late Mac answer cannot move the text onto the other host.
+ * A reread after a save stays on the Mac (`direct`): that copy is not on the reader yet.
+ * The phone never leaves the origin that served the page.
+ */
+async function readSnapshotText(
+  articleId: string,
+  archiveUrl: string,
+  source: { permalink?: string; direct?: boolean } | undefined,
+  signal: AbortSignal,
+) {
+  if (source?.direct || IS_WEB) {
+    return createArchiveBridge(archiveUrl).getArticles({ ids: [articleId], signal });
+  }
+  const pinned = archiveBaseFromPermalink(source?.permalink);
+  const auth = await archiveAuthFor(archiveUrl);
+  if (pinned) return createArchiveBridge(pinned, auth).getArticles({ ids: [articleId], signal });
+  return loadReadingArticles({ macBase: archiveUrl, auth, ids: [articleId], signal });
+}
+
 function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -279,15 +301,14 @@ export function Reader({
   const inflight = useRef(new Map<string, InFlight>());
 
   const watch = useCallback(
-    (articleId: string, url: string) => {
+    (articleId: string, url: string, source?: { permalink?: string; direct?: boolean }) => {
       let entry = inflight.current.get(articleId);
       if (!entry) {
         const controller = new AbortController();
         const created: InFlight = {
           controller,
           watchers: 0,
-          promise: createArchiveBridge(url)
-            .getArticles({ ids: [articleId], signal: controller.signal })
+          promise: readSnapshotText(articleId, url, source, controller.signal)
             .then(({ articles, failed }): FetchResult => {
               const article = articles[0];
               if (article) {
@@ -354,7 +375,7 @@ export function Reader({
     if (rereadId) {
       let cancelled = false;
       setLoad({ status: "fetching", stage: "reading" });
-      const watcher = watch(rereadId, archiveUrl);
+      const watcher = watch(rereadId, archiveUrl, { direct: true });
       void watcher.promise.then((result) => {
         if (cancelled) return;
         if ("article" in result) {
@@ -414,7 +435,7 @@ export function Reader({
     if (entry.archiveId) {
       let cancelled = false;
       setLoad({ status: "loading" });
-      const watcher = watch(entry.archiveId, archiveUrl);
+      const watcher = watch(entry.archiveId, archiveUrl, { permalink: entry.permalink });
       void watcher.promise.then((result) => {
         if (cancelled) return;
         setLoad(
@@ -519,11 +540,12 @@ export function Reader({
 
   // Quietly warm the next article so j feels instant. Only what is already saved: nothing is captured unasked.
   const nextArchiveId = next?.archiveId;
+  const nextPermalink = next?.permalink;
   useEffect(() => {
     if (!nextArchiveId || !archiveUrl || cache.current.has(nextArchiveId) || load.status !== "ready") return;
-    const watcher = watch(nextArchiveId, archiveUrl);
+    const watcher = watch(nextArchiveId, archiveUrl, { permalink: nextPermalink });
     return () => watcher.release();
-  }, [nextArchiveId, archiveUrl, load.status, watch]);
+  }, [nextArchiveId, nextPermalink, archiveUrl, load.status, watch]);
 
   useEffect(() => {
     if (!keysActive) return;

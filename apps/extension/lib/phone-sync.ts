@@ -1,7 +1,9 @@
 import { anySignal, normalizeArchiveUrl, type FeedSource } from "@homepage/agent-core";
 import { IS_WEB } from "@/lib/platform";
+import { archiveGetInit, isReaderUrl, READER_PASSWORD_MISSING, type ArchiveAuth } from "./archive-auth";
+import { parseRebuildRequest, type RebuildRequest } from "./rebuild-request";
 import { saveSources } from "./sources";
-import { KEYS } from "./storage";
+import { KEYS, loadSettings } from "./storage";
 
 /**
  * The extension and the phone/web version share two things through Amber (same
@@ -24,6 +26,10 @@ export interface SharedHomepage {
   code: string;
   /** ISO timestamp of when it was built. */
   timestamp: string;
+  /** When the reader last copied this page from the Mac, if the response said. */
+  syncedAt?: string;
+  /** The reader's `rebuild_request` on GET, when it included one. `expired` is read from here. */
+  rebuildRequest?: RebuildRequest;
 }
 
 export type HomepageFetch =
@@ -34,16 +40,18 @@ export type HomepageFetch =
   | { status: "unsupported" }
   | { status: "error"; message: string };
 
-export interface RemoteSources {
-  sources: FeedSource[];
-  /** Amber's `updated_at` for this list, when it gave one. */
-  updatedAt: string | null;
-}
+export type RemoteSourcesResult =
+  | { status: "list"; sources: FeedSource[]; updatedAt: string | null; readOnly: boolean }
+  /** The reader refuses source edits and did not return a list (HTTP 405). */
+  | { status: "read_only" }
+  | { status: "unavailable" };
 
 export type SourcesPublish =
   | { status: "ok" }
   /** Amber held a newer list: it has been adopted into storage (list and stamp) and is returned here. */
   | { status: "conflict"; sources: FeedSource[] }
+  /** The reader refused the write. `sources` is the list it returned, when it returned one. */
+  | { status: "read_only"; sources?: FeedSource[] }
   | { status: "skipped" | "failed" };
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -134,11 +142,39 @@ export async function saveSourcesStamp(stamp: string | null | undefined): Promis
   await browser.storage.local.set({ [KEYS.sourcesSyncStamp]: stamp });
 }
 
+/**
+ * Basic auth for one reader URL, loaded from settings. The phone is served by
+ * the reader, so it sends no Basic header. A missing store sends none either.
+ * `"unavailable"`: the URL is the reader and no password is set, so the request
+ * is not made (the reader would answer 401 and Chrome would ask for a login).
+ * The header is never logged.
+ */
+async function readerRequestInit(url: string): Promise<RequestInit | "unavailable"> {
+  if (IS_WEB) return {};
+  try {
+    const settings = await loadSettings();
+    const auth: ArchiveAuth = {
+      macBase: settings.archiveUrl,
+      fallbackBase: settings.fallbackArchiveUrl,
+      password: settings.readerPassword,
+    };
+    if (!auth.password.trim() && isReaderUrl(url, auth)) return "unavailable";
+    return archiveGetInit(url, auth);
+  } catch {
+    return {};
+  }
+}
+
 async function putJson(url: string, body: unknown): Promise<void> {
+  const gated = await readerRequestInit(url);
+  if (gated === "unavailable") return;
+  const headers = new Headers(gated.headers);
+  headers.set("Content-Type", "application/json");
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
+    redirect: gated.redirect,
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Amber answered ${response.status}`);
@@ -149,9 +185,117 @@ export async function pushHomepage(archiveUrl: string, homepage: SharedHomepage)
   const base = shareTarget(archiveUrl);
   if (!base) return;
   try {
-    await putJson(`${base}/api/homepage`, { code: homepage.code, timestamp: homepage.timestamp });
+    await putJson(`${base}/api/homepage`, homepageBody(homepage));
   } catch (err) {
     console.warn("[phone-sync] couldn't publish the homepage to Amber:", err instanceof Error ? err.message : err);
+  }
+}
+
+function homepageBody(homepage: SharedHomepage): { code: string; timestamp: string } {
+  return { code: homepage.code, timestamp: homepage.timestamp };
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish the finished page to the offline reader as well, so a phone on that
+ * host sees it without waiting for the hourly copy. The timestamp is sent whole,
+ * milliseconds included. An equal timestamp is accepted; an older one is 409 and
+ * one more than 24h ahead is 422. Best-effort: a failure is logged and never
+ * thrown. The reader password is attached only when this
+ * request's origin is the reader and not the Mac. No-op without a shareable
+ * reader address and a password, and when the reader is the Mac itself.
+ */
+export async function pushReaderHomepage(
+  readerUrl: string,
+  password: string,
+  homepage: SharedHomepage,
+  macUrl: string,
+): Promise<void> {
+  const base = shareTarget(readerUrl);
+  if (!base || !password.trim() || (macUrl && sameOrigin(base, macUrl))) return;
+  const url = `${base}/api/homepage`;
+  const auth: ArchiveAuth = { macBase: macUrl, fallbackBase: base, password };
+  const gated = archiveGetInit(url, auth);
+  try {
+    const headers = new Headers(gated.headers);
+    headers.set("Content-Type", "application/json");
+    const response = await fetch(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(homepageBody(homepage)),
+      redirect: gated.redirect,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`reader answered ${response.status}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "request failed";
+    console.warn(`[phone-sync] couldn't publish the homepage to the reader: ${message}`);
+  }
+}
+
+/**
+ * After a successful build, publish to the Mac archive and the reader. Either
+ * failure stays inside its own call, so the reader cannot fail the Mac push.
+ */
+export async function publishBuiltHomepage(
+  macBase: string | null,
+  readerUrl: string,
+  password: string,
+  homepage: SharedHomepage,
+): Promise<void> {
+  await Promise.all([
+    macBase ? pushHomepage(macBase, homepage) : Promise.resolve(),
+    pushReaderHomepage(readerUrl, password, homepage, macBase ?? ""),
+  ]);
+}
+
+export type RebuildPost =
+  | { status: "ok"; request: RebuildRequest }
+  | { status: "missing" }
+  | { status: "error"; message: string };
+
+/**
+ * What the phone shows when the rebuild POST fails. A missing status means the
+ * reader never answered. A 2xx here is a body that did not contain a request.
+ */
+export function rebuildRequestError(status?: number): string {
+  if (status === undefined) return "Couldn't ask your Mac to rebuild. The reader didn't answer.";
+  if (status >= 200 && status < 300) return "The reader answered, but the rebuild request couldn't be read.";
+  return `Couldn't ask your Mac to rebuild. The reader answered ${status}.`;
+}
+
+/**
+ * Ask the reader to record a rebuild request for the Mac. The phone is served
+ * by that reader, so this sends the session cookie and no Basic header. The
+ * body is `{}` with `Content-Type: application/json`. A 404 means this Amber
+ * has no such route. A cooldown object is still `"ok"`. `expired` on a POST is
+ * not a result the phone branches on; that flag is read from GET.
+ */
+export async function requestHomepageRebuild(origin: string, signal?: AbortSignal): Promise<RebuildPost> {
+  const base = normalizeArchiveUrl(origin);
+  if (!base) return { status: "error", message: "That isn't a reader address." };
+  try {
+    const timeout = AbortSignal.timeout(TIMEOUT_MS);
+    const response = await fetch(`${base}/api/homepage/rebuild-request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      credentials: "same-origin",
+      signal: signal ? anySignal([timeout, signal]) : timeout,
+    });
+    if (response.status === 404) return { status: "missing" };
+    if (!response.ok) return { status: "error", message: rebuildRequestError(response.status) };
+    const request = parseRebuildRequest(await response.json().catch(() => null));
+    return request ? { status: "ok", request } : { status: "error", message: rebuildRequestError(response.status) };
+  } catch {
+    return { status: "error", message: rebuildRequestError() };
   }
 }
 
@@ -178,14 +322,29 @@ export async function publishSources(
           ? stampCache
           : await loadSourcesStamp();
     if (!stamp && opts.ifUpdatedAt === undefined && amberHasNoSources) stamp = "";
-    const response = await fetch(`${base}/api/sources`, {
+    const url = `${base}/api/sources`;
+    // A keepalive push has to be issued in this turn. Loading settings would wait.
+    const gated = opts.keepalive ? {} : await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "skipped" };
+    const headers = new Headers(gated.headers);
+    headers.set("Content-Type", "application/json");
+    const response = await fetch(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ sources: sources.map(toSource), ...(typeof stamp === "string" ? { if_updated_at: stamp } : {}) }),
+      redirect: gated.redirect,
       keepalive: opts.keepalive || undefined,
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-    const body = (await response.json().catch(() => null)) as { sources?: unknown; updated_at?: unknown } | null;
+    const body = (await response.json().catch(() => null)) as {
+      sources?: unknown;
+      updated_at?: unknown;
+      read_only?: unknown;
+    } | null;
+    if (response.status === 405) {
+      const theirs = cleanSources(body?.sources);
+      return theirs ? { status: "read_only", sources: theirs } : { status: "read_only" };
+    }
     if (response.ok) {
       amberHasNoSources = false;
       await saveSourcesStamp(typeof body?.updated_at === "string" ? body.updated_at : null);
@@ -211,7 +370,11 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
   let response: Response;
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
-    response = await fetch(`${base}/api/homepage`, {
+    const url = `${base}/api/homepage`;
+    const gated = await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "error", message: READER_PASSWORD_MISSING };
+    response = await fetch(url, {
+      ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
   } catch (err) {
@@ -230,32 +393,62 @@ export async function fetchHomepage(base: string, signal?: AbortSignal): Promise
     return typeof detail === "string" && /no homepage/i.test(detail) ? { status: "empty" } : { status: "unsupported" };
   }
   if (!response.ok) return { status: "error", message: `Amber answered ${response.status}` };
-  const { code, timestamp } = (body ?? {}) as { code?: unknown; timestamp?: unknown };
-  if (typeof code !== "string" || code.length === 0) return { status: "empty" };
-  return {
-    status: "ok",
-    homepage: { code, timestamp: typeof timestamp === "string" ? timestamp : "" },
+  const { code, timestamp, synced_at, rebuild_request } = (body ?? {}) as {
+    code?: unknown;
+    timestamp?: unknown;
+    synced_at?: unknown;
+    rebuild_request?: unknown;
   };
+  if (typeof code !== "string" || code.length === 0) return { status: "empty" };
+  const homepage: SharedHomepage = { code, timestamp: typeof timestamp === "string" ? timestamp : "" };
+  if (typeof synced_at === "string" && synced_at) homepage.syncedAt = synced_at;
+  const request = parseRebuildRequest(rebuild_request);
+  if (request) homepage.rebuildRequest = request;
+  return { status: "ok", homepage };
 }
 
-/** The sources list stored in Amber (with its stamp), or null when there is none or it can't be read. */
-export async function fetchRemoteSources(base: string, signal?: AbortSignal): Promise<RemoteSources | null> {
+/**
+ * The sources list stored in Amber (with its stamp). `"read_only"` is a 405, or a
+ * list the reader marked `read_only` without a usable catalog. `"unavailable"` is
+ * a missing route, a failed read, or a server that has no list yet.
+ */
+export async function fetchRemoteSources(base: string, signal?: AbortSignal): Promise<RemoteSourcesResult> {
   try {
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
-    const response = await fetch(`${base}/api/sources`, {
+    const url = `${base}/api/sources`;
+    const gated = await readerRequestInit(url);
+    if (gated === "unavailable") return { status: "unavailable" };
+    const response = await fetch(url, {
+      ...gated,
       signal: signal ? anySignal([timeout, signal]) : timeout,
     });
-    if (response.status === 404) amberHasNoSources = true;
-    if (!response.ok) return null;
+    if (response.status === 404) {
+      amberHasNoSources = true;
+      return { status: "unavailable" };
+    }
+    const body = (await response.json().catch(() => null)) as {
+      sources?: unknown;
+      updated_at?: unknown;
+      read_only?: unknown;
+    } | null;
+    if (response.status === 405) {
+      const sources = cleanSources(body?.sources);
+      const updatedAt = typeof body?.updated_at === "string" && body.updated_at ? body.updated_at : null;
+      if (sources && (sources.length > 0 || updatedAt)) {
+        return { status: "list", sources, updatedAt, readOnly: true };
+      }
+      return { status: "read_only" };
+    }
+    if (!response.ok) return { status: "unavailable" };
     amberHasNoSources = false;
-    const body = (await response.json()) as { sources?: unknown; updated_at?: unknown } | null;
+    const readOnly = body?.read_only === true;
     const sources = cleanSources(body?.sources);
-    if (!sources) return null;
+    if (!sources) return readOnly ? { status: "read_only" } : { status: "unavailable" };
     const updatedAt = typeof body?.updated_at === "string" && body.updated_at ? body.updated_at : null;
     // An empty list counts only when someone saved it (updated_at set); a fresh Amber has neither.
-    if (sources.length === 0 && !updatedAt) return null;
-    return { sources, updatedAt };
+    if (sources.length === 0 && !updatedAt) return readOnly ? { status: "read_only" } : { status: "unavailable" };
+    return { status: "list", sources, updatedAt, readOnly };
   } catch {
-    return null;
+    return { status: "unavailable" };
   }
 }

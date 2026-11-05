@@ -17,7 +17,8 @@ export function proxiedUrl(address: string, origin = location.origin): string {
 export function installFeedProxy(): void {
   const nativeFetch = window.fetch.bind(window);
 
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  // `fetch` also has static helpers (`preconnect`). The wrapper replaces the function.
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = input instanceof Request ? input : null;
     const address = request ? request.url : String(input);
     const method = (init?.method ?? request?.method ?? "GET").toUpperCase();
@@ -38,11 +39,13 @@ export function installFeedProxy(): void {
     if (accept) forwarded.Accept = accept;
     const response = await nativeFetch(proxiedUrl(target.href), {
       method: "GET",
-      credentials: "omit",
+      // The phone is served by whichever Amber is up (the Mac, or the offline reader). The feed
+      // proxy is that same origin, and the reader only answers when its session cookie is sent.
+      credentials: "same-origin",
       headers: forwarded,
       signal,
     });
     Object.defineProperty(response, "url", { value: target.href });
     return response;
-  };
+  }) as typeof window.fetch;
 }

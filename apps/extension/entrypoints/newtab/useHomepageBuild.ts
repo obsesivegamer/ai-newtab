@@ -28,6 +28,8 @@ function reduce(state: BuildState, msg: BuildMsg): BuildState {
       return { ...state, narration: state.narration + msg.chunk };
     case "log":
       return { ...state, logs: [...state.logs.slice(-LOG_RETENTION), msg.line] };
+    case "notice":
+      return { ...state, notice: msg.message };
     case "done":
       return { ...state, running: false, phase: "done" };
     case "error":
@@ -76,7 +78,13 @@ export function useHomepageBuild(onDone: (code: string) => void) {
     // Paint last-known state instantly if the worker is asleep — the snapshot
     // from the freshly woken worker follows.
     void extensionStore.get<BuildState>(KEYS.buildSnapshot).then((snap) => {
-      if (snap?.running) setState((s) => (s.running || s.phase ? s : snap));
+      if (!snap) return;
+      setState((s) => {
+        if (s.running || s.phase) return s;
+        if (snap.running) return { ...snap, notice: snap.notice ?? null };
+        if (snap.notice) return { ...s, notice: snap.notice };
+        return s;
+      });
     });
 
     return () => {
@@ -90,7 +98,7 @@ export function useHomepageBuild(onDone: (code: string) => void) {
     portRef.current?.postMessage({ kind: "startBuild", resume: opts?.resume } satisfies PageMsg);
     // Optimistic: flip to the build screen now; the worker's snapshot and
     // deltas take over from here.
-    setState({ ...INITIAL_BUILD_STATE, running: true, phase: "setup" });
+    setState((current) => ({ ...INITIAL_BUILD_STATE, running: true, phase: "setup", notice: current.notice }));
   }, []);
 
   const cancel = useCallback(() => {

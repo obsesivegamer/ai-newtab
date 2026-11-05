@@ -19,6 +19,8 @@ export interface BuildState {
   narration: string;
   logs: string[];
   error: string | null;
+  /** A worker notice that is not a build failure (a rejected reader password). */
+  notice: string | null;
 }
 
 export const INITIAL_BUILD_STATE: BuildState = {
@@ -29,6 +31,7 @@ export const INITIAL_BUILD_STATE: BuildState = {
   narration: "",
   logs: [],
   error: null,
+  notice: null,
 };
 
 /** How many recent log lines are kept (and shown). */
@@ -46,6 +49,7 @@ export type BuildMsg =
   | { kind: "phase"; phase: RunPhase; stepIndex: number; detail: string }
   | { kind: "text"; chunk: string } // narration delta
   | { kind: "log"; line: string }
+  | { kind: "notice"; message: string | null }
   | { kind: "done"; code: string } // homepage saved; carries the raw TSX
   | { kind: "error"; message: string };
 
