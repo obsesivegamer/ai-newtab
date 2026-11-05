@@ -191,6 +191,11 @@ export async function loadSources(): Promise<FeedSource[]> {
   return sources;
 }
 
+/** The saved catalog, or null when nothing has been stored. Does not seed or migrate. */
+export async function readStoredSources(): Promise<FeedSource[] | null> {
+  return (await readState()).stored;
+}
+
 /** Stores the person's list. Saving it settles the one-time migrations: what is in it is their choice. */
 export async function saveSources(sources: FeedSource[]): Promise<void> {
   await browser.storage.local.set({
